@@ -2540,9 +2540,20 @@ class CodeTranslator:
                     current_section = '.text'
                 continue
                 
-            # Skip empty lines and comments
+            # Skip empty lines, comments, and assembler directives
             if not stripped or stripped.startswith(';'):
                 continue
+                
+            # Skip assembler directives that don't affect code generation
+            assembler_directives = [
+                'global ', 'extern ', 'align ', 'bits ', 'org ',
+                'times ', 'incbin ', 'struc ', 'endstruc ', 
+                'istruc ', 'iend ', 'absolute ', 'common ',
+                'cpu ', 'float ', 'default '
+            ]
+            
+            if any(stripped.lower().startswith(directive) for directive in assembler_directives):
+                continue  # Assembler directives - skip, not needed in C code
                 
             # Categorize lines based on current section
             if current_section in ['.data', '.bss']:
@@ -2620,8 +2631,15 @@ class CodeTranslator:
         if not stripped or stripped.startswith(';'):
             return False
             
-        # Skip global directive
-        if stripped.lower().startswith('global '):
+        # Skip assembler directives that are not CPU instructions
+        assembler_directives = [
+            'global ', 'extern ', 'section ', 'align ', 'bits ', 'org ',
+            'times ', 'incbin ', 'struc ', 'endstruc ', 
+            'istruc ', 'iend ', 'absolute ', 'common ',
+            'cpu ', 'float ', 'default '
+        ]
+        
+        if any(stripped.lower().startswith(directive) for directive in assembler_directives):
             return False
             
         # Don't treat C code as assembly
