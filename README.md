@@ -22,9 +22,31 @@ CASM, an compiler designed to seamlessly blend the power and control of Assembly
     - [Looping and Conditionals](#looping-and-conditionals)
     - [Mixing Assembly and High-Level Code](#mixing-assembly-and-high-level-code)
 
+- [Overview](#overview)
+- [Language Syntax](#language-syntax)
+  - [File Structure and Sections](#file-structure-and-sections)
+  - [Data Declarations](#data-declarations)
+  - [High-Level Constructs (C-like)](#high-level-constructs-c-like)
+    - [Variables](#variables)
+    - [Procedures (Functions)](#procedures-functions)
+    - [Control Flow](#control-flow)
+    - [I/O Operations](#io-operations)
+    - [Array Access](#array-access)
+  - [Inline Assembly](#inline-assembly)
+- [How to Compile](#how-to-compile)
+  - [Basic Compilation](#basic-compilation)
+  - [Command-Line Options](#command-line-options)
+  - [Cross-Compilation](#cross-compilation)
+- [Examples](#examples)
+  - [Hello World](#hello-world)
+  - [Looping and Conditionals](#looping-and-conditionals)
+  - [Mixing Assembly and High-Level Code](#mixing-assembly-and-high-level-code)
+
 ---
 
 ## 1. Overview
+
+## Overview
 
 CASM is a source-to-source compiler that translates a hybrid C/Assembly language into standard C code. This C code is then compiled into a native executable using a standard C compiler like GCC.
 
@@ -35,6 +57,8 @@ CASM is a source-to-source compiler that translates a hybrid C/Assembly language
 - **Cross-Platform:** Can target different operating systems and architectures like Linux, Windows, macOS, x86_64, and ARM64.
 
 ## 2. Language Syntax
+
+## Language Syntax
 
 ### File Structure and Sections
 
@@ -204,7 +228,7 @@ mov [c], eax
 print "The sum is:", c
 ```
 
-## 3. How to Compile
+## How to Compile
 
 The compiler is a Python script that translates your `.asm` file to a `.c` file and then invokes `gcc` to create an executable.
 
@@ -239,7 +263,7 @@ You can easily cross-compile for other platforms. For example, to compile for Wi
 python3 CASM.py c main.asm -t:windows -o:main.exe
 ```
 
-## 4. Examples
+## Examples
 
 ### Hello World
 
