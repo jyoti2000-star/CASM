@@ -13,6 +13,7 @@ CASM, an advanced compiler designed to seamlessly blend the power and control of
     - [I/O Operations](#io-operations)
     - [Array Access](#array-access)
   - [Inline Assembly](#inline-assembly)
+  - [Extern Declarations (C Interoperability)](#extern-declarations-c-interoperability)
 - [How to Compile](#how-to-compile)
   - [Basic Compilation](#basic-compilation)
   - [Command-Line Options](#command-line-options)
@@ -188,6 +189,35 @@ main:
 ```
 
 ### Inline Assembly
+
+CASM supports declaring external C functions and assembly functions using the `extern` keyword. This allows you to include standard C library headers, declare external C functions with their signatures, and call them from your CASM code.
+
+**Syntax:**
+
+1.  **Header Includes:**
+
+    ```casm
+    extern <header_name.h>
+    ```
+
+    Example:
+
+    ```casm
+    extern <stdio.h>
+    extern <windows.h>  ; For Windows-specific APIs
+    ```
+
+2.  **Function Declarations:**
+    ```casm
+    extern return_type function_name(parameter_list)
+    ```
+    Example:
+    ```casm
+    extern int printf(const char* format, ...)
+    extern void* malloc(size_t size)
+    ```
+
+When you use `extern`, CASM automatically adds the necessary `#include` directives and `extern` function prototypes to the generated C code, allowing you to seamlessly call C library functions or system APIs.
 
 You can write standard Intel-syntax x86 assembly directly within your code. The compiler will automatically convert it into GCC-style inline assembly.
 
