@@ -872,6 +872,178 @@ class ExceptionHandler:
         # Placeholder for SEH generation
         return b''
 
+class ExternDeclaration:
+    """Represents an extern declaration for C functions or assembly functions"""
+    
+    def __init__(self, name: str, declaration_type: str, signature: str = "", 
+                 header_file: str = "", is_assembly: bool = False):
+        self.name = name
+        self.declaration_type = declaration_type  # 'c_function', 'asm_function', 'header_include'
+        self.signature = signature  # Function signature like "int func(int, char*)"
+        self.header_file = header_file  # Header file like "stdint.h"
+        self.is_assembly = is_assembly
+        self.return_type = "void"
+        self.parameters = []
+        self.calling_convention = "cdecl"  # cdecl, stdcall, fastcall, etc.
+        
+        if signature:
+            self._parse_signature(signature)
+            
+    def _parse_signature(self, signature: str):
+        """Parse function signature to extract return type and parameters"""
+        # Handle function signature parsing
+        # Example: "int func(int a, char* b)" -> return_type="int", params=[("int", "a"), ("char*", "b")]
+        signature = signature.strip()
+        
+        # Match pattern: return_type function_name(parameters)
+        match = re.match(r'([\w\s\*]+)\s+(\w+)\s*\(([^)]*)\)', signature)
+        if match:
+            self.return_type = match.group(1).strip()
+            func_name = match.group(2).strip()
+            if func_name != self.name:
+                self.name = func_name  # Update name if different
+            params_str = match.group(3).strip()
+            
+            if params_str and params_str != "void":
+                # Parse parameters
+                param_parts = [p.strip() for p in params_str.split(',')]
+                for param in param_parts:
+                    if param:
+                        # Handle "type name" or just "type"
+                        parts = param.rsplit(' ', 1)
+                        if len(parts) == 2:
+                            param_type, param_name = parts
+                            self.parameters.append((param_type.strip(), param_name.strip()))
+                        else:
+                            # Just type, no name
+                            self.parameters.append((param.strip(), ""))
+        else:
+            # Handle simple function name without signature
+            self.return_type = "int"  # Default return type
+            
+    def generate_c_declaration(self) -> str:
+        """Generate C function declaration"""
+        if self.declaration_type == 'header_include':
+            return f'#include <{self.header_file}>'
+        elif self.declaration_type == 'c_function':
+            param_list = ", ".join([f"{ptype} {pname}" if pname else ptype 
+                                  for ptype, pname in self.parameters])
+            if not param_list:
+                param_list = "void"
+            return f'extern {self.return_type} {self.name}({param_list});'
+        elif self.declaration_type == 'asm_function':
+            # For assembly functions, generate appropriate declaration
+            param_list = ", ".join([f"{ptype} {pname}" if pname else ptype 
+                                  for ptype, pname in self.parameters])
+            if not param_list:
+                param_list = "void"
+            return f'extern {self.return_type} {self.name}({param_list});  // Assembly function'
+        return ""
+        
+    def generate_inline_asm_call(self, args: List[str] = None) -> str:
+        """Generate inline assembly call for this extern function"""
+        if not self.is_assembly:
+            return ""
+            
+        args = args or []
+        # Generate inline assembly call based on calling convention
+        if self.calling_convention == "stdcall" or "Win" in self.name:
+            # Windows API call
+            call_asm = f'call {self.name}'
+        else:
+            # Standard call
+            call_asm = f'call {self.name}'
+            
+        return call_asm
+
+class ExternManager:
+    """Manages extern declarations and their integration"""
+    
+    def __init__(self):
+        self.extern_declarations: Dict[str, ExternDeclaration] = {}
+        self.required_headers: Set[str] = set()
+        self.asm_functions: Dict[str, ExternDeclaration] = {}
+        
+    def add_extern_declaration(self, declaration: ExternDeclaration):
+        """Add an extern declaration"""
+        self.extern_declarations[declaration.name] = declaration
+        
+        if declaration.declaration_type == 'header_include':
+            self.required_headers.add(declaration.header_file)
+        elif declaration.is_assembly:
+            self.asm_functions[declaration.name] = declaration
+            
+    def parse_extern_line(self, line: str) -> Optional[ExternDeclaration]:
+        """Parse an extern declaration line"""
+        line = line.strip()
+        
+        # Handle header includes: extern <stdint.h>
+        if match := re.match(r'extern\s*<([^>]+)>', line):
+            header_file = match.group(1)
+            return ExternDeclaration(
+                name=f"include_{header_file.replace('.', '_')}",
+                declaration_type='header_include',
+                header_file=header_file
+            )
+            
+        # Handle function declarations: extern int function_name(params)
+        elif match := re.match(r'extern\s+([\w\s\*]+\s+\w+\s*\([^)]*\))', line):
+            signature = match.group(1).strip()
+            func_match = re.search(r'(\w+)\s*\(', signature)
+            if func_match:
+                func_name = func_match.group(1)
+                return ExternDeclaration(
+                    name=func_name,
+                    declaration_type='c_function',
+                    signature=signature
+                )
+                
+        # Handle simple function names: extern WriteConsole
+        elif match := re.match(r'extern\s+(\w+)(?:\s*\(([^)]*)\))?', line):
+            func_name = match.group(1)
+            params = match.group(2) if match.group(2) else ""
+            
+            # Check if it looks like a Windows API or assembly function
+            is_assembly = (func_name.startswith('Write') or 
+                          func_name.startswith('Get') or 
+                          func_name.startswith('Set') or 
+                          'Console' in func_name or
+                          'Handle' in func_name)
+                          
+            signature = f"int {func_name}({params})" if params else f"int {func_name}()"
+            
+            return ExternDeclaration(
+                name=func_name,
+                declaration_type='asm_function' if is_assembly else 'c_function',
+                signature=signature,
+                is_assembly=is_assembly
+            )
+            
+        return None
+        
+    def get_required_headers(self) -> List[str]:
+        """Get list of required header includes"""
+        headers = []
+        for header in sorted(self.required_headers):
+            headers.append(f'#include <{header}>')
+        return headers
+        
+    def get_function_declarations(self) -> List[str]:
+        """Get list of function declarations"""
+        declarations = []
+        for name, decl in self.extern_declarations.items():
+            if decl.declaration_type in ['c_function', 'asm_function']:
+                declarations.append(decl.generate_c_declaration())
+        return declarations
+        
+    def is_extern_function(self, name: str) -> bool:
+        """Check if a function is an extern declaration"""
+        return name in self.extern_declarations
+        
+    def get_extern_function(self, name: str) -> Optional[ExternDeclaration]:
+        """Get extern declaration by name"""
+        return self.extern_declarations.get(name)
+
 class TypeSystem:
     """Advanced type system with inference"""
     
@@ -1309,6 +1481,24 @@ class AsmParser:
                 var.section = '.data'
                 symbols.add_variable(var)
                 return f'int {name} = {value};'
+                
+        # Double/Quad word (64-bit): label dq number  
+        m = re.match(r'^([a-zA-Z_]\w*)\s+dq\s+(-?\d+(?:\.\d+)?)(?:\s*,|$)', line)
+        if m:
+            name, value = m.groups()
+            # Check if it's an array
+            if ',' in line:
+                vals_str = line.split('dq', 1)[1].strip()
+                vals = [v.strip() for v in vals_str.split(',') if v.strip()]
+                var = VariableInfo(name, 'double[]', vals, is_global=True, size=len(vals), is_array=True)
+                var.section = '.data'
+                symbols.add_variable(var)
+                return f'double {name}[] = {{{", ".join(vals)}}};'
+            else:
+                var = VariableInfo(name, 'double', float(value), is_global=True)
+                var.section = '.data'
+                symbols.add_variable(var)
+                return f'double {name} = {value};'
 
         return None
         
@@ -1344,7 +1534,7 @@ class InlineAsmGenerator:
     """Generate proper GCC inline assembly with enhanced dynamic processing"""
     
     @staticmethod
-    def process_asm_block(lines: List[str], symbols: SymbolTable) -> Tuple[Optional[str], Set[str], Set[str]]:
+    def process_asm_block(lines: List[str], symbols: SymbolTable, extern_manager: 'ExternManager' = None) -> Tuple[Optional[str], Set[str], Set[str]]:
         """Convert assembly block to inline asm - ALL assembly is converted, nothing skipped"""
         if not lines:
             return None, set(), set()
@@ -1389,7 +1579,7 @@ class InlineAsmGenerator:
                 
             # Convert assembly lines to inline assembly or C code
             processed_line, line_outputs, line_inputs = InlineAsmGenerator._convert_line_to_inline_asm(
-                line, symbols, block_analysis)
+                line, symbols, block_analysis, extern_manager)
             
             if processed_line is not None:
                 outputs.update(line_outputs)
@@ -1427,15 +1617,45 @@ class InlineAsmGenerator:
         return '\n'.join(result_lines), outputs, inputs
     
     @staticmethod
-    def _convert_line_to_inline_asm(line: str, symbols: SymbolTable, block_analysis: Dict[str, Any] = None) -> Tuple[str, Set[str], Set[str]]:
+    def _convert_line_to_inline_asm(line: str, symbols: SymbolTable, block_analysis: Dict[str, Any] = None, extern_manager: 'ExternManager' = None) -> Tuple[str, Set[str], Set[str]]:
         """Convert a single assembly line to inline assembly format - ALL lines are converted"""
         outputs = set()
         inputs = set()
         
         # Handle function calls by converting to proper C function calls
-        if m := re.match(r'^\s*call\s+([a-zA-Z_]\w*)(?:\s*\(([^)]*)\))?', line, re.I):
+        # Improved parsing to handle nested parentheses properly
+        if m := re.match(r'^\s*call\s+([a-zA-Z_]\w*)(?:\s*(.*))?$', line, re.I):
             func_name = m.group(1)
-            args = m.group(2) if m.group(2) else ''
+            remainder = (m.group(2) if m.group(2) else '').strip()
+            
+            # If there's a remainder that starts with '(', parse the full argument list
+            args = ''
+            if remainder.startswith('('):
+                # Find matching closing parenthesis, handling nested parentheses
+                paren_count = 0
+                end_idx = -1
+                for i, char in enumerate(remainder):
+                    if char == '(':
+                        paren_count += 1
+                    elif char == ')':
+                        paren_count -= 1
+                        if paren_count == 0:
+                            end_idx = i
+                            break
+                            
+                if end_idx != -1:
+                    args = remainder[1:end_idx]  # Extract content between parentheses
+            
+            # Check if this is an extern function
+            if extern_manager and extern_manager.is_extern_function(func_name):
+                extern_func = extern_manager.get_extern_function(func_name)
+                if extern_func:
+                    # Generate proper C function call for extern function
+                    if args:
+                        return f'{func_name}({args});', outputs, inputs
+                    else:
+                        return f'{func_name}();', outputs, inputs
+            
             # Convert to C function call instead of inline assembly
             if args:
                 return f'{func_name}({args});', outputs, inputs
@@ -1526,7 +1746,7 @@ class InlineAsmGenerator:
                 
             # Convert to inline assembly format
             processed_line, line_outputs, line_inputs = InlineAsmGenerator._convert_line_to_inline_asm(
-                line, symbols, analysis)
+                line, symbols, analysis, None)
             
             if processed_line:
                 outputs.update(line_outputs)
@@ -1570,7 +1790,7 @@ class InlineAsmGenerator:
                 
             # Convert to inline assembly format
             processed_line, line_outputs, line_inputs = InlineAsmGenerator._convert_line_to_inline_asm(
-                line, symbols, analysis)
+                line, symbols, analysis, None)
             
             if processed_line:
                 outputs.update(line_outputs)
@@ -1614,7 +1834,7 @@ class InlineAsmGenerator:
                 
             # Convert ALL lines to inline assembly format
             processed_line, line_outputs, line_inputs = InlineAsmGenerator._convert_line_to_inline_asm(
-                line, symbols, analysis)
+                line, symbols, analysis, None)
             
             if processed_line:
                 outputs.update(line_outputs)
@@ -2046,6 +2266,7 @@ class CodeTranslator:
         self.type_system = TypeSystem()
         self.exception_handler = ExceptionHandler()
         self.debug_info = DebugInfoGenerator("")
+        self.extern_manager = ExternManager()  # Add extern manager
         
         # Architecture backend
         self.architecture_backend = self._get_architecture_backend()
@@ -2074,8 +2295,11 @@ class CodeTranslator:
         if self._is_pure_c_code(lines):
             return '\n'.join(lines)
             
-        # First pass: macro preprocessing
-        processed_lines = self.macro_processor.process_file(lines, file_path)
+        # First pass: process extern declarations
+        processed_lines = self._process_extern_declarations(lines)
+        
+        # Second pass: macro preprocessing
+        processed_lines = self.macro_processor.process_file(processed_lines, file_path)
         
         # Apply architecture-specific preprocessing if needed
         if self.options.target_arch != TargetArchitecture.X86_64:
@@ -2095,6 +2319,11 @@ class CodeTranslator:
             '#include <string.h>',
             '#include <unistd.h>'
         }
+        
+        # Add headers from extern declarations
+        extern_headers = self.extern_manager.get_required_headers()
+        for header in extern_headers:
+            headers.append(header)
         
         for block_type, block_lines in blocks:
             if block_type == 'DATA':
@@ -2118,7 +2347,7 @@ class CodeTranslator:
                 # Apply architecture-specific optimizations
                 arch_optimized_lines = self.architecture_backend.optimize_for_architecture(optimized_lines)
                 
-                inline_asm, outputs, inputs = InlineAsmGenerator.process_asm_block(arch_optimized_lines, self.symbols)
+                inline_asm, outputs, inputs = InlineAsmGenerator.process_asm_block(arch_optimized_lines, self.symbols, self.extern_manager)
                 if inline_asm:
                     indent = '    ' if self.in_function else ''
                     if '\n' in inline_asm:  # Multiple C lines
@@ -2141,6 +2370,13 @@ class CodeTranslator:
         # Generate final C code
         c_lines.extend(sorted(list(set(headers) | default_headers)))
         c_lines.append('')
+        
+        # Add extern function declarations
+        extern_decls = self.extern_manager.get_function_declarations()
+        if extern_decls:
+            c_lines.append('/* Extern function declarations */')
+            c_lines.extend(extern_decls)
+            c_lines.append('')
         
         if global_decls:
             c_lines.append('/* Global variables */')
@@ -2189,6 +2425,25 @@ class CodeTranslator:
             else:
                 converted_lines.append(line)
         return converted_lines
+        
+    def _process_extern_declarations(self, lines: List[str]) -> List[str]:
+        """Process extern declarations and remove them from the line list"""
+        processed_lines = []
+        
+        for line in lines:
+            line_stripped = line.strip()
+            
+            # Check if this is an extern declaration
+            if line_stripped.startswith('extern '):
+                extern_decl = self.extern_manager.parse_extern_line(line_stripped)
+                if extern_decl:
+                    self.extern_manager.add_extern_declaration(extern_decl)
+                    # Don't add this line to processed_lines - it's been handled
+                    continue
+            
+            processed_lines.append(line)
+            
+        return processed_lines
         
     def _generate_c_code(self, ast: Any) -> str:
         """Generate C code (default implementation)"""
@@ -2260,20 +2515,28 @@ class CodeTranslator:
             stripped = line.strip()
             
             # Handle section directives
-            if stripped.startswith('section '):
+            if stripped.startswith('section ') or stripped in ['.data', '.bss', '.text', '.rodata']:
                 if current_lines:
                     blocks.append((current_block, current_lines))
                     current_lines = []
                     
-                section = stripped.split()[1]
-                if '.data' in section:
+                # Handle both 'section .data' and '.data' formats
+                if stripped.startswith('section '):
+                    section = stripped.split()[1]
+                else:
+                    section = stripped
+                    
+                if '.data' in section or section == '.data':
                     current_block = 'DATA'
                     current_section = '.data'
-                elif '.bss' in section:
+                elif '.bss' in section or section == '.bss':
                     current_block = 'BSS'
                     current_section = '.bss'
+                elif '.rodata' in section or section == '.rodata':
+                    current_block = 'DATA'  # Treat rodata as data section
+                    current_section = '.data'
                 else:
-                    current_block = 'C'
+                    current_block = 'ASM'  # .text should be assembly
                     current_section = '.text'
                 continue
                 
@@ -2283,6 +2546,17 @@ class CodeTranslator:
                 
             # Categorize lines based on current section
             if current_section in ['.data', '.bss']:
+                # Set the correct block type for data sections if not already set
+                if current_section == '.data' and current_block != 'DATA':
+                    if current_lines:
+                        blocks.append((current_block, current_lines))
+                        current_lines = []
+                    current_block = 'DATA'
+                elif current_section == '.bss' and current_block != 'BSS':
+                    if current_lines:
+                        blocks.append((current_block, current_lines))
+                        current_lines = []
+                    current_block = 'BSS'
                 current_lines.append(line)
             elif self._is_high_level_line(stripped):
                 if current_block != 'C':
