@@ -13,7 +13,6 @@ CASM, an advanced compiler designed to seamlessly blend the power and control of
       - [I/O Operations](#io-operations)
       - [Array Access](#array-access)
     - [Inline Assembly](#inline-assembly)
-    - [Preprocessor Directives](#preprocessor-directives)
 3.  [How to Compile](#3-how-to-compile)
     - [Basic Compilation](#basic-compilation)
     - [Command-Line Options](#command-line-options)
@@ -33,7 +32,6 @@ CASM is a source-to-source compiler that translates a hybrid C/Assembly language
 
 - **Hybrid Syntax:** Write low-level Assembly and high-level C-like code in the same file.
 - **Familiarity:** Uses Intel syntax for Assembly and a simplified, C-inspired syntax for high-level constructs.
-- **Preprocessor:** Supports `#define`, conditional compilation (`#ifdef`, etc.), and file includes.
 - **Cross-Platform:** Can target different operating systems and architectures like Linux, Windows, macOS, x86_64, and ARM64.
 
 ## 2. Language Syntax
@@ -206,13 +204,6 @@ mov [c], eax
 print "The sum is:", c
 ```
 
-### Preprocessor Directives
-
-- `#define <NAME> <value>`: Defines a simple macro.
-- `#define <NAME>(args) <body>`: Defines a function-like macro.
-- `#ifdef <NAME>`, `#ifndef <NAME>`, `#else`, `#endif`: For conditional compilation.
-- `.include "path/to/file.asm"`: Includes another source file.
-
 ## 3. How to Compile
 
 The compiler is a Python script that translates your `.asm` file to a `.c` file and then invokes `gcc` to create an executable.
@@ -222,7 +213,7 @@ The compiler is a Python script that translates your `.asm` file to a `.c` file 
 The primary command is `c` (for compile).
 
 ```sh
-python3 compiler.py c main.asm
+python3 CASM.py c main.asm
 ```
 
 This command will:
@@ -232,20 +223,20 @@ This command will:
 
 ### Command-Line Options
 
-| Option        | Description                                                   | Example                                     |
-| :------------ | :------------------------------------------------------------ | :------------------------------------------ |
-| `-o:<file>`   | Set the output executable name.                               | `python3 compiler.py c test.asm -o:my_app`  |
-| `-d:release`  | Compiles with optimizations (`-O3`) and no debug info.        | `python3 compiler.py c test.asm -d:release` |
-| `-d:debug`    | Compiles with debug info (`-g`) and no optimizations (`-O0`). | `python3 compiler.py c test.asm -d:debug`   |
-| `-t:<target>` | Set the target platform (`linux`, `windows`, `macos`).        | `python3 compiler.py c test.asm -t:windows` |
-| `-a:<arch>`   | Set the target architecture (`x86_64`, `arm64`).              | `python3 compiler.py c test.asm -a:arm64`   |
+| Option        | Description                                                   | Example                                 |
+| :------------ | :------------------------------------------------------------ | :-------------------------------------- |
+| `-o:<file>`   | Set the output executable name.                               | `python3 CASM.py c test.asm -o:my_app`  |
+| `-d:release`  | Compiles with optimizations (`-O3`) and no debug info.        | `python3 CASM.py c test.asm -d:release` |
+| `-d:debug`    | Compiles with debug info (`-g`) and no optimizations (`-O0`). | `python3 CASM.py c test.asm -d:debug`   |
+| `-t:<target>` | Set the target platform (`linux`, `windows`, `macos`).        | `python3 CASM.py c test.asm -t:windows` |
+| `-a:<arch>`   | Set the target architecture (`x86_64`, `arm64`).              | `python3 CASM.py c test.asm -a:arm64`   |
 
 ### Cross-Compilation
 
 You can easily cross-compile for other platforms. For example, to compile for Windows from macOS or Linux, you need a MinGW toolchain installed.
 
 ```sh
-python3 compiler.py c main.asm -t:windows -o:main.exe
+python3 CASM.py c main.asm -t:windows -o:main.exe
 ```
 
 ## 4. Examples
