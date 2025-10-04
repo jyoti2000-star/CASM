@@ -1,6 +1,4 @@
-# CASM - The C/Assembly Hybrid Compiler
-
-Welcome to CASM, an advanced compiler designed to seamlessly blend the power and control of Assembly with the simplicity and readability of C-like high-level constructs. This document serves as a comprehensive guide to the CASM language syntax and the compilation process.
+CASM, an advanced compiler designed to seamlessly blend the power and control of Assembly with the simplicity and readability of C-like high-level constructs. This document serves as a comprehensive guide to the CASM language syntax and the compilation process.
 
 ## Table of Contents
 
