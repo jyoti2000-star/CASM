@@ -222,13 +222,13 @@ The compiler is a Python script that translates your `.asm` file to a `.c` file 
 The primary command is `c` (for compile).
 
 ```sh
-python3 compiler.py c advanced_test.asm
+python3 compiler.py c main.asm
 ```
 
 This command will:
 
-1.  Create `advanced_test.c`.
-2.  Compile `advanced_test.c` into a native executable named `advanced_test`.
+1.  Create `main.c`.
+2.  Compile `main.c` into a native executable named `main`.
 
 ### Command-Line Options
 
@@ -245,7 +245,7 @@ This command will:
 You can easily cross-compile for other platforms. For example, to compile for Windows from macOS or Linux, you need a MinGW toolchain installed.
 
 ```sh
-python3 compiler.py c my_program.asm -t:windows -o:my_program.exe
+python3 compiler.py c main.asm -t:windows -o:main.exe
 ```
 
 ## 4. Examples
