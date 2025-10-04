@@ -1,26 +1,6 @@
-CASM, an compiler designed to seamlessly blend the power and control of Assembly with the simplicity and readability of C-like high-level constructs. This document serves as a comprehensive guide to the CASM language syntax and the compilation process.
+CASM, an advanced compiler designed to seamlessly blend the power and control of Assembly with the simplicity and readability of C-like high-level constructs. This document serves as a comprehensive guide to the CASM language syntax and the compilation process.
 
 ## Table of Contents
-
-1.  [Overview](#1-overview)
-2.  [Language Syntax](#2-language-syntax)
-    - [File Structure and Sections](#file-structure-and-sections)
-    - [Data Declarations](#data-declarations)
-    - [High-Level Constructs (C-like)](#high-level-constructs-c-like)
-      - [Variables](#variables)
-      - [Procedures (Functions)](#procedures-functions)
-      - [Control Flow](#control-flow)
-      - [I/O Operations](#io-operations)
-      - [Array Access](#array-access)
-    - [Inline Assembly](#inline-assembly)
-3.  [How to Compile](#3-how-to-compile)
-    - [Basic Compilation](#basic-compilation)
-    - [Command-Line Options](#command-line-options)
-    - [Cross-Compilation](#cross-compilation)
-4.  [Examples](#4-examples)
-    - [Hello World](#hello-world)
-    - [Looping and Conditionals](#looping-and-conditionals)
-    - [Mixing Assembly and High-Level Code](#mixing-assembly-and-high-level-code)
 
 - [Overview](#overview)
 - [Language Syntax](#language-syntax)
@@ -44,8 +24,6 @@ CASM, an compiler designed to seamlessly blend the power and control of Assembly
 
 ---
 
-## 1. Overview
-
 ## Overview
 
 CASM is a source-to-source compiler that translates a hybrid C/Assembly language into standard C code. This C code is then compiled into a native executable using a standard C compiler like GCC.
@@ -55,8 +33,6 @@ CASM is a source-to-source compiler that translates a hybrid C/Assembly language
 - **Hybrid Syntax:** Write low-level Assembly and high-level C-like code in the same file.
 - **Familiarity:** Uses Intel syntax for Assembly and a simplified, C-inspired syntax for high-level constructs.
 - **Cross-Platform:** Can target different operating systems and architectures like Linux, Windows, macOS, x86_64, and ARM64.
-
-## 2. Language Syntax
 
 ## Language Syntax
 
