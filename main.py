@@ -18,6 +18,7 @@ from preprocessor import Preprocessor
 from cross_platform import AssemblyConverter, global_assembly_converter
 from code_analysis import CodeQualityEngine
 from stdlib_extended import StandardLibrary, global_stdlib
+from c_codegen import CCodeGenerator
 
 # Color constants
 class Colors:
@@ -54,6 +55,7 @@ class HLASMPreprocessor:
         self.lexer = Lexer()
         self.parser = Parser()
         self.codegen = CodeGenerator(target_os, target_arch)
+        self.c_codegen = CCodeGenerator()  # For processing C commands
         self.preprocessor = Preprocessor()
         self.symbol_table = SymbolTable()
         self.error_handler = ErrorHandler()
@@ -75,28 +77,33 @@ class HLASMPreprocessor:
     
     def process_file(self, filename: str, enable_optimization: bool = True, 
                     enable_analysis: bool = True) -> str:
-        """Process high-level assembly file with advanced features"""
+        """Process high-level assembly file with 3-stage pipeline: C codegen → HLASM codegen → Pure assembly"""
         try:
             # Set current file for error reporting
             self.error_handler.set_current_file(filename)
             
-            # Preprocessing phase
-            preprocessed_lines = self.preprocessor.process_file(filename)
+            print_info("Starting 3-stage compilation pipeline...")
             
-            # Tokenization
-            tokens = self.lexer.tokenize('\n'.join(preprocessed_lines))
+            # STAGE 1: Process C commands embedded in assembly using c_codegen.py
+            print_system("[Stage 1/3] Processing C commands with c_codegen.py...")
+            stage1_output = self._process_c_commands(filename)
             
-            # Parsing with error handling
-            ast = self.parser.parse(tokens)
+            # STAGE 2: Process high-level assembly commands using codegen.py  
+            print_system("[Stage 2/3] Processing high-level assembly with codegen.py...")
+            stage2_output = self._process_hlasm_commands(stage1_output)
             
-            # Code generation
-            output = self.codegen.generate(ast)
-            output_lines = output.split('\n')
+            # STAGE 3: Final assembly processing and optimization
+            print_system("[Stage 3/3] Final processing and optimization...")
+            
+            # Parse remaining assembly
+            output_lines = stage2_output.split('\n')
             
             # Optimization phase
             if enable_optimization:
                 output_lines = self.optimizer.optimize(output_lines)
-                output = '\n'.join(output_lines)
+                final_output = '\n'.join(output_lines)
+            else:
+                final_output = stage2_output
             
             # Code quality analysis
             if enable_analysis:
@@ -108,7 +115,8 @@ class HLASMPreprocessor:
                 print(self.error_handler.generate_report(show_context=True))
                 sys.exit(1)
             
-            return output
+            print_success("3-stage pipeline completed successfully!")
+            return final_output
             
         except FileNotFoundError:
             print_error(f"Error: File '{filename}' not found")
@@ -121,9 +129,66 @@ class HLASMPreprocessor:
             sys.exit(1)
 
     
+    def _process_c_commands(self, filename: str) -> str:
+        """Stage 1: Process C commands using c_codegen.py"""
+        import tempfile
+        import os
+        
+        # Create a temporary file for intermediate output
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_stage1.asm', delete=False) as temp_file:
+            temp_output_path = temp_file.name
+        
+        try:
+            # Use c_codegen to process C commands
+            success = self.c_codegen.process_asm_file(filename, temp_output_path, "optimized", "windows")
+            
+            if not success:
+                raise Exception("C code generation failed")
+            
+            # Read the processed content
+            with open(temp_output_path, 'r') as f:
+                stage1_content = f.read()
+            
+            return stage1_content
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_output_path):
+                os.unlink(temp_output_path)
+    
+    def _process_hlasm_commands(self, content: str) -> str:
+        """Stage 2: Process high-level assembly commands using codegen.py"""
+        # Check if there are any high-level assembly commands to process
+        if not any(line.strip().startswith('%') and not line.strip().startswith('%!') 
+                  for line in content.split('\n')):
+            # No high-level assembly commands, return as-is
+            return content
+        
+        try:
+            # Tokenize the content
+            tokens = self.lexer.tokenize(content)
+            
+            # Parse with error handling
+            ast = self.parser.parse(tokens)
+            
+            # Generate assembly code
+            hlasm_output = self.codegen.generate(ast)
+            
+            return hlasm_output
+            
+        except Exception as e:
+            # If parsing fails, it might be pure assembly already
+            print_warning(f"Stage 2 parsing failed, treating as pure assembly: {e}")
+            return content
+    
     def get_stdlib_used(self):
         """Get the set of standard library functions used"""
-        return self.codegen.stdlib_used
+        stdlib_used = set()
+        if hasattr(self.codegen, 'stdlib_used'):
+            stdlib_used.update(self.codegen.stdlib_used)
+        if hasattr(self.c_codegen, 'stdlib_used'):
+            stdlib_used.update(getattr(self.c_codegen, 'stdlib_used', set()))
+        return stdlib_used
     
     def get_optimization_report(self) -> str:
         """Get optimization report"""
@@ -231,9 +296,11 @@ class HLASMCompiler:
                                                        enable_analysis=self.enable_analysis)
             
             if verbose:
-                print_info(f"Generated {len(asm_output.split(chr(10)))} lines of assembly")
-                if self.preprocessor.get_stdlib_used():
-                    print_info(f"Standard library functions: {', '.join(sorted(self.preprocessor.get_stdlib_used()))}")
+                print_info(f"Generated {len(asm_output.split(chr(10)))} lines of final assembly")
+                stdlib_used = self.preprocessor.get_stdlib_used()
+                if stdlib_used:
+                    print_info(f"Standard library functions: {', '.join(sorted(stdlib_used))}")
+                print_info("Pipeline stages completed: C codegen → HLASM codegen → Pure assembly")
             
             # Write preprocessed assembly to temporary file
             asm_file = os.path.join(self.temp_dir, 'output.asm')
@@ -380,8 +447,10 @@ class HLASMCompiler:
             if verbose:
                 print_info(f"Optimization level: {self.optimization_level}")
                 print_info(f"Target platform: {self.target_os}")
-                if self.preprocessor.get_stdlib_used():
-                    print_info(f"Standard library functions used: {', '.join(sorted(self.preprocessor.get_stdlib_used()))}")
+                print_info("Compilation pipeline: C commands → High-level ASM → Pure assembly")
+                stdlib_used = self.preprocessor.get_stdlib_used()
+                if stdlib_used:
+                    print_info(f"Standard library functions used: {', '.join(sorted(stdlib_used))}")
             
             return True
             
@@ -436,6 +505,7 @@ def main():
         print(f"{Colors.BLUE}Usage:{Colors.RESET} python3 main.py <command> <input.asm> [options]")
         print()
         print("Advanced High-Level Assembly Language Preprocessor and Compiler")
+        print("3-Stage Pipeline: C Commands → High-Level Assembly → Pure Assembly")
         print()
         print(f"{Colors.ORANGE}Commands:{Colors.RESET}")
         print("  p <input.asm> [output.asm]  - Preprocess only (default behavior)")
@@ -540,8 +610,10 @@ def main():
             
             if verbose:
                 print_info(f"Optimization level: {optimization_level}")
-                if preprocessor.get_stdlib_used():
-                    print_info(f"Standard library functions included: {', '.join(sorted(preprocessor.get_stdlib_used()))}")
+                stdlib_used = preprocessor.get_stdlib_used()
+                if stdlib_used:
+                    print_info(f"Standard library functions included: {', '.join(sorted(stdlib_used))}")
+                print_info("Pipeline: C commands → High-level ASM → Pure assembly")
                 
                 if enable_analysis:
                     print("\n" + preprocessor.get_quality_report())
@@ -583,8 +655,10 @@ def main():
             
             if verbose:
                 print_info(f"Optimization level: {optimization_level}")
-                if preprocessor.get_stdlib_used():
-                    print_info(f"Standard library functions included: {', '.join(sorted(preprocessor.get_stdlib_used()))}")
+                stdlib_used = preprocessor.get_stdlib_used()
+                if stdlib_used:
+                    print_info(f"Standard library functions included: {', '.join(sorted(stdlib_used))}")
+                print_info("Pipeline: C commands → High-level ASM → Pure assembly")
                 
                 if enable_analysis:
                     print("\n" + preprocessor.get_quality_report())

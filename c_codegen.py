@@ -47,6 +47,11 @@ class CCodeGenerator:
         self.variable_counter = 0
         self.stack_offset = 0
         
+        # Enhanced tracking for instruction numbering and mapping
+        self.instruction_counter = 0  # Sequential instruction numbering
+        self.lc_label_counter = 0     # Counter for LC labels (LC1, LC2, LC3...)
+        self.lc_label_mapping = {}    # Maps original .LC0, .LC1 to LC1, LC2...
+        
         # Global counters for variable naming
         self.hasm_var_counter = 0  # For V01, V02, V03...
         self.c_var_counter = 0     # For L01, L02, L03...
@@ -492,9 +497,23 @@ class CCodeGenerator:
         return f'[rbp-{self.track_c_variable(var_name, "int")}]'
     
     def generate_optimized_assembly(self, c_code: str, hasm_vars: Dict[str, HASMVariable], mode: str = "optimized") -> str:
-        """Generate assembly using GCC compilation with external declarations"""
+        """Generate assembly using GCC compilation with external declarations and enhanced tracking"""
+        # Add ASM markers around the C code for better tracking
+        enhanced_c_code = self._add_asm_markers(c_code)
+        
         # Always use GCC compilation for proper external linkage
-        return self._compile_with_gcc(c_code, hasm_vars)
+        return self._compile_with_gcc(enhanced_c_code, hasm_vars)
+    
+    def _add_asm_markers(self, c_code: str) -> str:
+        """Wrap each C instruction with asm(nop) above and below"""
+        lines = c_code.strip().split('\n')
+        result_lines = []
+        for line in lines:
+            if line.strip():
+                result_lines.append('__asm__("nop");')
+                result_lines.append(line)
+                result_lines.append('__asm__("nop");')
+        return '\n'.join(result_lines)
     
     def _generate_direct_assembly(self, c_code: str, hasm_vars: Dict[str, HASMVariable]) -> str:
         """Generate optimized assembly directly without full compilation"""
@@ -812,10 +831,9 @@ class CCodeGenerator:
             return f"; Error: {str(e)}"
     
     def _convert_to_nasm_syntax(self, asm_content: str, hasm_vars: Dict[str, HASMVariable]) -> str:
-        """Convert GCC Intel assembly to NASM-compatible syntax"""
+        """Convert GCC Intel assembly to NASM-compatible syntax with proper LC label mapping"""
         lines = asm_content.split('\n')
         converted_lines = []
-        string_counter = 0
         
         for line in lines:
             converted_line = line
@@ -842,24 +860,10 @@ class CCodeGenerator:
                         # Simple string without escape sequences
                         converted_line = re.sub(r'\.ascii\s+"[^"]*"', f'db "{string_content}", 0', converted_line)
             
-            # Replace .LC labels with unique identifiers
-            if line.strip().endswith(':') and '.LC' in line:
-                converted_line = f'str_const_{string_counter}:'
-                string_counter += 1
-            elif '.LC' in line and not line.strip().startswith(';') and not line.strip().endswith(':'):
-                # This is a reference to a .LC label, we need to map it to the most recent str_const
-                # For now, let's use a simple approach and map all .LC references to str_const_0, 1, 2, etc.
-                if '.LC0' in line:
-                    converted_line = line.replace('.LC0', f'str_const_{string_counter}')
-                elif '.LC1' in line:
-                    converted_line = line.replace('.LC1', f'str_const_1')
-                elif '.LC2' in line:
-                    converted_line = line.replace('.LC2', f'str_const_2')
-                elif '.LC3' in line:
-                    converted_line = line.replace('.LC3', f'str_const_3')
+            # Enhanced LC label replacement
+            converted_line = self._replace_lc_labels_enhanced(converted_line)
             
             # Convert QWORD PTR references to direct variable access
-            # For integers, we want the value, for strings we want the address
             for var_name, var in hasm_vars.items():
                 mapped_name = self.get_hasm_var_name(var_name)
                 if var.var_type == 'int':
@@ -902,6 +906,41 @@ class CCodeGenerator:
                     break
         
         return '\n'.join(converted_lines)
+            
+    def _replace_lc_labels_enhanced(self, line: str) -> str:
+        """Enhanced LC label replacement that maps .LC0, .LC1, etc. to LC1, LC2, LC3..."""
+        # Handle label definitions: .LC0: -> LC1:
+        if line.strip().endswith(':') and '.LC' in line:
+            lc_match = re.search(r'\.LC(\d+):', line)
+            if lc_match:
+                original_num = lc_match.group(1)
+                original_label = f'.LC{original_num}'
+                
+                # Check if we already mapped this label
+                if original_label not in self.lc_label_mapping:
+                    self.lc_label_counter += 1
+                    self.lc_label_mapping[original_label] = f'LC{self.lc_label_counter}'
+                
+                return line.replace(f'.LC{original_num}:', f'{self.lc_label_mapping[original_label]}:')
+        
+        # Handle label references: .LC0 -> LC1
+        elif '.LC' in line and not line.strip().startswith(';'):
+            # Find all .LC references in the line
+            lc_matches = re.finditer(r'\.LC(\d+)', line)
+            for match in lc_matches:
+                original_num = match.group(1)
+                original_label = f'.LC{original_num}'
+                
+                # Check if we already mapped this label
+                if original_label not in self.lc_label_mapping:
+                    self.lc_label_counter += 1
+                    self.lc_label_mapping[original_label] = f'LC{self.lc_label_counter}'
+                
+                line = line.replace(original_label, self.lc_label_mapping[original_label])
+            
+            return line
+        
+        return line
     
     def _map_hasm_variables_in_asm(self, asm_content: str, hasm_vars: Dict[str, HASMVariable]) -> str:
         """Clean up the assembly and ensure proper external linkage"""
@@ -1023,6 +1062,93 @@ int main() {{
         
         return '\n'.join(result)
     
+    def _extract_assembly_blocks(self, asm_code: str) -> List[str]:
+        """Extract assembly code blocks that correspond to C instructions"""
+        lines = asm_code.split('\n')
+        
+        # Find pairs of /APP and /NO_APP markers
+        marker_pairs = []
+        i = 0
+        while i < len(lines):
+            if lines[i].strip() == '/APP':
+                # Find the matching /NO_APP
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip() == '/NO_APP':
+                        marker_pairs.append((i, j))
+                        i = j
+                        break
+                else:
+                    i += 1
+            else:
+                i += 1
+        
+        # For each marker pair, extract the corresponding assembly block
+        blocks = []
+        for pair_idx, (app_pos, no_app_pos) in enumerate(marker_pairs):
+            # Look after the /NO_APP marker for the actual assembly code
+            block_lines = []
+            start_pos = no_app_pos + 1
+            
+            # Determine the end position (either next /APP or end of function)
+            end_pos = len(lines)
+            if pair_idx + 1 < len(marker_pairs):
+                end_pos = marker_pairs[pair_idx + 1][0]  # Next /APP position
+            
+            # Collect meaningful assembly instructions
+            for k in range(start_pos, end_pos):
+                line = lines[k]
+                stripped = line.strip()
+                
+                # Skip empty lines and comments
+                if not stripped or stripped.startswith(';'):
+                    continue
+                
+                # Skip labels and directives
+                if stripped.endswith(':') or stripped.startswith('.'):
+                    continue
+                
+                # Skip function epilogue unless it's the last block
+                if pair_idx < len(marker_pairs) - 1:  # Not the last block
+                    if any(instr in stripped for instr in ['add rsp', 'pop', 'ret', 'leave']):
+                        continue
+                
+                # Add the instruction
+                block_lines.append(line)
+            
+            if block_lines:
+                blocks.append('\n'.join(block_lines))
+        
+        return blocks
+    
+    def _process_file_with_assembly_blocks(self, lines: List[str], c_instructions: List[Tuple[int, str, int]], 
+                                         assembly_blocks: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
+        """Process the original file and insert assembly blocks in place of C instructions"""
+        processed_lines = []
+        
+        # Create mapping of line numbers to assembly blocks
+        line_to_block = {}
+        for i, (line_num, c_code, inst_id) in enumerate(c_instructions):
+            if i < len(assembly_blocks):
+                line_to_block[line_num] = assembly_blocks[i]
+        
+        # Process each line
+        for i, line in enumerate(lines):
+            if line.strip().startswith('%var '):
+                # Skip %var declarations as they go to data section
+                continue
+            elif self.is_c_command(line):
+                # Replace C instruction with its corresponding assembly block
+                if i in line_to_block:
+                    processed_lines.append(f"; C instruction {c_instructions[[x[0] for x in c_instructions].index(i)][2]}: {line.strip()}")
+                    processed_lines.append(line_to_block[i])
+                else:
+                    processed_lines.append(f"; C instruction (no assembly): {line.strip()}")
+            else:
+                # Keep other lines as-is
+                processed_lines.append(line)
+        
+        return processed_lines
+    
     # ========== C BLOCK PROCESSING ==========
     
     def _identify_c_blocks(self, lines: List[str]) -> List[Dict[str, Any]]:
@@ -1085,7 +1211,7 @@ int main() {{
     # ========== MAIN PROCESSING METHODS ==========
     
     def process_asm_file(self, input_file: str, output_file: str, mode: str = "optimized", target_platform: str = "windows") -> bool:
-        """Process an ASM file with C code generation"""
+        """Process an ASM file with C code generation (all C code as one block, wrap each instruction with asm(nop))"""
         try:
             # Reset counters for each new file but preserve constant counter logic
             self.hasm_var_counter = 0
@@ -1097,30 +1223,80 @@ int main() {{
             self.constant_counter = 0  # Reset string constant counter for new file
             self.variable_counter = 0
             self.stack_offset = 0
-            
+
+            # Reset enhanced tracking counters
+            self.instruction_counter = 0
+            self.lc_label_counter = 0
+            self.lc_label_mapping = {}
+
             with open(input_file, 'r') as f:
                 content = f.read()
-            
+
             # Parse HASM variables first
             hasm_vars = self.parse_hasm_variables(content)
+
+            # Extract all C code lines with their positions and assign incrementing IDs
+            c_instructions = []  # List of (line_number, c_code, instruction_id)
+            lines = content.split('\n')
+            instruction_counter = 0
             
-            # Process the content
-            processed_content = self._process_content(content, hasm_vars, mode, target_platform)
-            
-            # Write to output file
+            for i, line in enumerate(lines):
+                if self.is_c_command(line):
+                    instruction_counter += 1
+                    c_code = line.strip()[2:].strip()
+                    c_instructions.append((i, c_code, instruction_counter))
+
+            # Combine all C code into a single block
+            combined_c_code = '\n'.join([inst[1] for inst in c_instructions])
+
+            # Generate assembly for the whole C code block, wrapping each instruction with asm(nop)
+            if combined_c_code.strip():
+                asm_code = self.generate_optimized_assembly(combined_c_code, hasm_vars, mode)
+                
+                # Extract assembly blocks between /APP and /NO_APP markers
+                assembly_blocks = self._extract_assembly_blocks(asm_code)
+                
+                # Take only the first N blocks matching the number of C instructions
+                # The last block is usually function cleanup
+                filtered_blocks = assembly_blocks[:len(c_instructions)]
+                
+                # Process the original file and insert assembly blocks
+                processed_lines = self._process_file_with_assembly_blocks(
+                    lines, c_instructions, filtered_blocks, hasm_vars
+                )
+            else:
+                processed_lines = [line for line in lines if not line.strip().startswith('%var ')]
+
+            # Build final output
+            data_section_lines = self.generate_hasm_variable_data_section(hasm_vars)
+            text_section_lines = processed_lines
+
+            # Build the final output with proper sections
+            final_output = []
+            if data_section_lines:
+                final_output.append('section .data')
+                final_output.extend(data_section_lines)
+                final_output.append('')
+            if text_section_lines:
+                final_output.append('section .text')
+                final_output.extend(text_section_lines)
+
             with open(output_file, 'w') as f:
-                f.write(processed_content)
-            
+                f.write('\n'.join(final_output))
+
             print(f"Successfully processed {input_file} -> {output_file}")
             print(f"Found {len(hasm_vars)} HASM variables: {list(hasm_vars.keys())}")
             print(f"  Mapped to: {list(self.hasm_var_mapping.values())}")
             if self.c_var_mapping:
                 print(f"C variables: {list(self.c_var_mapping.keys())}")
                 print(f"  Mapped to: {list(self.c_var_mapping.values())}")
+            print(f"Generated {self.lc_label_counter} LC labels: {list(self.lc_label_mapping.values())}")
+            print(f"Processed {len(c_instructions)} C instructions with assembly blocks")
+            print(f"LC label mapping: {self.lc_label_mapping}")
             print(f"Generated {self.constant_counter} string constants")
             print(f"Mode: {mode}")
             return True
-            
+
         except Exception as e:
             print(f"Error processing file: {str(e)}")
             return False
