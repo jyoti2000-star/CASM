@@ -19,6 +19,7 @@ from cross_platform import AssemblyConverter, global_assembly_converter
 from code_analysis import CodeQualityEngine
 from stdlib_extended import StandardLibrary, global_stdlib
 from c_codegen import CCodeGenerator
+from formatter import ASMFormatter
 
 # Color constants
 class Colors:
@@ -60,6 +61,7 @@ class HLASMPreprocessor:
         self.symbol_table = SymbolTable()
         self.error_handler = ErrorHandler()
         self.quality_engine = CodeQualityEngine()
+        self.formatter = ASMFormatter()  # Add formatter
         
         # Set optimization level
         opt_levels = {
@@ -115,6 +117,17 @@ class HLASMPreprocessor:
                 print(self.error_handler.generate_report(show_context=True))
                 sys.exit(1)
             
+            # Save unformatted output for debugging
+            unformatted_file = "output/unformatted_debug.asm"
+            os.makedirs("output", exist_ok=True)
+            with open(unformatted_file, 'w') as f:
+                f.write(final_output)
+            print_info(f"Unformatted output saved to: {unformatted_file}")
+            
+            # Apply formatter to final output
+            print_system("[Final] Formatting final assembly...")
+            final_output = self._format_assembly_content(final_output)
+            
             print_success("3-stage pipeline completed successfully!")
             return final_output
             
@@ -156,6 +169,42 @@ class HLASMPreprocessor:
             if os.path.exists(temp_output_path):
                 os.unlink(temp_output_path)
     
+    def _format_assembly_content(self, content: str) -> str:
+        """Format assembly content with proper section headers"""
+        import tempfile
+        import os
+        
+        # Create temporary files for formatting
+        with tempfile.NamedTemporaryFile(mode='w', suffix='_unformatted.asm', delete=False) as temp_input:
+            temp_input.write(content)
+            temp_input_path = temp_input.name
+        
+        with tempfile.NamedTemporaryFile(mode='r', suffix='_formatted.asm', delete=False) as temp_output:
+            temp_output_path = temp_output.name
+        
+        try:
+            # Create a new formatter instance to avoid conflicts
+            formatter = ASMFormatter()
+            
+            # Format the content
+            success = formatter.format_file(temp_input_path, temp_output_path)
+            
+            if success:
+                # Read the formatted content
+                with open(temp_output_path, 'r') as f:
+                    formatted_content = f.read()
+                return formatted_content
+            else:
+                print_warning("Formatting failed, using original content")
+                return content
+                
+        finally:
+            # Clean up temporary files
+            if os.path.exists(temp_input_path):
+                os.unlink(temp_input_path)
+            if os.path.exists(temp_output_path):
+                os.unlink(temp_output_path)
+    
     def _process_hlasm_commands(self, content: str) -> str:
         """Stage 2: Process high-level assembly commands using codegen.py"""
         # Check if there are any high-level assembly commands to process
@@ -165,6 +214,9 @@ class HLASMPreprocessor:
             return content
         
         try:
+            # Extract existing data sections from c_codegen output
+            existing_data_sections = self._extract_existing_data_sections(content)
+            
             # Tokenize the content
             tokens = self.lexer.tokenize(content)
             
@@ -174,12 +226,84 @@ class HLASMPreprocessor:
             # Generate assembly code
             hlasm_output = self.codegen.generate(ast)
             
-            return hlasm_output
+            # Merge existing data sections with new output
+            merged_output = self._merge_data_sections(hlasm_output, existing_data_sections)
+            
+            return merged_output
             
         except Exception as e:
             # If parsing fails, it might be pure assembly already
             print_warning(f"Stage 2 parsing failed, treating as pure assembly: {e}")
             return content
+    
+    def _extract_existing_data_sections(self, content: str) -> dict:
+        """Extract existing data sections from content"""
+        lines = content.split('\n')
+        data_sections = {'data': [], 'bss': []}
+        current_section = None
+        in_data_section = False
+        
+        for line in lines:
+            stripped = line.strip()
+            if stripped == '; DATA START':
+                in_data_section = True
+                current_section = 'data'
+                continue
+            elif stripped == '; DATA END':
+                in_data_section = False
+                current_section = None
+                continue
+            elif in_data_section and current_section:
+                data_sections[current_section].append(line)
+        
+        return data_sections
+    
+    def _merge_data_sections(self, hlasm_output: str, existing_data: dict) -> str:
+        """Merge existing data sections with new HLASM output, removing duplicates"""
+        lines = hlasm_output.split('\n')
+        result = []
+        in_data_section = False
+        data_section_written = False
+        skip_until_data_end = False
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Skip duplicate data sections that come after the first one
+            if stripped == '; DATA START' and data_section_written:
+                skip_until_data_end = True
+                continue
+            elif stripped == '; DATA END' and skip_until_data_end:
+                skip_until_data_end = False
+                continue
+            elif skip_until_data_end:
+                continue
+            
+            # When we encounter the first data section marker, merge everything
+            if stripped == '; DATA START' and not data_section_written:
+                result.append(line)
+                
+                # Add existing data first
+                if existing_data['data']:
+                    result.extend(existing_data['data'])
+                
+                # Add new data from HLASM
+                in_data_section = True
+                data_section_written = True
+                continue
+            elif stripped == '; DATA END' and in_data_section:
+                result.append(line)
+                in_data_section = False
+                continue
+            elif in_data_section:
+                # Add new HLASM data (this will be the %println strings)
+                result.append(line)
+                continue
+            else:
+                # Regular lines
+                result.append(line)
+        
+        return '\n'.join(result)
     
     def get_stdlib_used(self):
         """Get the set of standard library functions used"""

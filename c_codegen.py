@@ -1302,14 +1302,14 @@ int main() {{
                 data_section_lines.extend(string_constants)
             text_section_lines = processed_lines
 
-            # Build the final output with proper sections
+            # Build the final output with custom data markers instead of sections
             final_output = []
             if data_section_lines:
-                final_output.append('section .data')
+                final_output.append('; DATA START')
                 final_output.extend(data_section_lines)
+                final_output.append('; DATA END')
                 final_output.append('')
             if text_section_lines:
-                final_output.append('section .text')
                 final_output.extend(text_section_lines)
 
             with open(output_file, 'w') as f:
