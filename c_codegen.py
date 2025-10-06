@@ -1120,6 +1120,31 @@ int main() {{
         
         return blocks
     
+    def _extract_string_constants(self, asm_code: str) -> List[str]:
+        """Extract string constants (LC labels) from generated assembly"""
+        lines = asm_code.split('\n')
+        string_constants = []
+        
+        # Look for the string constants section
+        in_string_section = False
+        for line in lines:
+            stripped = line.strip()
+            
+            # Start of string constants section
+            if stripped == '; String constants':
+                in_string_section = True
+                continue
+            
+            # End of string constants section (empty line or start of code)
+            if in_string_section and (not stripped or stripped.startswith('push') or stripped.startswith('mov')):
+                break
+            
+            # Collect string constant lines
+            if in_string_section and stripped:
+                string_constants.append(line)
+        
+        return string_constants
+    
     def _process_file_with_assembly_blocks(self, lines: List[str], c_instructions: List[Tuple[int, str, int]], 
                                          assembly_blocks: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
         """Process the original file and insert assembly blocks in place of C instructions"""
@@ -1253,6 +1278,9 @@ int main() {{
             if combined_c_code.strip():
                 asm_code = self.generate_optimized_assembly(combined_c_code, hasm_vars, mode)
                 
+                # Extract string constants (LC labels) from the generated assembly
+                string_constants = self._extract_string_constants(asm_code)
+                
                 # Extract assembly blocks between /APP and /NO_APP markers
                 assembly_blocks = self._extract_assembly_blocks(asm_code)
                 
@@ -1266,9 +1294,12 @@ int main() {{
                 )
             else:
                 processed_lines = [line for line in lines if not line.strip().startswith('%var ')]
+                string_constants = []
 
             # Build final output
             data_section_lines = self.generate_hasm_variable_data_section(hasm_vars)
+            if string_constants:
+                data_section_lines.extend(string_constants)
             text_section_lines = processed_lines
 
             # Build the final output with proper sections
@@ -1293,7 +1324,10 @@ int main() {{
             print(f"Generated {self.lc_label_counter} LC labels: {list(self.lc_label_mapping.values())}")
             print(f"Processed {len(c_instructions)} C instructions with assembly blocks")
             print(f"LC label mapping: {self.lc_label_mapping}")
-            print(f"Generated {self.constant_counter} string constants")
+            if combined_c_code.strip():
+                print(f"Generated {len(string_constants)} string constants")
+            else:
+                print(f"Generated 0 string constants")
             print(f"Mode: {mode}")
             return True
 
