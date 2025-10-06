@@ -1,0 +1,732 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import platform
+import subprocess
+import tempfile
+import shutil
+import json
+from pathlib import Path
+from lexer import Lexer
+from parser import Parser
+from codegen import CodeGenerator
+from symbol_table import SymbolTable, global_symbol_table
+from optimizer import OptimizationEngine, OptimizationLevel
+from error_handler import ErrorHandler, global_error_handler
+from preprocessor import Preprocessor
+from cross_platform import AssemblyConverter, global_assembly_converter
+from code_analysis import CodeQualityEngine
+from stdlib_extended import StandardLibrary, global_stdlib
+
+# Color constants
+class Colors:
+    RED = '\033[91m'      # Error messages
+    ORANGE = '\033[38;5;208m'  # System commands (proper orange)
+    GREEN = '\033[92m'    # Success messages
+    BLUE = '\033[94m'     # Info messages
+    YELLOW = '\033[93m'   # Warning messages
+    RESET = '\033[0m'     # Reset to default
+
+def print_error(message):
+    """Print error message with red [x]"""
+    print(f"{Colors.RED}[x]{Colors.RESET} {message}", file=sys.stderr)
+
+def print_system(message):
+    """Print system command message with orange [*]"""
+    print(f"{Colors.ORANGE}[*]{Colors.RESET} {message}")
+
+def print_success(message):
+    """Print success message with green [+]"""
+    print(f"{Colors.GREEN}[+]{Colors.RESET} {message}")
+
+def print_info(message):
+    """Print info message with blue [-]"""
+    print(f"{Colors.BLUE}[-]{Colors.RESET} {message}")
+
+def print_warning(message):
+    """Print warning message with yellow [!]"""
+    print(f"{Colors.YELLOW}[!]{Colors.RESET} {message}")
+
+
+class HLASMPreprocessor:
+    def __init__(self, target_os: str = None, target_arch: str = None, optimization_level: str = "O2"):
+        self.lexer = Lexer()
+        self.parser = Parser()
+        self.codegen = CodeGenerator(target_os, target_arch)
+        self.preprocessor = Preprocessor()
+        self.symbol_table = SymbolTable()
+        self.error_handler = ErrorHandler()
+        self.quality_engine = CodeQualityEngine()
+        
+        # Set optimization level
+        opt_levels = {
+            "O0": OptimizationLevel.O0,
+            "O1": OptimizationLevel.O1, 
+            "O2": OptimizationLevel.O2,
+            "O3": OptimizationLevel.O3,
+            "Os": OptimizationLevel.Os
+        }
+        self.optimizer = OptimizationEngine(opt_levels.get(optimization_level, OptimizationLevel.O2))
+        
+        # Set target platform
+        platform_name = f"{self.codegen.platform.os_name}-{self.codegen.platform.architecture}"
+        global_assembly_converter.set_target_platform(platform_name)
+    
+    def process_file(self, filename: str, enable_optimization: bool = True, 
+                    enable_analysis: bool = True) -> str:
+        """Process high-level assembly file with advanced features"""
+        try:
+            # Set current file for error reporting
+            self.error_handler.set_current_file(filename)
+            
+            # Preprocessing phase
+            preprocessed_lines = self.preprocessor.process_file(filename)
+            
+            # Tokenization
+            tokens = self.lexer.tokenize('\n'.join(preprocessed_lines))
+            
+            # Parsing with error handling
+            ast = self.parser.parse(tokens)
+            
+            # Code generation
+            output = self.codegen.generate(ast)
+            output_lines = output.split('\n')
+            
+            # Optimization phase
+            if enable_optimization:
+                output_lines = self.optimizer.optimize(output_lines)
+                output = '\n'.join(output_lines)
+            
+            # Code quality analysis
+            if enable_analysis:
+                self.quality_engine.analyze_code(output_lines)
+            
+            # Check for errors
+            if self.error_handler.has_errors():
+                print_error("Compilation failed due to errors:")
+                print(self.error_handler.generate_report(show_context=True))
+                sys.exit(1)
+            
+            return output
+            
+        except FileNotFoundError:
+            print_error(f"Error: File '{filename}' not found")
+            sys.exit(1)
+        except Exception as e:
+            print_error(f"Error processing file: {e}")
+            if hasattr(e, '__traceback__'):
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
+
+    
+    def get_stdlib_used(self):
+        """Get the set of standard library functions used"""
+        return self.codegen.stdlib_used
+    
+    def get_optimization_report(self) -> str:
+        """Get optimization report"""
+        return self.optimizer.get_optimization_report()
+    
+    def get_quality_report(self) -> str:
+        """Get code quality analysis report"""
+        return self.quality_engine.generate_quality_report()
+    
+    def get_symbol_report(self) -> str:
+        """Get symbol table report"""
+        return self.symbol_table.generate_symbol_report()
+    
+    def get_platform_report(self) -> str:
+        """Get platform compatibility report"""
+        return global_assembly_converter.generate_platform_report()
+    
+    def export_reports(self, base_filename: str):
+        """Export all compiler reports to files"""
+        reports = {
+            'optimization': self.get_optimization_report(),
+            'quality': self.get_quality_report(),
+            'symbols': self.get_symbol_report(),
+            'platform': self.get_platform_report()
+        }
+        
+        for report_type, content in reports.items():
+            filename = f"{base_filename}_{report_type}.txt"
+            with open(filename, 'w') as f:
+                f.write(content)
+            print_success(f"Exported {report_type} report to {filename}")
+
+
+class HLASMCompiler:
+    def __init__(self, target_os: str = None, target_arch: str = None, 
+                 optimization_level: str = "O2", enable_analysis: bool = True):
+        self.preprocessor = HLASMPreprocessor(target_os, target_arch, optimization_level)
+        self.temp_dir = None
+        self.target_os = self.preprocessor.codegen.platform.os_name
+        self.target_arch = self.preprocessor.codegen.platform.architecture
+        self.output_dir = "output"
+        self.optimization_level = optimization_level
+        self.enable_analysis = enable_analysis
+        self._ensure_output_dir()
+        
+        # Print target platform info
+        print_info(f"Target platform: {self.target_os}-{self.target_arch}")
+        print_info(f"Object format: {self.preprocessor.codegen.platform.object_format}")
+        print_info(f"Calling convention: {self.preprocessor.codegen.platform.calling_convention}")
+    
+    def _ensure_output_dir(self):
+        """Ensure output directory exists"""
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            print_success(f"Created output directory: {self.output_dir}")
+    
+    def check_dependencies(self):
+        """Check if required tools are available"""
+        required_tools = ['nasm', 'ld']
+        missing_tools = []
+        
+        for tool in required_tools:
+            if not shutil.which(tool):
+                missing_tools.append(tool)
+        
+        if missing_tools:
+            print_error(f"Error: Missing required tools: {', '.join(missing_tools)}")
+            print_error("Please install:")
+            for tool in missing_tools:
+                if tool == 'nasm':
+                    print_error("  - NASM assembler (brew install nasm)")
+                elif tool == 'ld':
+                    print_error("  - GNU linker (usually comes with Xcode Command Line Tools)")
+            return False
+        return True
+    
+    def compile_file(self, input_file: str, output_executable: str = None, 
+                    run_after_compile: bool = True, generate_reports: bool = False,
+                    verbose: bool = False):
+        """Compile HLASM file to executable with advanced features"""
+        
+        if not self.check_dependencies():
+            return False
+        
+        input_path = Path(input_file)
+        if not input_path.exists():
+            print_error(f"Error: Input file '{input_file}' not found")
+            return False
+        
+        # Set default output executable name in output directory
+        if output_executable is None:
+            output_executable = os.path.join(self.output_dir, input_path.stem)
+        elif not os.path.dirname(output_executable):
+            # If no directory specified, put in output folder
+            output_executable = os.path.join(self.output_dir, output_executable)
+        
+        try:
+            # Create temporary directory for intermediate files
+            self.temp_dir = tempfile.mkdtemp(prefix='hlasm_compile_')
+            
+            # Step 1: Preprocess high-level assembly to standard assembly
+            print_system(f"[1/5] Preprocessing {input_file}...")
+            asm_output = self.preprocessor.process_file(input_file, 
+                                                       enable_optimization=True,
+                                                       enable_analysis=self.enable_analysis)
+            
+            if verbose:
+                print_info(f"Generated {len(asm_output.split(chr(10)))} lines of assembly")
+                if self.preprocessor.get_stdlib_used():
+                    print_info(f"Standard library functions: {', '.join(sorted(self.preprocessor.get_stdlib_used()))}")
+            
+            # Write preprocessed assembly to temporary file
+            asm_file = os.path.join(self.temp_dir, 'output.asm')
+            with open(asm_file, 'w') as f:
+                f.write(asm_output)
+            
+            # Step 2: Show analysis results if enabled
+            if self.enable_analysis:
+                print_system("[2/5] Running code analysis...")
+                quality_report = self.preprocessor.get_quality_report()
+                
+                # Show summary
+                lines = quality_report.split('\n')
+                for line in lines:
+                    if 'Total Optimizations Applied:' in line:
+                        print_info(line)
+                    elif '[ERROR]' in line or '[WARNING]' in line:
+                        if '[ERROR]' in line:
+                            print_error(line)
+                        else:
+                            print_warning(line)
+                
+                if verbose:
+                    print(quality_report)
+            
+            # Step 3: Assemble with NASM
+            print_system("[3/5] Assembling with NASM...")
+            obj_file = os.path.join(self.temp_dir, 'output.o')
+            
+            nasm_cmd = ['nasm', '-f', self._get_object_format(), asm_file, '-o', obj_file]
+            
+            result = subprocess.run(nasm_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print_error(f"NASM assembly failed:")
+                print_error(result.stderr)
+                return False
+            
+            # Step 4: Link
+            print_system("[4/5] Linking...")
+            
+            # Check if we're cross-compiling
+            import platform as host_platform
+            host_os = host_platform.system().lower()
+            
+            if self.target_os == 'windows':
+                # For Windows cross-compilation using MinGW-w64
+                # Use GCC instead of ld directly for better library handling
+                mingw_gcc = shutil.which('x86_64-w64-mingw32-gcc')
+                if mingw_gcc:
+                    print_info("Using MinGW-w64 GCC for Windows cross-compilation")
+                    # Update output_executable to include .exe extension
+                    output_executable_with_ext = f'{output_executable}.exe'
+                    # Use GCC to link, which handles library paths automatically
+                    ld_cmd = ['x86_64-w64-mingw32-gcc', 
+                             '-nostartfiles',  # Don't use standard startup files
+                             '-e', 'main',     # Entry point
+                             obj_file, '-o', output_executable_with_ext,
+                             '-lkernel32', '-luser32']  # Required Windows libraries
+                    # Update output_executable for subsequent steps
+                    output_executable = output_executable_with_ext
+                else:
+                    print_warning("MinGW-w64 not found. Install with: brew install mingw-w64")
+                    print_error("Windows cross-compilation requires MinGW-w64 toolchain")
+                    return False
+            else:
+                # Default Windows linking
+                ld_cmd = ['ld', obj_file, '-o', output_executable]
+                # Add platform-specific linker options
+                ld_cmd.extend(self._get_linker_options())
+            
+            if verbose:
+                print_info(f"Linker command: {' '.join(ld_cmd)}")
+            
+            result = subprocess.run(ld_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print_error(f"Linking failed:")
+                print_error(result.stderr)
+                return False
+            
+            print_success(f"Executable created: {output_executable}")
+            
+            # Step 5: Run the executable (if requested)
+            if run_after_compile:
+                # Check if we're cross-compiling to a different platform
+                import platform as host_platform
+                host_os = host_platform.system().lower()
+                
+                if self.target_os == 'windows' and host_os != 'windows':
+                    # Check if Wine is available for running Windows executables
+                    wine_cmd = shutil.which('wine') or shutil.which('wine64')
+                    if wine_cmd:
+                        print_system(f"[5/5] Running {output_executable} with Wine...")
+                        print_info(f"Using Wine: {wine_cmd}")
+                        print("-" * 40)
+                        
+                        try:
+                            result = subprocess.run([wine_cmd, output_executable], 
+                                                  capture_output=False, text=True)
+                            print("-" * 40)
+                            if result.returncode == 0:
+                                print_success(f"Program exited with code: {result.returncode}")
+                            else:
+                                print_warning(f"Program exited with code: {result.returncode}")
+                        except KeyboardInterrupt:
+                            print_warning("Program interrupted by user")
+                        except Exception as e:
+                            print_error(f"Error running executable with Wine: {e}")
+                            return False
+                    else:
+                        print_warning(f"[5/5] Cross-compiled for Windows, cannot run on {host_os}")
+                        print_info(f"Windows executable created: {output_executable}")
+                        print_info("Install Wine to run Windows executables: brew install --cask wine-stable")
+                elif self.target_os != host_os:
+                    print_warning(f"[5/5] Cross-compiled for {self.target_os}, cannot run on {host_os}")
+                    print_info(f"Executable created: {output_executable}")
+                    print_info(f"Transfer to {self.target_os} system to run.")
+                else:
+                    print_system(f"[5/5] Running {output_executable}...")
+                    print("-" * 40)
+                    
+                    try:
+                        result = subprocess.run([f'./{output_executable}'], 
+                                              capture_output=False, text=True)
+                        print("-" * 40)
+                        if result.returncode == 0:
+                            print_success(f"Program exited with code: {result.returncode}")
+                        else:
+                            print_warning(f"Program exited with code: {result.returncode}")
+                    except KeyboardInterrupt:
+                        print_warning("Program interrupted by user")
+                    except Exception as e:
+                        print_error(f"Error running executable: {e}")
+                        return False
+            else:
+                print_success("Compilation complete")
+            
+            # Generate reports if requested
+            if generate_reports:
+                report_base = os.path.join(self.output_dir, input_path.stem)
+                self.preprocessor.export_reports(report_base)
+                print_info("Compilation reports generated")
+            
+            # Show compilation summary
+            if verbose:
+                print_info(f"Optimization level: {self.optimization_level}")
+                print_info(f"Target platform: {self.target_os}")
+                if self.preprocessor.get_stdlib_used():
+                    print_info(f"Standard library functions used: {', '.join(sorted(self.preprocessor.get_stdlib_used()))}")
+            
+            return True
+            
+        except Exception as e:
+            print_error(f"Compilation failed: {e}")
+            return False
+        
+        finally:
+            # Cleanup temporary files
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+    
+    def run_executable(self, executable_name: str):
+        """Run an existing executable"""
+        if not os.path.exists(executable_name):
+            print(f"Error: Executable '{executable_name}' not found", file=sys.stderr)
+            return False
+        
+        print(f"Running {executable_name}...")
+        print("-" * 40)
+        try:
+            result = subprocess.run([f'./{executable_name}'], capture_output=False, text=True)
+            print("-" * 40)
+            print(f"Program exited with code: {result.returncode}")
+            return True
+        except KeyboardInterrupt:
+            print("\nProgram interrupted by user")
+            return True
+        except Exception as e:
+            print(f"Error running executable: {e}", file=sys.stderr)
+            return False
+    
+    def _get_object_format(self):
+        """Get the appropriate object format for the current platform"""
+        return self.preprocessor.codegen.platform.object_format
+    
+    def _get_linker_options(self):
+        """Get platform-specific linker options"""
+        platform = self.preprocessor.codegen.platform
+        
+        # Only Windows is supported
+        if platform.os_name == 'windows':
+            if platform.architecture == 'x86_64':
+                return ['--entry=main']
+            else:
+                return ['--entry=main']
+        return []
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"{Colors.BLUE}Usage:{Colors.RESET} python3 main.py <command> <input.asm> [options]")
+        print()
+        print("Advanced High-Level Assembly Language Preprocessor and Compiler")
+        print()
+        print(f"{Colors.ORANGE}Commands:{Colors.RESET}")
+        print("  p <input.asm> [output.asm]  - Preprocess only (default behavior)")
+        print("  c <input.asm> [executable]  - Compile to executable only (don't run)")
+        print("  r <input.asm> [executable]  - Compile and run .asm file")
+        print("  convert <input.asm> <target> [output.asm] - Convert assembly to target architecture")
+        print("  analyze <input.asm>         - Run code quality analysis only")
+        print("  info                        - Show compiler information")
+        print()
+        print(f"{Colors.ORANGE}Options:{Colors.RESET}")
+        print("  -t <target>     Target platform (os-arch or just os)")
+        print("                  Examples: windows-x86_64, windows")
+        print("  -a <arch>       Target architecture (x86_64, arm64, x86_32)")
+        print("  -O <level>      Optimization level (O0, O1, O2, O3, Os)")
+        print("  -v, --verbose   Verbose output")
+        print()
+        print(f"{Colors.ORANGE}Examples:{Colors.RESET}")
+        print("  python3 main.py p program.asm              # Preprocess only (auto-detect)")
+        print("  python3 main.py c program.asm -O3 -v       # Compile with max optimization")
+        print("  python3 main.py r program.asm -t windows-x86_64  # Cross-compile for Windows x64")
+        print("  python3 main.py r program.asm -t windows      # Cross-compile for Windows")
+        print("  python3 main.py r program.asm -a arm64         # Target ARM64 (current OS)")
+        print("  python3 main.py convert program.asm windows-x86_64 program_win.asm")
+        print("  python3 main.py analyze program.asm        # Quality analysis only")
+        print("  python3 main.py info --platform-info       # Show platform info")
+        print()
+        print("All output files are saved in the 'output' folder")
+        sys.exit(1)
+    
+    # Parse command-line arguments
+    args = sys.argv[1:]
+    
+    # Parse options
+    target_os = None
+    target_arch = None
+    optimization_level = "O2"
+    verbose = False
+    enable_optimization = True
+    enable_analysis = True
+    generate_reports = False
+    
+    i = 0
+    while i < len(args):
+        if args[i] == '-t' and i + 1 < len(args):
+            target_spec = args[i + 1]
+            if '-' in target_spec:
+                target_os, target_arch = target_spec.split('-', 1)
+            else:
+                target_os = target_spec
+            args = args[:i] + args[i + 2:]
+        elif args[i] == '-a' and i + 1 < len(args):
+            target_arch = args[i + 1]
+            args = args[:i] + args[i + 2:]
+        elif args[i] in ['-O', '--optimize'] and i + 1 < len(args):
+            optimization_level = args[i + 1]
+            args = args[:i] + args[i + 2:]
+        elif args[i] in ['-v', '--verbose']:
+            verbose = True
+            args = args[:i] + args[i + 1:]
+        else:
+            i += 1
+    
+    if len(args) < 1:
+        print_error("Error: Command required")
+        sys.exit(1)
+    
+    command = args[0].lower()
+    
+    # Handle special commands
+    if command == 'info':
+        print(f"{Colors.BLUE}HLASM Advanced Compiler Information{Colors.RESET}")
+        print("=" * 50)
+        print(f"Version: 2.0")
+        print(f"Features: Optimization, Analysis, Cross-platform")
+        print(f"Supported platforms: {', '.join(global_assembly_converter.get_available_platforms())}")
+        print(f"Standard library functions: {len(global_stdlib.functions)}")
+        print(f"Categories: {', '.join(global_stdlib.get_all_categories())}")
+        return
+    
+    # Handle legacy usage (no command specified)
+    if command.endswith('.asm'):
+        # Legacy mode: python3 main.py input.asm [output.asm]
+        input_file = args[0]
+        if len(args) > 1:
+            output_file = args[1]
+            if not os.path.dirname(output_file):
+                output_file = os.path.join("output", output_file)
+        else:
+            basename = os.path.basename(input_file).replace('.asm', '_generated.asm')
+            output_file = os.path.join("output", basename)
+        
+        # Ensure output directory exists
+        os.makedirs("output", exist_ok=True)
+        
+        preprocessor = HLASMPreprocessor(target_os, target_arch, optimization_level)
+        output = preprocessor.process_file(input_file, enable_optimization, enable_analysis)
+        
+        try:
+            with open(output_file, 'w') as f:
+                f.write(output)
+            print_success(f"Successfully preprocessed: {input_file} -> {output_file}")
+            
+            if verbose:
+                print_info(f"Optimization level: {optimization_level}")
+                if preprocessor.get_stdlib_used():
+                    print_info(f"Standard library functions included: {', '.join(sorted(preprocessor.get_stdlib_used()))}")
+                
+                if enable_analysis:
+                    print("\n" + preprocessor.get_quality_report())
+            
+            if generate_reports:
+                report_base = os.path.join("output", Path(input_file).stem)
+                preprocessor.export_reports(report_base)
+                
+        except IOError as e:
+            print_error(f"Error writing output file: {e}")
+            sys.exit(1)
+        return
+    
+    # New command-based interface
+    if command == 'p':  # Preprocess only
+        if len(args) < 2:
+            print_error("Error: 'p' command requires input file")
+            sys.exit(1)
+        
+        input_file = args[1]
+        if len(args) > 2:
+            output_file = args[2]
+            if not os.path.dirname(output_file):
+                output_file = os.path.join("output", output_file)
+        else:
+            basename = os.path.basename(input_file).replace('.asm', '_generated.asm')
+            output_file = os.path.join("output", basename)
+        
+        # Ensure output directory exists
+        os.makedirs("output", exist_ok=True)
+        
+        preprocessor = HLASMPreprocessor(target_os, target_arch, optimization_level)
+        output = preprocessor.process_file(input_file, enable_optimization, enable_analysis)
+        
+        try:
+            with open(output_file, 'w') as f:
+                f.write(output)
+            print_success(f"Successfully preprocessed: {input_file} -> {output_file}")
+            
+            if verbose:
+                print_info(f"Optimization level: {optimization_level}")
+                if preprocessor.get_stdlib_used():
+                    print_info(f"Standard library functions included: {', '.join(sorted(preprocessor.get_stdlib_used()))}")
+                
+                if enable_analysis:
+                    print("\n" + preprocessor.get_quality_report())
+            
+            if generate_reports:
+                report_base = os.path.join("output", Path(input_file).stem)
+                preprocessor.export_reports(report_base)
+                
+        except IOError as e:
+            print_error(f"Error writing output file: {e}")
+            sys.exit(1)
+    
+    elif command == 'c':  # Compile only (don't run)
+        if len(args) < 2:
+            print_error("Error: 'c' command requires input file")
+            sys.exit(1)
+        
+        input_file = args[1]
+        output_executable = args[2] if len(args) > 2 else Path(input_file).stem
+        
+        compiler = HLASMCompiler(target_os, target_arch, optimization_level, enable_analysis)
+        success = compiler.compile_file(input_file, output_executable, 
+                                       run_after_compile=False, 
+                                       generate_reports=generate_reports,
+                                       verbose=verbose)
+        if not success:
+            sys.exit(1)
+    
+    elif command == 'r':  # Compile and run .asm file
+        if len(args) < 2:
+            print_error("Error: 'r' command requires input .asm file")
+            sys.exit(1)
+        
+        input_file = args[1]
+        if not input_file.endswith('.asm'):
+            print_error("Error: 'r' command requires a .asm file")
+            sys.exit(1)
+        
+        output_executable = args[2] if len(args) > 2 else Path(input_file).stem
+        
+        print_info(f"Compiling and running {input_file}...")
+        compiler = HLASMCompiler(target_os, target_arch, optimization_level, enable_analysis)
+        success = compiler.compile_file(input_file, output_executable, 
+                                       run_after_compile=True,
+                                       generate_reports=generate_reports,
+                                       verbose=verbose)
+        if not success:
+            sys.exit(1)
+    
+    elif command == 'analyze':  # Code quality analysis only
+        if len(args) < 2:
+            print_error("Error: 'analyze' command requires input file")
+            sys.exit(1)
+        
+        input_file = args[1]
+        
+        print_info(f"Analyzing {input_file}...")
+        
+        try:
+            with open(input_file, 'r') as f:
+                code_lines = f.readlines()
+            
+            quality_engine = CodeQualityEngine()
+            quality_engine.analyze_code(code_lines)
+            
+            print(quality_engine.generate_quality_report())
+            
+            if generate_reports:
+                report_base = os.path.join("output", Path(input_file).stem)
+                os.makedirs("output", exist_ok=True)
+                
+                with open(f"{report_base}_analysis.txt", 'w') as f:
+                    f.write(quality_engine.generate_quality_report())
+                
+                with open(f"{report_base}_analysis.json", 'w') as f:
+                    json.dump(quality_engine.export_results_json(), f, indent=2)
+                
+                print_success("Analysis reports generated")
+        
+        except Exception as e:
+            print_error(f"Analysis failed: {e}")
+            sys.exit(1)
+    
+    elif command == 'convert':  # Convert assembly to target architecture
+        if len(args) < 3:
+            print_error("Error: 'convert' command requires input file and target platform")
+            print_error("Usage: python3 main.py convert <input.asm> <target-platform> [output.asm]")
+            print_error("Example: python3 main.py convert program.asm windows-x86_64 program_win.asm")
+            sys.exit(1)
+        
+        input_file = args[1]
+        target_platform = args[2]
+        output_file = args[3] if len(args) > 3 else f"{Path(input_file).stem}_{target_platform.replace('-', '_')}.asm"
+        
+        print_info(f"Converting {input_file} to {target_platform}...")
+        
+        try:
+            # Check if target platform is supported
+            if target_platform not in global_assembly_converter.get_available_platforms():
+                print_error(f"Error: Unsupported target platform '{target_platform}'")
+                print_error(f"Supported platforms: {', '.join(global_assembly_converter.get_available_platforms())}")
+                sys.exit(1)
+            
+            # Create output directory if it doesn't exist
+            os.makedirs("output", exist_ok=True)
+            output_path = os.path.join("output", output_file)
+            
+            # Perform conversion
+            success = global_assembly_converter.convert_file(input_file, output_path, target_platform)
+            
+            if success:
+                print_success(f"Assembly converted successfully to {output_path}")
+                
+                # Generate conversion report if verbose
+                if verbose:
+                    with open(input_file, 'r') as f:
+                        original_code = f.read()
+                    
+                    report = global_assembly_converter.get_conversion_report(original_code, target_platform)
+                    print("\n" + "=" * 50)
+                    print("CONVERSION REPORT")
+                    print("=" * 50)
+                    print(report)
+                    
+                    # Save report to file
+                    report_path = os.path.join("output", f"{Path(input_file).stem}_conversion_report.txt")
+                    with open(report_path, 'w') as f:
+                        f.write(report)
+                    print_info(f"Conversion report saved to {report_path}")
+            else:
+                print_error("Conversion failed")
+                sys.exit(1)
+                
+        except Exception as e:
+            print_error(f"Conversion failed: {e}")
+            sys.exit(1)
+    
+    else:
+        print_error(f"Error: Unknown command '{command}'")
+        print_error("Valid commands: p (preprocess), c (compile), r (compile and run), convert, analyze, info")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
