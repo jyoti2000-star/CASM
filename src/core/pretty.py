@@ -24,36 +24,71 @@ class CASMPrettyPrinter:
         self.control_counter = 0  # Counter for control flow labels
         self.extra_variables = []  # Variables to add to data section
         
-    def prettify(self, assembly_code: str, ast: ProgramNode, variable_map: Dict, c_assembly_segments: Dict = None) -> str:
-        """Main entry point - prettify the assembly code with context awareness"""
-        self.variable_map = variable_map
-        self.c_assembly_segments = c_assembly_segments or {}
-        
-        # Reset counters for consistent labeling
-        self.string_counter = 0
-        self.control_counter = 0
+    def prettify(self, assembly_code: str, ast: ProgramNode, variable_labels: Dict = None, gcc_blocks: Dict = None) -> str:
+        """Format assembly code with proper structure and comments"""
+        # Initialize tracking
+        self.current_block_id = 0
         self.extra_variables = []
-        self.string_label_map = {}  # Map original labels to sequential ones
-        self.collected_strings = {}  # Map string_label -> content
+        self.variable_labels = variable_labels or {}
+        self.collected_strings = {}
+        self.c_assembly_segments = gcc_blocks or {}
         
-        # Pre-process AST to collect all strings
+        # Collect string literals from AST for cross-referencing
         self._collect_all_strings(ast)
         
-        self._extract_metadata(assembly_code)
+        # Pre-scan AST to collect for loop counters
+        self._collect_for_loop_counters(ast)
         
-        print_info("Prettifying assembly with context awareness...")
-        
-        # Parse the assembly into structured sections
+        lines = assembly_code.split('\n')
         sections = self._parse_assembly_sections(assembly_code)
         
-        # Rebuild with proper structure and context
-        prettified = self._rebuild_with_context(sections, ast)
+        output = []
         
-        # Final cleanup and formatting
-        final_output = self._final_cleanup(prettified)
+        # Header with comments
+        if 'header' in sections:
+            output.extend(self._format_header(sections['header']))
+            output.append("")
         
-        print_success("Assembly prettified with context preservation")
-        return final_output
+        # External declarations - always ensure they are included
+        output.append("; External function declarations")
+        
+        # Always ensure we have the necessary external function declarations
+        required_functions = ['abort', 'cos', 'exit', 'free', 'malloc', 'pow', 
+                             'printf', 'putchar', 'puts', 'rand', 'scanf', 'sin', 
+                             'sqrt', 'srand', 'strcmp', 'strcpy', 'strlen']
+        
+        # Add existing external declarations first
+        existing_externs = set()
+        if sections.get('externals'):
+            for line in sections['externals']:
+                if line.strip() and line.strip().startswith('extern'):
+                    output.append(line)
+                    # Extract function name from extern declaration
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        existing_externs.add(parts[1])
+        
+        # Add any missing required external functions
+        for func in required_functions:
+            if func not in existing_externs:
+                output.append(f"extern {func}")
+        
+        # Debug: force at least some extern declarations for testing
+        if not existing_externs:
+            print(f"[DEBUG] No existing externs found, adding all required functions: {required_functions}")
+        else:
+            print(f"[DEBUG] Found existing externs: {existing_externs}")
+        
+        output.append("")
+        
+        # Data section - organized
+        output.extend(self._format_data_section(sections['data']))
+        output.append("")
+        
+        # Text section with context-aware C code placement
+        output.extend(self._format_text_section_with_context(sections, ast))
+        
+        return '\n'.join(output)
     
     def _collect_all_strings(self, ast: ProgramNode):
         """Pre-process AST to collect all string literals for consistent labeling"""
@@ -83,6 +118,32 @@ class CASMPrettyPrinter:
         
         visit_statements(ast.statements)
         print_info(f"Collected {len(self.collected_strings)} string literals")
+    
+    def _collect_for_loop_counters(self, ast: ProgramNode):
+        """Pre-scan AST to collect all for loop counter variables"""
+        def visit_statements(statements):
+            for stmt in statements:
+                if isinstance(stmt, IfNode):
+                    visit_statements(stmt.if_body)
+                    if hasattr(stmt, 'else_body') and stmt.else_body:
+                        visit_statements(stmt.else_body)
+                elif isinstance(stmt, WhileNode):
+                    visit_statements(stmt.body)
+                elif isinstance(stmt, ForNode):
+                    # Generate deterministic counter variable name
+                    counter_hash = hash(f"{stmt.variable}_{stmt.count}") % 1000
+                    if counter_hash < 0:
+                        counter_hash = -counter_hash
+                    counter_var = f"for_counter_{counter_hash}"
+                    
+                    # Add to extra variables for data section
+                    self.extra_variables.append(f"    {counter_var} dd 0")
+                    
+                    # Visit nested statements
+                    visit_statements(stmt.body)
+        
+        visit_statements(ast.statements)
+        print_info(f"Pre-collected {len(self.extra_variables)} for loop counters")
     
     def _extract_metadata(self, assembly_code: str):
         """Extract metadata from the assembly code"""
@@ -138,6 +199,10 @@ class CASMPrettyPrinter:
         for line in lines:
             stripped = line.strip()
             
+            if stripped.startswith('extern'):
+                sections['externals'].append(line)
+                continue
+            
             # Detect GCC assembly blocks
             if '=== RAW GCC ASSEMBLY OUTPUT ===' in line:
                 current_gcc_block = {
@@ -189,12 +254,36 @@ class CASMPrettyPrinter:
         output.append("")
         
         # External declarations - cleaned up
+        output.append("; External function declarations")
+        
+        # Always ensure we have the necessary external function declarations
+        required_functions = ['abort', 'cos', 'exit', 'free', 'malloc', 'pow', 
+                             'printf', 'putchar', 'puts', 'rand', 'scanf', 'sin', 
+                             'sqrt', 'srand', 'strcmp', 'strcpy', 'strlen']
+        
+        # Add existing external declarations first
+        existing_externs = set()
         if sections['externals']:
-            output.append("; External function declarations")
             for line in sections['externals']:
-                if line.strip():
+                if line.strip() and line.strip().startswith('extern'):
                     output.append(line)
-            output.append("")
+                    # Extract function name from extern declaration
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        existing_externs.add(parts[1])
+        
+        # Add any missing required external functions
+        for func in required_functions:
+            if func not in existing_externs:
+                output.append(f"extern {func}")
+        
+        # Debug: force at least some extern declarations for testing
+        if not existing_externs:
+            print(f"[DEBUG] No existing externs found, adding all required functions: {required_functions}")
+        else:
+            print(f"[DEBUG] Found existing externs: {existing_externs}")
+        
+        output.append("")
         
         # Data section - organized
         output.extend(self._format_data_section(sections['data']))
@@ -395,18 +484,19 @@ class CASMPrettyPrinter:
             
         elif isinstance(stmt, ForNode):
             # Generate real for loop assembly
-            # Generate consistent labels
-            self.control_counter += 1
-            start_label = f"for_start_{self.control_counter}"
-            end_label = f"for_end_{self.control_counter}"
-            counter_var = f"for_counter_{self.control_counter}"
+            # Use a deterministic counter based on loop count and variable name
+            # This ensures consistency across different compilation phases
+            counter_hash = hash(f"{stmt.variable}_{stmt.count}") % 1000  # Keep it small
+            if counter_hash < 0:
+                counter_hash = -counter_hash
+            
+            start_label = f"for_start_{counter_hash}"
+            end_label = f"for_end_{counter_hash}"
+            counter_var = f"for_counter_{counter_hash}"
             
             output.append(f"    ; for {stmt.variable} in range({stmt.count})")
             
-            # Add counter variable to data section
-            self.extra_variables.append(f"    {counter_var} dd 0")
-            
-            # Initialize counter
+            # Initialize counter (variable already defined in data section)
             output.append(f"    mov dword [rel {counter_var}], 0")
             output.append(f"{start_label}:")
             
