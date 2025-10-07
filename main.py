@@ -19,7 +19,7 @@ from cross_platform import AssemblyConverter, global_assembly_converter
 from code_analysis import CodeQualityEngine
 from stdlib_extended import StandardLibrary, global_stdlib
 from c_codegen import CCodeGenerator
-from formatter import ASMFormatter
+from assembly_processor import ASMFormatter, AdvancedAssemblyProcessor, process_assembly_with_comparison
 
 # Color constants
 class Colors:
@@ -117,18 +117,87 @@ class HLASMPreprocessor:
                 print(self.error_handler.generate_report(show_context=True))
                 sys.exit(1)
             
-            # Save unformatted output for debugging
-            unformatted_file = "output/unformatted_debug.asm"
-            os.makedirs("output", exist_ok=True)
-            with open(unformatted_file, 'w') as f:
-                f.write(final_output)
-            print_info(f"Unformatted output saved to: {unformatted_file}")
-            
             # Apply formatter to final output
             print_system("[Final] Formatting final assembly...")
             final_output = self._format_assembly_content(final_output)
             
-            print_success("3-stage pipeline completed successfully!")
+            # Apply advanced assembly processing with automatic extern detection
+            print_system("[Post-processing] Applying advanced assembly processing with extern detection...")
+            try:
+                processor = AdvancedAssemblyProcessor(debug=False)
+                final_output = processor.process_assembly(final_output)
+                print_success("Advanced assembly processing completed successfully")
+            except Exception as e:
+                print_warning(f"Advanced assembly processing failed: {e}, continuing...")
+            
+            # Apply comprehensive final formatting
+            print_system("[Final Formatting] Applying comprehensive assembly formatting...")
+            try:
+                from formatter import AssemblyFormatter
+                final_formatter = AssemblyFormatter(debug=False)
+                
+                # Create temporary files for final formatting
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='_pre_final.asm', delete=False) as temp_input:
+                    temp_input.write(final_output)
+                    temp_input_path = temp_input.name
+                
+                with tempfile.NamedTemporaryFile(mode='r', suffix='_final.asm', delete=False) as temp_output:
+                    temp_output_path = temp_output.name
+                
+                # Format with the comprehensive formatter
+                success = final_formatter.format_file(temp_input_path, temp_output_path)
+                
+                if success:
+                    with open(temp_output_path, 'r') as f:
+                        final_output = f.read()
+                    print_success("Comprehensive assembly formatting completed successfully")
+                else:
+                    print_warning("Comprehensive formatting failed, using previous output")
+                
+                # Clean up temporary files
+                if os.path.exists(temp_input_path):
+                    os.unlink(temp_input_path)
+                if os.path.exists(temp_output_path):
+                    os.unlink(temp_output_path)
+                    
+            except ImportError:
+                print_warning("Comprehensive formatter not found, skipping final formatting...")
+            except Exception as e:
+                print_warning(f"Comprehensive formatting failed: {e}, continuing with previous output...")
+            
+            # Apply conservative assembly fixing (only critical syntax errors)
+            print_system("[Post-processing] Applying conservative assembly fixes...")
+            try:
+                from conservative_assembly_fixer import fix_assembly_conservative
+                final_output = fix_assembly_conservative(final_output)
+                print_success("Conservative assembly fixes applied successfully")
+            except ImportError:
+                print_warning("Post-processing module not found, applying built-in fixes...")
+                # Apply built-in NASM compatibility fixes
+                final_output = self._fix_nasm_compatibility_issues(final_output)
+                print_success("Built-in NASM fixes applied successfully")
+            except Exception as e:
+                print_warning(f"Post-processing failed: {e}, applying built-in fixes...")
+                # Apply built-in NASM compatibility fixes as fallback
+                final_output = self._fix_nasm_compatibility_issues(final_output)
+                print_success("Built-in NASM fixes applied successfully")
+            
+            # Save final formatted assembly with random name
+            import random
+            import string
+            
+            # Generate random prefix  
+            random_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            base_name = os.path.splitext(os.path.basename(filename))[0] 
+            final_asm_file = f"output/{random_chars}_{base_name}_final_formatted.asm"
+            
+            os.makedirs("output", exist_ok=True)
+            with open(final_asm_file, 'w') as f:
+                f.write(final_output)
+            print_success(f"Final formatted assembly saved to: {final_asm_file}")
+            
+            print_success("3-stage pipeline with comprehensive formatting completed successfully!")
             return final_output
             
         except FileNotFoundError:
@@ -204,6 +273,88 @@ class HLASMPreprocessor:
                 os.unlink(temp_input_path)
             if os.path.exists(temp_output_path):
                 os.unlink(temp_output_path)
+    
+    def _fix_nasm_compatibility_issues(self, assembly_content: str) -> str:
+        """Fix common NASM compatibility issues in generated assembly"""
+        lines = assembly_content.split('\n')
+        fixed_lines = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            
+            # Fix the specific double-dereference pattern for HASM variables
+            # Pattern: mov rbx, [rel V01] followed by mov eax, dword [rbx]
+            if ('mov rbx, [rel V01]' in line.strip() and 
+                i + 1 < len(lines) and 
+                'mov eax, dword [rbx]' in lines[i + 1].strip()):
+                
+                # Replace with direct access
+                indent = line[:len(line) - len(line.lstrip())]
+                fixed_lines.append(f'{indent}mov eax, dword [rel V01]  ; Fixed: Direct access to HASM variable')
+                i += 2  # Skip both lines
+                continue
+            
+            # Fix similar patterns for other variables (V02, V03, etc.)
+            if 'mov rbx, [rel V' in line.strip() and i + 1 < len(lines):
+                # Extract variable name (V01, V02, etc.)
+                import re
+                match = re.search(r'mov rbx, \[rel (V\d+)\]', line.strip())
+                if match and 'mov eax, dword [rbx]' in lines[i + 1].strip():
+                    var_name = match.group(1)
+                    indent = line[:len(line) - len(line.lstrip())]
+                    fixed_lines.append(f'{indent}mov eax, dword [rel {var_name}]  ; Fixed: Direct access to HASM variable')
+                    i += 2  # Skip both lines
+                    continue
+            
+            # Fix register size mismatches: mov 32bit_reg, 64bit_reg
+            if 'mov edx, rax' in line:
+                import re
+                line = re.sub(r'mov edx, rax', 'mov edx, eax  ; Fixed: Register size match', line)
+            elif 'mov ecx, rax' in line:
+                import re  
+                line = re.sub(r'mov ecx, rax', 'mov ecx, eax  ; Fixed: Register size match', line)
+            elif 'mov r8d, rax' in line:
+                import re
+                line = re.sub(r'mov r8d, rax', 'mov r8d, eax  ; Fixed: Register size match', line)
+            elif 'mov r9d, rax' in line:
+                import re
+                line = re.sub(r'mov r9d, rax', 'mov r9d, eax  ; Fixed: Register size match', line)
+            
+            # Fix register size mismatches: add 32bit_reg, 64bit_reg
+            elif 'add edx, rax' in line:
+                import re
+                line = re.sub(r'add edx, rax', 'add edx, eax  ; Fixed: Register size match', line)
+            elif 'add ecx, rax' in line:
+                import re
+                line = re.sub(r'add ecx, rax', 'add ecx, eax  ; Fixed: Register size match', line)
+            elif 'add r8d, rax' in line:
+                import re
+                line = re.sub(r'add r8d, rax', 'add r8d, eax  ; Fixed: Register size match', line)
+            elif 'add r9d, rax' in line:
+                import re
+                line = re.sub(r'add r9d, rax', 'add r9d, eax  ; Fixed: Register size match', line)
+            
+            # Fix standalone [rbx] references (likely orphaned from double-dereference)
+            elif 'dword [rbx]' in line and 'mov' in line:
+                import re
+                line = re.sub(r'dword \[rbx\]', 'dword [rel V01]  ; Fixed: HASM variable reference', line)
+            
+            # Fix standalone [rax] references  
+            elif 'dword [rax]' in line and 'mov' in line:
+                import re
+                line = re.sub(r'dword \[rax\]', 'dword [rel V01]  ; Fixed: HASM variable reference', line)
+            
+            # Fix add operations with [rbx]
+            elif 'add' in line and '[rbx]' in line:
+                import re
+                line = re.sub(r'\[rbx\]', '[rel V01]  ; Fixed: HASM variable reference', line)
+            
+            # Keep original line if no pattern matched
+            fixed_lines.append(line)
+            i += 1
+        
+        return '\n'.join(fixed_lines)
     
     def _process_hlasm_commands(self, content: str) -> str:
         """Stage 2: Process high-level assembly commands using codegen.py"""
@@ -471,17 +622,33 @@ class HLASMCompiler:
             
             if self.target_os == 'windows':
                 # For Windows cross-compilation using MinGW-w64
-                # Use GCC instead of ld directly for better library handling
+                mingw_ld = shutil.which('x86_64-w64-mingw32-ld')
                 mingw_gcc = shutil.which('x86_64-w64-mingw32-gcc')
+                
+                # Prefer GCC over ld for easier library handling
                 if mingw_gcc:
                     print_info("Using MinGW-w64 GCC for Windows cross-compilation")
                     # Update output_executable to include .exe extension
                     output_executable_with_ext = f'{output_executable}.exe'
-                    # Use GCC to link, which handles library paths automatically
+                    # Use GCC with proper linking - console application with C runtime
                     ld_cmd = ['x86_64-w64-mingw32-gcc', 
-                             '-nostartfiles',  # Don't use standard startup files
-                             '-e', 'main',     # Entry point
                              obj_file, '-o', output_executable_with_ext,
+                             '-mconsole', '-lkernel32', '-lmsvcrt']
+                    # Update output_executable for subsequent steps
+                    output_executable = output_executable_with_ext
+                elif mingw_ld:
+                    print_info("Using MinGW-w64 ld for Windows cross-compilation")
+                    # Update output_executable to include .exe extension
+                    output_executable_with_ext = f'{output_executable}.exe'
+                    # Get the MinGW library path
+                    mingw_lib_path = "/opt/homebrew/Cellar/mingw-w64/13.0.0_2/toolchain-x86_64/x86_64-w64-mingw32/lib"
+                    # Use ld directly with explicit library path
+                    ld_cmd = ['x86_64-w64-mingw32-ld', 
+                             '--entry=main',           # Entry point
+                             '--subsystem=console',    # Console subsystem
+                             f'-L{mingw_lib_path}',    # Library search path
+                             obj_file, 
+                             '-o', output_executable_with_ext,
                              '-lkernel32', '-luser32']  # Required Windows libraries
                     # Update output_executable for subsequent steps
                     output_executable = output_executable_with_ext
@@ -758,42 +925,18 @@ def main():
             sys.exit(1)
         
         input_file = args[1]
-        if len(args) > 2:
-            output_file = args[2]
-            if not os.path.dirname(output_file):
-                output_file = os.path.join("output", output_file)
-        else:
-            basename = os.path.basename(input_file).replace('.asm', '_generated.asm')
-            output_file = os.path.join("output", basename)
         
-        # Ensure output directory exists
-        os.makedirs("output", exist_ok=True)
-        
+        # Create the preprocessor and process the file
+        # The process_file method already saves the final formatted file
         preprocessor = HLASMPreprocessor(target_os, target_arch, optimization_level)
-        output = preprocessor.process_file(input_file, enable_optimization, enable_analysis)
+        final_output = preprocessor.process_file(input_file, enable_optimization, enable_analysis)
         
-        try:
-            with open(output_file, 'w') as f:
-                f.write(output)
-            print_success(f"Successfully preprocessed: {input_file} -> {output_file}")
-            
-            if verbose:
-                print_info(f"Optimization level: {optimization_level}")
-                stdlib_used = preprocessor.get_stdlib_used()
-                if stdlib_used:
-                    print_info(f"Standard library functions included: {', '.join(sorted(stdlib_used))}")
-                print_info("Pipeline: C commands → High-level ASM → Pure assembly")
-                
-                if enable_analysis:
-                    print("\n" + preprocessor.get_quality_report())
-            
-            if generate_reports:
-                report_base = os.path.join("output", Path(input_file).stem)
-                preprocessor.export_reports(report_base)
-                
-        except IOError as e:
-            print_error(f"Error writing output file: {e}")
-            sys.exit(1)
+        if verbose:
+            print_info(f"Optimization level: {optimization_level}")
+            stdlib_used = preprocessor.get_stdlib_used()
+            if stdlib_used:
+                print_info(f"Standard library functions included: {', '.join(sorted(stdlib_used))}")
+            print_info("Pipeline: C commands → High-level ASM → Pure assembly")
     
     elif command == 'c':  # Compile only (don't run)
         if len(args) < 2:

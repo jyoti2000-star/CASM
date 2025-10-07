@@ -164,6 +164,7 @@ class CodeGenerator:
         self.data_section = []
         self.bss_section = []
         self.stdlib_used = set()
+        self.function_calls = set()  # Track function calls for automatic extern generation
         
         # Use enhanced platform detection (x86-64 only)
         if target_os is None:
@@ -189,6 +190,10 @@ class CodeGenerator:
         # Platform-specific assembly directives will be added in generate()
         pass
     
+    def add_function_call(self, function_name: str):
+        """Track a function call for automatic extern generation"""
+        self.function_calls.add(function_name)
+    
     def generate(self, ast: ProgramNode) -> str:
         """Generate assembly code from AST"""
         # Process the AST
@@ -204,12 +209,9 @@ class CodeGenerator:
         result.append(self.platform.global_directive)
         result.append("")
         
-        # Add Windows external library declarations
-        if self.platform.os_name == 'windows':
-            result.append("; External library declarations")
-            result.append("extern GetStdHandle")
-            result.append("extern WriteConsoleA")
-            result.append("extern ExitProcess")
+        # Add function call tracking comment for debugging
+        if self.function_calls:
+            result.append(f"; Function calls detected: {', '.join(sorted(self.function_calls))}")
             result.append("")
         
         # Add standard library functions if used
@@ -418,6 +420,7 @@ class CodeGenerator:
     
     def visit_CallNode(self, node: CallNode):
         """Visit call node"""
+        self.add_function_call(node.name)  # Track the function call
         self.add_line(f"    call {node.name}  ; %call {node.name}")
     
     def visit_ReturnNode(self, node: ReturnNode):
@@ -502,6 +505,7 @@ class CodeGenerator:
         if self.platform.os_name == 'windows':
             # Windows API call to ExitProcess
             self.add_line(f"    mov rcx, {node.code}  ; exit code")
+            self.add_function_call("ExitProcess")  # Track the function call
             self.add_line(f"    call ExitProcess")
         else:
             self.add_line(f"    mov {self.platform.registers['syscall_num']}, {self.platform.syscalls['sys_exit']}")
@@ -999,6 +1003,7 @@ class CodeGenerator:
                 # Windows API call to WriteConsole
                 self.add_line(f"    ; Get console handle")
                 self.add_line(f"    mov rcx, -11  ; STD_OUTPUT_HANDLE")
+                self.add_function_call("GetStdHandle")  # Track the function call
                 self.add_line(f"    call GetStdHandle")
                 self.add_line(f"    mov r15, rax  ; Save handle")
                 self.add_line(f"    ; Call WriteConsole")
@@ -1007,6 +1012,7 @@ class CodeGenerator:
                 self.add_line(f"    mov r8, {length}  ; number of chars")
                 self.add_line(f"    mov r9, 0  ; written count (can be NULL)")
                 self.add_line(f"    mov qword [rsp+32], 0  ; 5th parameter (reserved)")
+                self.add_function_call("WriteConsoleA")  # Track the function call
                 self.add_line(f"    call WriteConsoleA")
             else:
                 self.add_line(f"    mov {self.platform.registers['syscall_num']}, {self.platform.syscalls['sys_write']}")
@@ -1020,6 +1026,7 @@ class CodeGenerator:
             if self.platform.os_name == 'windows':
                 # Windows API call for variables
                 self.add_line(f"    mov rcx, -11  ; STD_OUTPUT_HANDLE")
+                self.add_function_call("GetStdHandle")  # Track the function call
                 self.add_line(f"    call GetStdHandle")
                 self.add_line(f"    mov r15, rax  ; Save handle")
                 self.add_line(f"    mov rcx, r15  ; console handle")
@@ -1030,6 +1037,7 @@ class CodeGenerator:
                     self.add_line(f"    mov r8, 19  ; estimated length")
                 self.add_line(f"    mov r9, 0  ; written count")
                 self.add_line(f"    mov qword [rsp+32], 0  ; 5th parameter (reserved)")
+                self.add_function_call("WriteConsoleA")  # Track the function call
                 self.add_line(f"    call WriteConsoleA")
             else:
                 self.add_line(f"    mov {self.platform.registers['syscall_num']}, {self.platform.syscalls['sys_write']}")
@@ -1056,6 +1064,7 @@ class CodeGenerator:
             self.stdlib_used.add('strlen')
             self.add_line(f"    ; %strlen {str_ptr}, {result}")
             self.add_line(f"    mov rdi, {str_ptr}")
+            self.add_function_call("__strlen")  # Track the function call
             self.add_line(f"    call __strlen")
             self.add_line(f"    mov {result}, rax")
     
@@ -1067,6 +1076,7 @@ class CodeGenerator:
             self.add_line(f"    ; %strcpy {dest}, {src}")
             self.add_line(f"    mov rdi, {dest}")
             self.add_line(f"    mov rsi, {src}")
+            self.add_function_call("__strcpy")  # Track the function call
             self.add_line(f"    call __strcpy")
     
     def process_strcmp(self, args: List[str]):
@@ -1077,6 +1087,7 @@ class CodeGenerator:
             self.add_line(f"    ; %strcmp {str1}, {str2}")
             self.add_line(f"    mov rdi, {str1}")
             self.add_line(f"    mov rsi, {str2}")
+            self.add_function_call("__strcmp")  # Track the function call
             self.add_line(f"    call __strcmp")
     
     def process_memset(self, args: List[str]):
@@ -1088,6 +1099,7 @@ class CodeGenerator:
             self.add_line(f"    mov rdi, {dest}")
             self.add_line(f"    mov rsi, {value}")
             self.add_line(f"    mov rdx, {count}")
+            self.add_function_call("__memset")  # Track the function call
             self.add_line(f"    call __memset")
     
     def process_memcpy(self, args: List[str]):
@@ -1099,6 +1111,7 @@ class CodeGenerator:
             self.add_line(f"    mov rdi, {dest}")
             self.add_line(f"    mov rsi, {src}")
             self.add_line(f"    mov rdx, {count}")
+            self.add_function_call("__memcpy")  # Track the function call
             self.add_line(f"    call __memcpy")
     
     def process_atoi(self, args: List[str]):

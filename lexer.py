@@ -200,7 +200,19 @@ class Lexer:
     
     def _is_hlasm_directive(self, line: str) -> bool:
         """Check if line contains a high-level directive"""
-        return line.startswith('%') or any(keyword in line for keyword in ['in', 'range'])
+        # Check for % directives
+        if line.startswith('%'):
+            return True
+        
+        # Check for loop keywords (but be more specific to avoid false positives)
+        # Only consider 'in' and 'range' as keywords if they appear in proper context
+        words = line.split()
+        if len(words) >= 3:
+            # Look for patterns like "variable in range" or "for variable in"
+            if 'in' in words and ('range' in words or 'for' in line.lower()):
+                return True
+        
+        return False
     
     def _tokenize_directive(self, line: str):
         """Tokenize a high-level directive"""

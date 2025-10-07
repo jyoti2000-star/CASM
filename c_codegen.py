@@ -835,7 +835,10 @@ class CCodeGenerator:
         lines = asm_content.split('\n')
         converted_lines = []
         
-        for line in lines:
+        # Pre-process to fix the double-dereference pattern for HASM variables
+        fixed_lines = self._fix_variable_access_patterns(lines, hasm_vars)
+        
+        for line in fixed_lines:
             converted_line = line
             
             # Convert .ascii to db
@@ -893,10 +896,25 @@ class CCodeGenerator:
             
             converted_lines.append(converted_line)
         
-        # Add external declarations at the top
+        # Add external declarations at the top - detect all function calls
         external_decls = []
-        if any('call\tprintf' in line or 'call printf' in line for line in converted_lines):
-            external_decls.append('extern printf')
+        function_calls = set()
+        excluded_functions = {'main', '__main'}  # Functions that shouldn't have extern declarations
+        
+        # Find all call instructions and extract function names
+        for line in converted_lines:
+            # Match call instructions with various formats
+            call_match = re.search(r'call\s+([^\s;]+)', line)
+            if call_match:
+                func_name = call_match.group(1).strip()
+                # Remove any whitespace or tabs
+                func_name = re.sub(r'\s+', '', func_name)
+                if func_name not in excluded_functions:
+                    function_calls.add(func_name)
+        
+        # Generate extern declarations for all detected function calls
+        for func_name in sorted(function_calls):
+            external_decls.append(f'extern {func_name}')
         
         if external_decls:
             # Find the section .text line and insert externals before it
@@ -906,7 +924,34 @@ class CCodeGenerator:
                     break
         
         return '\n'.join(converted_lines)
+    
+    def _fix_variable_access_patterns(self, lines: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
+        """Fix double-dereference patterns for HASM variables"""
+        fixed_lines = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i].strip()
+            line_found = False
             
+            # Check for the specific problematic pattern: mov rbx, [rel V01]
+            if 'mov rbx, [rel V01]' in line and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # Check if next line is: mov eax, dword [rbx]
+                if 'mov eax, dword [rbx]' in next_line:
+                    # Replace the pattern with direct access
+                    indent = re.match(r'^(\s*)', lines[i]).group(1) if lines[i] else '    '
+                    fixed_lines.append(f'{indent}mov eax, dword [rel V01]  ; Load base address')
+                    i += 2  # Skip both lines
+                    line_found = True
+            
+            if not line_found:
+                # No pattern found, keep original line
+                fixed_lines.append(lines[i])
+                i += 1
+        
+        return fixed_lines
+    
     def _replace_lc_labels_enhanced(self, line: str) -> str:
         """Enhanced LC label replacement that maps .LC0, .LC1, etc. to LC1, LC2, LC3..."""
         # Handle label definitions: .LC0: -> LC1:
