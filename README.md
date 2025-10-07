@@ -71,14 +71,59 @@ python3 casm.py asm test.casm
 %println number
 ```
 
-### Comments and Assembly
+### Comments and Raw Assembly
 ```assembly
 ; This is a comment
 %println "Hello"    ; End-of-line comment
 
-; Inline assembly is supported
+; Raw assembly is fully supported alongside CASM constructs
 mov rax, 42
 push rax
+pop rbx
+
+; Mix CASM variables with raw assembly
+%var my_number 100
+mov rax, [my_number]    ; Load CASM variable into register
+add rax, 50             ; Add 50 using raw assembly
+mov [my_number], rax    ; Store back to CASM variable
+
+; Raw assembly loops and control flow
+%var counter 0
+loop_start:
+    mov rax, [counter]
+    inc rax
+    mov [counter], rax
+    cmp rax, 10
+    jl loop_start
+
+; System calls and low-level operations
+mov rax, 1              ; sys_write
+mov rdi, 1              ; stdout
+mov rsi, message        ; message buffer
+mov rdx, 13             ; message length
+syscall
+
+; Stack operations
+push rbp
+mov rbp, rsp
+sub rsp, 32             ; Allocate stack space
+
+; Register manipulation
+xor rax, rax            ; Clear register
+mov rbx, 0x12345678     ; Load immediate value
+shl rbx, 4              ; Shift left
+or rax, rbx             ; Bitwise OR
+
+; Function calls and returns
+call my_function
+mov rsp, rbp
+pop rbp
+ret
+
+my_function:
+    ; Raw assembly function
+    mov rax, 42
+    ret
 ```
 
 ### C Code Integration (CASM C Assembly)
@@ -200,6 +245,62 @@ CASM variables are automatically available in C code as extern declarations:
     %println "That's a large circle!"
     %! printf("Indeed, %.2f is quite large!\n", calculated_area);
 %endif
+```
+
+### Assembly Integration Example
+```assembly
+; mixed.casm - Demonstrates raw assembly mixed with CASM constructs
+%var array_size 5
+%var sum 0
+%var numbers_array 1024  ; Allocate space for array
+
+%println "=== Assembly + CASM Array Sum ==="
+
+; Initialize array with raw assembly
+mov rdi, [numbers_array]    ; Get array address
+mov rcx, 0                  ; Counter
+
+init_loop:
+    mov [rdi + rcx*4], ecx  ; Store counter value in array
+    inc rcx
+    cmp rcx, [array_size]
+    jl init_loop
+
+%println "Array initialized with assembly"
+
+; Calculate sum using mixed approach
+mov rsi, 0                  ; Sum register
+mov rcx, 0                  ; Counter
+mov rdi, [numbers_array]    ; Array address
+
+sum_loop:
+    mov eax, [rdi + rcx*4]  ; Load array element
+    add rsi, rax            ; Add to sum
+    inc rcx
+    
+    ; Use CASM for loop control
+    %if rcx < array_size
+        jmp sum_loop
+    %endif
+
+; Store result in CASM variable using assembly
+mov [sum], rsi
+
+%println "Sum calculated using assembly:"
+%println sum
+
+; Direct register manipulation for final calculation
+mov rax, [sum]
+imul rax, 2                 ; Multiply by 2
+mov rbx, 10
+xor rdx, rdx
+div rbx                     ; Divide by 10
+
+%println "Processed result (sum * 2 / 10):"
+; Raw assembly to print the result
+push rax
+%println rax
+pop rax
 ```
 
 ## Architecture
