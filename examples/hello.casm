@@ -1,0 +1,5 @@
+; Hello World program in CASM
+; Demonstrates basic output
+
+%println "Hello, World!"
+%println "Welcome to CASM!"

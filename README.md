@@ -1,330 +1,179 @@
-CASM, an compiler designed to seamlessly blend the power and control of Assembly with the simplicity and readability of C-like high-level constructs. This document serves as a comprehensive guide to the CASM language syntax and the compilation process.
+# CASM - Clean Assembly Language Compiler
 
-## Table of Contents
+A clean, focused assembly language compiler with high-level constructs for educational and practical use.
 
-- [Overview](#overview)
-- [Language Syntax](#language-syntax)
-  - [File Structure and Sections](#file-structure-and-sections)
-  - [Data Declarations](#data-declarations)
-  - [High-Level Constructs (C-like)](#high-level-constructs-c-like)
-    - [Variables](#variables)
-    - [Procedures (Functions)](#procedures-functions)
-    - [Control Flow](#control-flow)
-    - [I/O Operations](#io-operations)
-    - [Array Access](#array-access)
-  - [Inline Assembly](#inline-assembly)
-  - [Extern Declarations (C Interoperability)](#extern-declarations-c-interoperability)
-- [How to Compile](#how-to-compile)
-  - [Basic Compilation](#basic-compilation)
-  - [Command-Line Options](#command-line-options)
-  - [Cross-Compilation](#cross-compilation)
-- [Examples](#examples)
-  - [Hello World](#hello-world)
-  - [Looping and Conditionals](#looping-and-conditionals)
-  - [Mixing Assembly and High-Level Code](#mixing-assembly-and-high-level-code)
+## Features
 
----
+CASM provides essential programming constructs while generating efficient x86-64 Windows assembly:
 
-## Overview
+- **Control Flow**: `%if/%else/%endif`, `%while/%endwhile`, `%for/%endfor`
+- **Variables**: `%var name value`
+- **I/O**: `%println message`, `%scanf format variable`
+- **Comments**: `;` for single-line comments
+- **Inline Assembly**: Direct assembly code support
 
-CASM is a source-to-source compiler that translates a hybrid C/Assembly language into standard C code. This C code is then compiled into a native executable using a standard C compiler like GCC.
+## Quick Start
 
-**Key Features:**
+### Installation
 
-- **Hybrid Syntax:** Write low-level Assembly and high-level C-like code in the same file.
-- **Familiarity:** Uses Intel syntax for Assembly and a simplified, C-inspired syntax for high-level constructs.
-- **Cross-Platform:** Can target different operating systems and architectures like Linux, Windows, macOS, x86_64, and ARM64.
+Requires:
+- Python 3.7+
+- NASM assembler
+- MinGW-w64 (for Windows cross-compilation)
+- Wine (for running executables on macOS/Linux)
 
-## Language Syntax
+```bash
+# Install dependencies on macOS
+brew install nasm mingw-w64 wine-stable
 
-### File Structure and Sections
-
-A CASM source file is organized into sections, similar to traditional assembly language.
-
-- `section .data`: Used for declaring **initialized** global variables.
-- `section .bss`: Used for declaring **uninitialized** global variables (reserving space).
-- `section .text`: Contains the executable code, including the `main` entry point.
-
-```
-section .data
-    my_message db "Hello", 0
-
-section .bss
-    my_buffer resb 100
-
-section .text
-global main
-
-main:
-    ; Your code here
-    ret
+# Install dependencies on Ubuntu/Debian
+sudo apt install nasm gcc-mingw-w64 wine
 ```
 
-### Data Declarations
+### Usage
 
-You can declare data using traditional assembly directives.
+```bash
+# Compile and run
+python3 casm.py run hello.casm
 
-| Directive | Description                | Example                            |
-| :-------- | :------------------------- | :--------------------------------- |
-| `db`      | Define Byte(s)             | `my_char db 'A'`, `msg db "Hi", 0` |
-| `dd`      | Define Doubleword (32-bit) | `my_num dd 42`, `arr dd 1, 2, 3`   |
-| `resb`    | Reserve Bytes              | `buffer resb 256`                  |
-| `resd`    | Reserve Doublewords        | `value resd 1`                     |
+# Compile to executable only
+python3 casm.py compile program.casm
 
-### High-Level Constructs (C-like)
-
-CASM provides several C-like keywords and structures to simplify development.
-
-#### Variables
-
-Declare local or global variables using the `var` keyword.
-
-**Syntax:** `var <name>: <type> [= <initial_value>];`
-
-```
-; Global variable
-var global_counter: int = 100;
-
-main:
-    ; Local variable
-    var i: int
-    var message: char* = "A local string"
-    var prices: float[] = {1.99, 2.50, 10.0};
+# Generate assembly code only
+python3 casm.py asm test.casm
 ```
 
-#### Procedures (Functions)
+## Language Reference
 
-Define functions using `proc` and `endp`.
-
-**Syntax:** `proc <name>[: <return_type> <param1>, <param2>, ...]`
-
-```
-; A simple procedure
-proc print_hello
-    print "Hello from a procedure!"
-endp
-
-; A function with parameters and a return value
-proc add_numbers: int x, y
-    var sum: int
-    sum = x + y
-    return sum
-endp
-
-main:
-    call print_hello()
-    var result: int
-    result = add_numbers(10, 20)
-    print "Result:", result
-    ret
+### Variable Declaration
+```assembly
+%var counter 0
+%var message "Hello World"
+%var buffer 1024
 ```
 
-#### Control Flow
+### Control Flow
+```assembly
+%if counter < 10
+    %println "Counter is less than 10"
+%else
+    %println "Counter is 10 or greater"
+%endif
 
-**`if / else if / else`**
+%while counter < 5
+    %println counter
+    %var counter counter+1
+%endwhile
 
-Use C-style conditions. Braces `{}` are required.
-
-```
-var num: int = 10
-if (num > 5) {
-    print "Number is greater than 5"
-} else if (num == 5) {
-    print "Number is exactly 5"
-} else {
-    print "Number is less than 5"
-}
-```
-
-**`for` Loop**
-
-CASM supports a simplified `for` loop.
-
-**Syntax:** `for <variable> = <start> to <end> { ... }`
-
-```
-var i: int
-for i = 0 to 4 {
-    print "Loop iteration:", i
-}
+%for i in range(10)
+    %println i
+%endfor
 ```
 
-#### I/O Operations
-
-**`print`**
-
-A versatile command for printing to the console. It works like `printf`.
-
-```
-print "Hello, World!"             ; Prints a simple string with a newline
-print my_variable                 ; Prints the content of a variable
-print "Count:", counter           ; Prints a label and a variable
-print "Value is %d", my_num       ; Uses a format specifier
+### Input/Output
+```assembly
+%println "Enter a number:"
+%scanf "%d" number
+%println "You entered:"
+%println number
 ```
 
-**`scanf`**
+### Comments and Assembly
+```assembly
+; This is a comment
+%println "Hello"    ; End-of-line comment
 
-Read formatted input from the user.
-
-```
-var user_age: int
-print "Enter your age: "
-scanf "%d", user_age
-```
-
-#### Array Access
-
-Access array elements using standard C-style bracket notation `[]`.
-
-```
-section .data
-    my_array dd 10, 20, 30
-
-section .text
-main:
-    print "First element:", my_array[0]  ; Prints 10
-    my_array[1] = 99                     ; Modifies the second element
-    print "Second element:", my_array[1] ; Prints 99
-    ret
+; Inline assembly is supported
+mov rax, 42
+push rax
 ```
 
-### Inline Assembly
-
-CASM supports declaring external C functions and assembly functions using the `extern` keyword. This allows you to include standard C library headers, declare external C functions with their signatures, and call them from your CASM code.
-
-**Syntax:**
-
-1.  **Header Includes:**
-
-    ```casm
-    extern <header_name.h>
-    ```
-
-    Example:
-
-    ```casm
-    extern <stdio.h>
-    extern <windows.h>  ; For Windows-specific APIs
-    ```
-
-2.  **Function Declarations:**
-    ```casm
-    extern return_type function_name(parameter_list)
-    ```
-    Example:
-    ```casm
-    extern int printf(const char* format, ...)
-    extern void* malloc(size_t size)
-    ```
-
-When you use `extern`, CASM automatically adds the necessary `#include` directives and `extern` function prototypes to the generated C code, allowing you to seamlessly call C library functions or system APIs.
-
-You can write standard Intel-syntax x86 assembly directly within your code. The compiler will automatically convert it into GCC-style inline assembly.
-
-```
-var a: int = 10
-var b: int = 20
-var c: int
-
-; Assembly block to add a and b
-mov eax, [a]
-add eax, [b]
-mov [c], eax
-
-print "The sum is:", c
-```
-
-## How to Compile
-
-The compiler is a Python script that translates your `.asm` file to a `.c` file and then invokes `gcc` to create an executable.
-
-### Basic Compilation
-
-The primary command is `c` (for compile).
-
-```sh
-python3 CASM.py c main.asm
-```
-
-This command will:
-
-1.  Create `main.c`.
-2.  Compile `main.c` into a native executable named `main`.
-
-### Command-Line Options
-
-| Option        | Description                                                   | Example                                 |
-| :------------ | :------------------------------------------------------------ | :-------------------------------------- |
-| `-o:<file>`   | Set the output executable name.                               | `python3 CASM.py c test.asm -o:my_app`  |
-| `-d:release`  | Compiles with optimizations (`-O3`) and no debug info.        | `python3 CASM.py c test.asm -d:release` |
-| `-d:debug`    | Compiles with debug info (`-g`) and no optimizations (`-O0`). | `python3 CASM.py c test.asm -d:debug`   |
-| `-t:<target>` | Set the target platform (`linux`, `windows`, `macos`).        | `python3 CASM.py c test.asm -t:windows` |
-| `-a:<arch>`   | Set the target architecture (`x86_64`, `arm64`).              | `python3 CASM.py c test.asm -a:arm64`   |
-
-### Cross-Compilation
-
-You can easily cross-compile for other platforms. For example, to compile for Windows from macOS or Linux, you need a MinGW toolchain installed.
-
-```sh
-python3 CASM.py c main.asm -t:windows -o:main.exe
-```
-
-## Examples
+## Example Programs
 
 ### Hello World
-
-```
-; main.asm
-section .data
-    hello_msg db "Hello, World!", 0
-
-section .text
-    global main
-
-main:
-    print hello_msg
-    ret
+```assembly
+; hello.casm
+%println "Hello, World!"
 ```
 
-### Looping and Conditionals
+### Simple Calculator
+```assembly
+; calc.casm
+%var num1 0
+%var num2 0
+%var result 0
 
+%println "Enter first number:"
+%scanf "%d" num1
+
+%println "Enter second number:"
+%scanf "%d" num2
+
+; Add the numbers (simplified)
+%var result num1+num2
+%println "Result:"
+%println result
 ```
-; loops.asm
-section .text
-    global main
 
-main:
-    var k: int
-    for k = 1 to 10 {
-        if k % 2 == 0 {
-            print k, " is even."
-        } else {
-            print k, " is odd."
-        }
-    }
-    ret
+### Counting Loop
+```assembly
+; count.casm
+%var i 0
+
+%while i < 10
+    %println i
+    %var i i+1
+%endwhile
+
+%println "Done counting!"
 ```
 
-### Mixing Assembly and High-Level Code
+## Architecture
 
+CASM uses a clean 4-stage compilation pipeline:
+
+1. **Lexical Analysis** (`src/core/lexer.py`) - Tokenizes CASM source code
+2. **Parsing** (`src/core/parser.py`) - Builds Abstract Syntax Tree (AST)
+3. **Code Generation** (`src/core/codegen.py`) - Converts AST to x86-64 assembly
+4. **Assembly & Linking** (`src/compiler.py`) - NASM + MinGW-w64 toolchain
+
+### Directory Structure
 ```
-; mix.asm
-section .data
-    num1 dd 100
-    num2 dd 50
-
-section .text
-    global main
-
-main:
-    var result: int
-
-    ; Use assembly for subtraction
-    mov eax, [num1]
-    sub eax, [num2]
-    mov [result], eax
-
-    ; Use high-level print
-    print "100 - 50 =", result
-    ret
+casm_clean/
+├── casm.py              # Main entry point
+├── src/
+│   ├── core/
+│   │   ├── tokens.py    # Token definitions
+│   │   ├── lexer.py     # Lexical analyzer
+│   │   ├── parser.py    # Parser
+│   │   ├── ast_nodes.py # AST node definitions
+│   │   └── codegen.py   # Code generator
+│   ├── stdlib/
+│   │   └── minimal.py   # Minimal standard library
+│   └── compiler.py      # Main compiler class
+├── tests/               # Test files
+├── examples/            # Example programs
+└── output/             # Generated files
 ```
+
+## Target Platform
+
+- **Architecture**: x86-64 only
+- **Operating System**: Windows (PE32+ executables)
+- **Calling Convention**: Windows x64
+- **Assembler**: NASM (Intel syntax)
+- **Linker**: MinGW-w64 GCC
+
+Cross-compilation from macOS/Linux is supported via MinGW-w64 and Wine.
+
+## Development
+
+The codebase emphasizes:
+- **Clean Architecture**: Separation of concerns, single responsibility
+- **Focused Feature Set**: Only essential language constructs
+- **Educational Value**: Clear, readable code for learning compiler design
+- **Practical Use**: Generates working executables
+
+## License
+
+See LICENSE file for details.

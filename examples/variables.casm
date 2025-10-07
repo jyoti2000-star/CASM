@@ -1,0 +1,13 @@
+; Variable demonstration
+; Shows variable declaration and usage
+
+%var counter 0
+%var message "Current count:"
+
+%println "Starting counter demo"
+%println message
+%println counter
+
+%var counter 5
+%println "Updated counter:"
+%println counter

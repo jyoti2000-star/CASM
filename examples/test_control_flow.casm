@@ -1,0 +1,28 @@
+%extern stdio.h
+
+%var number 5
+%var result 0
+%var counter 0
+
+%println "Starting control flow test..."
+
+%if number > 3
+    %println "Number is greater than 3"
+    %! printf("C code inside if: %d\n", 42);
+    
+    %while counter < 3
+        %println "Inside while loop"
+        %scanf "%d" result
+        %var counter counter+1
+    %endwhile
+    
+%else
+    %println "Number is not greater than 3"
+%endif
+
+%for i in range(3)
+    %println "For loop iteration"
+    %! printf("Loop iteration: %d\n", i);
+%endfor
+
+%println "Control flow test complete!"

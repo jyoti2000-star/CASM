@@ -1,0 +1,15 @@
+%extern stdio.h
+
+%var number 45
+%var result 0
+
+%println "Testing combined C compilation..."
+
+%if number > 40
+    %println "Number is greater than 40"
+    %! printf("C code result: %d\n", 123);
+    %var result 42
+%endif
+
+%println "Final result:"
+%println result

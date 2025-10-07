@@ -1,0 +1,33 @@
+%extern stdio.h
+%extern math.h
+
+%var number 7
+%var factorial_result 0
+%var fibonacci_result 0
+
+%println "=== C+ASM Hybrid Test ==="
+%println "Testing C code integration with CASM variables"
+
+%! printf("Starting calculation for number: %d\n", 42);
+
+%if number > 5
+    %println "Number is greater than 5, calculating factorial..."
+    %! int temp_factorial = 1;
+    %! int i;
+    %! for(i = 1; i <= 5; i++) { temp_factorial *= i; }
+    %! printf("Factorial of 5 = %d\n", temp_factorial);
+    
+    %var factorial_result 120
+%else
+    %println "Number is 5 or less"
+%endif
+
+%println "Calculating Fibonacci sequence..."
+%! int fib_a = 0;
+%! int fib_b = 1;
+%! int fib_result = 0;
+%! if(1 <= 1) fib_result = 1;
+%! else { fib_result = fib_a + fib_b; }
+%! printf("Fibonacci result: %d\n", fib_result);
+
+%println "=== Hybrid Test Complete ==="
