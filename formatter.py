@@ -65,6 +65,10 @@ class AssemblyFormatter:
             r'^\s*[A-Za-z_]\w*\s*dd\s+',  # variable dd
             r'^\s*[A-Za-z_]\w*\s*dw\s+',  # variable dw
             r'^\s*[A-Za-z_]\w*\s*dq\s+',  # variable dq
+            r'^\s*LC\d+\s+d[bdwq]\s+',    # LC constants (LC1 db, LC2 dq, etc.)
+            r'^\s*V\d+\s+d[bdwq]\s+',     # V variables (V01 dd, V02 db, etc.)
+            r'^LC\d+\s+d[bdwq]\s+',       # LC constants without indentation
+            r'^V\d+\s+d[bdwq]\s+',        # V variables without indentation
         ]
         
         # Label patterns for data section
@@ -165,7 +169,7 @@ class AssemblyFormatter:
                 is_empty=True
             )
         
-        # Comments
+        # Comments - but keep important ones
         if stripped.startswith(';'):
             # Keep only instruction comments (original ASM statements)
             should_keep = any(re.search(pattern, stripped) for pattern in self.keep_comment_patterns)
@@ -195,6 +199,15 @@ class AssemblyFormatter:
                 is_comment=True  # Treat as comment to skip
             )
         
+        # Extern declarations - MUST be checked before data patterns
+        if stripped.startswith('extern '):
+            return AssemblyLine(
+                content=line,
+                line_number=line_number,
+                section_type=SectionType.TEXT,
+                is_extern=True
+            )
+        
         # Global declarations
         if stripped.startswith('global '):
             return AssemblyLine(
@@ -202,15 +215,6 @@ class AssemblyFormatter:
                 line_number=line_number,
                 section_type=SectionType.TEXT,
                 is_global=True
-            )
-        
-        # Extern declarations
-        if stripped.startswith('extern '):
-            return AssemblyLine(
-                content=line,
-                line_number=line_number,
-                section_type=SectionType.TEXT,
-                is_extern=True
             )
         
         # Check if it's an instruction FIRST before checking data patterns
@@ -323,8 +327,19 @@ class AssemblyFormatter:
         
         # Organize by section type
         for i, line in enumerate(self.parsed_lines):
-            if line.section_type == SectionType.DATA:
-                self.data_lines.append(line.content)
+            stripped = line.content.strip()
+            
+            # Force extern and global to text section
+            if stripped.startswith('extern ') or stripped.startswith('global '):
+                self.text_lines.append(line.content)
+            elif line.section_type == SectionType.DATA:
+                # Only add actual data declarations to data section
+                if (any(re.match(pattern, stripped) for pattern in self.data_patterns) or
+                    any(re.match(pattern, stripped) for pattern in self.data_label_patterns)):
+                    self.data_lines.append(line.content)
+                else:
+                    # If it's not a real data declaration, put it in text
+                    self.text_lines.append(line.content)
             elif line.section_type == SectionType.TEXT:
                 # Skip section declarations and empty lines from removed comments
                 if (not line.content.strip().startswith('section ') and 
@@ -404,9 +419,12 @@ class AssemblyFormatter:
         
         for line in self.text_lines:
             stripped = line.strip()
-            # Check if this is a db declaration that should be in data section
-            if stripped.startswith('db ') and ('"' in stripped or "'" in stripped):
-                # This looks like a string declaration that belongs in data
+            # Check if this is a data declaration that should be in data section
+            if (stripped.startswith('db ') and ('"' in stripped or "'" in stripped)) or \
+               (re.match(r'^LC\d+\s+db\s+', stripped)) or \
+               (re.match(r'^LC\d+\s+dq\s+', stripped)) or \
+               (re.match(r'^V\d+\s+d[bdwq]\s+', stripped)):
+                # This looks like a data declaration that belongs in data section
                 orphaned_declarations.append(f"    {stripped}")
             else:
                 remaining_text_lines.append(line)
@@ -449,29 +467,12 @@ class AssemblyFormatter:
         """Generate the final formatted assembly output"""
         output_lines = []
         
-        # Add .data section
-        output_lines.append('section .data')
+        # Collect extern and global declarations from text lines
+        extern_lines = []
+        global_lines = []
+        other_lines = []
         
-        # Add data section content
-        if self.data_lines:
-            for line in self.data_lines:
-                if line.strip():  # Skip empty lines in data section
-                    output_lines.append(line)  # Lines are already properly formatted from _combine_data_labels_and_declarations
-        else:
-            output_lines.append('    ; No data declarations')
-        
-        output_lines.append('')
-        
-        # Add .text section
-        output_lines.append('section .text')
-        
-        # Add text section content with instruction grouping
         if self.text_lines:
-            # First add extern and global declarations
-            extern_lines = []
-            global_lines = []
-            other_lines = []
-            
             for line in self.text_lines:
                 stripped = line.strip()
                 if stripped.startswith('extern '):
@@ -480,20 +481,73 @@ class AssemblyFormatter:
                     global_lines.append(line)
                 else:
                     other_lines.append(line)
+        
+        # Add .data section first
+        output_lines.append('section .data')
+        output_lines.append('')
+        output_lines.append('; Generated by Advanced High-Level Assembly Preprocessor')
+        output_lines.append('; Target platform: windows (Microsoft x64)')
+        output_lines.append('')
+        
+        # Add data section content - group variables and constants together
+        if self.data_lines:
+            # Separate different types of data declarations
+            v_vars = []      # V01, V02, V03, etc.
+            lc_vars = []     # LC1, LC2, LC3, etc.
+            other_vars = []  # __str1, etc.
             
-            # Add extern declarations first
-            if extern_lines:
-                for line in extern_lines:
+            for line in self.data_lines:
+                if line.strip():
+                    stripped = line.strip()
+                    if re.match(r'\s*V\d+\s+', stripped):
+                        v_vars.append(line)
+                    elif re.match(r'\s*LC\d+\s+', stripped):
+                        lc_vars.append(line)
+                    else:
+                        other_vars.append(line)
+            
+            # Add V variables first
+            if v_vars:
+                for line in v_vars:
                     output_lines.append(line)
-                output_lines.append('')
             
-            # Add global declarations
-            if global_lines:
-                for line in global_lines:
+            # Add LC variables (string constants)
+            if lc_vars:
+                if v_vars:  # Add spacing if we had V variables
+                    output_lines.append('')
+                for line in lc_vars:
                     output_lines.append(line)
-                output_lines.append('')
             
-            # Add the rest of the code with grouping
+            # Add other variables
+            if other_vars:
+                if v_vars or lc_vars:  # Add spacing if we had previous variables
+                    output_lines.append('')
+                for line in other_vars:
+                    output_lines.append(line)
+        else:
+            output_lines.append('    ; No data declarations')
+        
+        output_lines.append('')
+        output_lines.append('')
+        
+        # Add .text section
+        output_lines.append('section .text')
+        output_lines.append('')
+        
+        # Add extern declarations at the top of text section
+        if extern_lines:
+            for line in extern_lines:
+                output_lines.append(line)
+            output_lines.append('')
+        
+        # Add global declarations in text section
+        if global_lines:
+            for line in global_lines:
+                output_lines.append(line)
+            output_lines.append('')
+        
+        # Add the rest of the code with grouping
+        if other_lines:
             output_lines.extend(self._group_instructions(other_lines))
         
         return '\n'.join(output_lines)

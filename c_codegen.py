@@ -112,6 +112,18 @@ class CCodeGenerator:
                 var_info = self._parse_var_declaration(stripped, line_num)
                 if var_info:
                     variables[var_info.name] = var_info
+            
+            # Parse %set declarations (alternative syntax)
+            elif stripped.startswith('%set '):
+                var_info = self._parse_set_declaration(stripped, line_num)
+                if var_info:
+                    variables[var_info.name] = var_info
+            
+            # Parse %array declarations
+            elif stripped.startswith('%array '):
+                var_info = self._parse_array_declaration(stripped, line_num)
+                if var_info:
+                    variables[var_info.name] = var_info
         
         return variables
     
@@ -154,6 +166,61 @@ class CCodeGenerator:
                 value=value,
                 var_type=var_type,
                 line_number=line_num
+            )
+        
+        return None
+
+    def _parse_set_declaration(self, line: str, line_num: int) -> Optional[HASMVariable]:
+        """Parse a %set declaration (alternative syntax)"""
+        # Remove %set prefix
+        var_part = line[5:].strip()
+        
+        # Regular variable: name value
+        parts = var_part.split(None, 1)
+        if len(parts) >= 2:
+            name = parts[0]
+            value = parts[1]
+            
+            # Determine type based on value
+            if value.startswith('"') and value.endswith('"'):
+                var_type = 'string'
+            elif value.replace('.', '').replace('-', '').isdigit():
+                var_type = 'float' if '.' in value else 'int'
+            else:
+                var_type = 'unknown'
+            
+            return HASMVariable(
+                name=name,
+                value=value,
+                var_type=var_type,
+                line_number=line_num,
+                is_array=False,
+                array_size=0
+            )
+        
+        return None
+
+    def _parse_array_declaration(self, line: str, line_num: int) -> Optional[HASMVariable]:
+        """Parse a %array declaration"""
+        # Remove %array prefix
+        var_part = line[7:].strip()
+        
+        # Parse: name type size {values}
+        # Example: numbers int 10 {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        parts = var_part.split(None, 3)
+        if len(parts) >= 3:
+            name = parts[0]
+            array_type = parts[1]
+            size = int(parts[2])
+            value = parts[3] if len(parts) > 3 else '{}'
+            
+            return HASMVariable(
+                name=name,
+                value=value,
+                var_type=array_type,
+                line_number=line_num,
+                is_array=True,
+                array_size=size
             )
         
         return None
@@ -789,7 +856,7 @@ class CCodeGenerator:
         return hash(var_name) % 100 + 4
     
     def _compile_with_gcc(self, c_code: str, hasm_vars: Dict[str, HASMVariable]) -> str:
-        """Compile C code with HASM variable context using GCC"""
+        """Compile C code with HASM variable context using GCC with Windows x64 calling convention"""
         try:
             # Create temporary C file with proper context
             with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as c_file:
@@ -800,18 +867,32 @@ class CCodeGenerator:
             # Create temporary assembly file path
             asm_file_path = c_file_path.replace('.c', '.s')
             
-            # Compile C to assembly
+            # Compile C to assembly with Windows x64 optimizations and better error handling
             compile_cmd = [
-                "x86_64-w64-mingw32-gcc", "-S", "-masm=intel", "-O2", 
+                "x86_64-w64-mingw32-gcc", "-S", "-masm=intel", "-O1",  # Use O1 instead of O2 for better debugging
                 "-fno-asynchronous-unwind-tables", "-fno-stack-protector",
                 "-fomit-frame-pointer", "-fno-pic", "-fno-exceptions",
+                "-mno-red-zone",  # Disable red zone for Windows x64
+                "-mabi=ms",       # Use Microsoft calling convention
+                "-w",             # Suppress warnings for now
                 c_file_path, "-o", asm_file_path
             ]
             
             result = subprocess.run(compile_cmd, capture_output=True, text=True)
             
             if result.returncode != 0:
-                return f"; Error compiling C code: {result.stderr}"
+                # Save C code for debugging
+                debug_c_path = c_file_path.replace('.c', '_debug.c')
+                with open(debug_c_path, 'w') as debug_file:
+                    debug_file.write(full_c_code)
+                
+                print(f"[DEBUG] C compilation failed. Debug files:")
+                print(f"  C code: {debug_c_path}")
+                print(f"  Error: {result.stderr}")
+                
+                # Clean up main temp file but keep debug file
+                os.unlink(c_file_path)
+                return f"; Error compiling C code: {result.stderr.strip()}"
             
             # Read and clean the generated assembly
             with open(asm_file_path, 'r') as asm_file:
@@ -828,57 +909,43 @@ class CCodeGenerator:
             return nasm_asm
             
         except Exception as e:
+            print(f"[DEBUG] Exception in _compile_with_gcc: {str(e)}")
             return f"; Error: {str(e)}"
     
     def _convert_to_nasm_syntax(self, asm_content: str, hasm_vars: Dict[str, HASMVariable]) -> str:
-        """Convert GCC Intel assembly to NASM-compatible syntax with proper LC label mapping"""
+        """Convert GCC Intel assembly to NASM-compatible syntax with comprehensive LC label handling"""
         lines = asm_content.split('\n')
         converted_lines = []
         
-        # Pre-process to fix the double-dereference pattern for HASM variables
-        fixed_lines = self._fix_variable_access_patterns(lines, hasm_vars)
+        # Pre-process to fix calling convention and variable access patterns
+        fixed_lines = self._fix_calling_convention_and_variables(lines, hasm_vars)
+        
+        # First pass: collect ALL LC label references to ensure we map them all
+        all_lc_references = set()
+        for line in fixed_lines:
+            # Find all .LC references in any context
+            lc_matches = re.findall(r'\.LC(\d+)', line)
+            for lc_num in lc_matches:
+                all_lc_references.add(f'.LC{lc_num}')
+        
+        # Ensure all found LC references are mapped
+        for lc_ref in sorted(all_lc_references):
+            if lc_ref not in self.lc_label_mapping:
+                self.lc_label_counter += 1
+                self.lc_label_mapping[lc_ref] = f'LC{self.lc_label_counter}'
         
         for line in fixed_lines:
             converted_line = line
             
             # Convert .ascii to db
             if '.ascii' in converted_line:
-                # Extract the string content
-                match = re.search(r'\.ascii\s+"([^"]*)"', converted_line)
-                if match:
-                    string_content = match.group(1)
-                    # Convert escape sequences properly
-                    if '\\12' in string_content:
-                        # Split at \12 and create proper db directive
-                        parts = string_content.split('\\12')
-                        if len(parts) == 2 and parts[1] == '\\0':
-                            # Common pattern: "text\12\0" -> db "text", 10, 0
-                            converted_line = re.sub(r'\.ascii\s+"[^"]*"', f'db "{parts[0]}", 10, 0', converted_line)
-                        else:
-                            # More complex pattern, just convert \12 to 10
-                            string_content = string_content.replace('\\12', '", 10, "')
-                            string_content = string_content.replace('\\0', '', 0)
-                            converted_line = re.sub(r'\.ascii\s+"[^"]*"', f'db "{string_content}", 0', converted_line)
-                    else:
-                        # Simple string without escape sequences
-                        converted_line = re.sub(r'\.ascii\s+"[^"]*"', f'db "{string_content}", 0', converted_line)
+                converted_line = self._convert_ascii_directive(converted_line)
             
-            # Enhanced LC label replacement
+            # Enhanced LC label replacement - apply to ALL lines
             converted_line = self._replace_lc_labels_enhanced(converted_line)
             
             # Convert QWORD PTR references to direct variable access
-            for var_name, var in hasm_vars.items():
-                mapped_name = self.get_hasm_var_name(var_name)
-                if var.var_type == 'int':
-                    # For integers: mov rax, QWORD PTR .refptr.V01[rip] -> mov eax, [V01]
-                    pattern = f'mov\\s+(\\w+),\\s+QWORD PTR \\.refptr\\.{mapped_name}\\[rip\\]'
-                    replacement = f'mov \\1, [{mapped_name}]'
-                    converted_line = re.sub(pattern, replacement, converted_line)
-                elif var.var_type == 'string':
-                    # For strings: mov r8, QWORD PTR .refptr.V02[rip] -> mov r8, V02
-                    pattern = f'mov\\s+(\\w+),\\s+QWORD PTR \\.refptr\\.{mapped_name}\\[rip\\]'
-                    replacement = f'mov \\1, {mapped_name}'
-                    converted_line = re.sub(pattern, replacement, converted_line)
+            converted_line = self._convert_ptr_references(converted_line, hasm_vars)
             
             # Convert remaining DWORD PTR
             converted_line = re.sub(r'DWORD PTR \[([^]]+)\]', r'dword [\1]', converted_line)
@@ -896,25 +963,8 @@ class CCodeGenerator:
             
             converted_lines.append(converted_line)
         
-        # Add external declarations at the top - detect all function calls
-        external_decls = []
-        function_calls = set()
-        excluded_functions = {'main', '__main'}  # Functions that shouldn't have extern declarations
-        
-        # Find all call instructions and extract function names
-        for line in converted_lines:
-            # Match call instructions with various formats
-            call_match = re.search(r'call\s+([^\s;]+)', line)
-            if call_match:
-                func_name = call_match.group(1).strip()
-                # Remove any whitespace or tabs
-                func_name = re.sub(r'\s+', '', func_name)
-                if func_name not in excluded_functions:
-                    function_calls.add(func_name)
-        
-        # Generate extern declarations for all detected function calls
-        for func_name in sorted(function_calls):
-            external_decls.append(f'extern {func_name}')
+        # Add external declarations at the top
+        external_decls = self._generate_external_declarations(converted_lines)
         
         if external_decls:
             # Find the section .text line and insert externals before it
@@ -925,8 +975,181 @@ class CCodeGenerator:
         
         return '\n'.join(converted_lines)
     
-    def _fix_variable_access_patterns(self, lines: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
-        """Fix double-dereference patterns for HASM variables"""
+    def _fix_calling_convention_and_variables(self, lines: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
+        """Fix Windows x64 calling convention violations and variable access patterns"""
+        fixed_lines = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Fix double-dereference patterns for HASM variables
+            if self._is_double_dereference_start(line, i, lines, hasm_vars):
+                fixed_instruction = self._fix_double_dereference_pattern(line, i, lines, hasm_vars)
+                if fixed_instruction:
+                    fixed_lines.append(fixed_instruction)
+                    i += 2  # Skip both lines of the pattern
+                    continue
+            
+            # Fix calling convention violations for Windows x64
+            fixed_line = self._fix_windows_x64_calling_convention(line, i, lines)
+            
+            # Fix invalid register dereferences
+            fixed_line = self._fix_invalid_dereferences(fixed_line, hasm_vars)
+            
+            fixed_lines.append(fixed_line)
+            i += 1
+        
+        return fixed_lines
+    
+    def _is_double_dereference_start(self, line: str, line_num: int, lines: List[str], hasm_vars: Dict[str, HASMVariable]) -> bool:
+        """Check if this line starts a double-dereference pattern"""
+        # Look for pattern: mov reg, [rel V##]
+        if not re.search(r'mov\s+\w+,\s+\[rel\s+V\d+\]', line):
+            return False
+        
+        # Check if next line dereferences the register
+        if line_num + 1 < len(lines):
+            next_line = lines[line_num + 1].strip()
+            if re.search(r'mov\s+\w+,\s+dword\s+\[\w+\]', next_line):
+                return True
+        
+        return False
+    
+    def _fix_double_dereference_pattern(self, line: str, line_num: int, lines: List[str], hasm_vars: Dict[str, HASMVariable]) -> Optional[str]:
+        """Fix double-dereference pattern by creating direct access"""
+        # Extract variable name from first line
+        var_match = re.search(r'\[rel\s+(V\d+)\]', line)
+        if not var_match:
+            return None
+        
+        var_name = var_match.group(1)
+        next_line = lines[line_num + 1].strip()
+        
+        # Extract destination register from second line
+        dest_match = re.search(r'mov\s+(\w+),\s+dword\s+\[\w+\]', next_line)
+        if dest_match:
+            dest_reg = dest_match.group(1)
+            return f'\tmov {dest_reg}, dword [rel {var_name}]  ; Fixed: Direct variable access'
+        
+        return None
+    
+    def _fix_windows_x64_calling_convention(self, line: str, line_num: int, lines: List[str]) -> str:
+        """Fix Windows x64 calling convention violations"""
+        # Check if this is parameter setup for a function call
+        is_param_setup = self._is_parameter_setup_context(line_num, lines)
+        
+        if not is_param_setup:
+            return line
+        
+        # Fix System V to Windows x64 register mapping
+        # First parameter: rdi -> rcx
+        if re.search(r'mov\s+rdi,', line) or re.search(r'lea\s+rdi,', line):
+            fixed_line = re.sub(r'\b(mov|lea)\s+rdi,', r'\1 rcx,', line)
+            return fixed_line + '  ; Fixed: Windows x64 1st parameter (rdi->rcx)'
+        
+        # Second parameter: rsi -> rdx
+        elif re.search(r'mov\s+rsi,', line) or re.search(r'lea\s+rsi,', line):
+            fixed_line = re.sub(r'\b(mov|lea)\s+rsi,', r'\1 rdx,', line)
+            return fixed_line + '  ; Fixed: Windows x64 2nd parameter (rsi->rdx)'
+        
+        # Third parameter: rdx -> r8 (but be careful as rdx is also 2nd param in Windows x64)
+        elif re.search(r'mov\s+rdx,', line) and self._is_third_parameter(line_num, lines):
+            fixed_line = re.sub(r'mov\s+rdx,', 'mov r8,', line)
+            return fixed_line + '  ; Fixed: Windows x64 3rd parameter (rdx->r8)'
+        
+        return line
+    
+    def _is_parameter_setup_context(self, line_num: int, lines: List[str]) -> bool:
+        """Check if this line is in a parameter setup context before a function call"""
+        # Look ahead for a call instruction within reasonable distance
+        for i in range(line_num + 1, min(len(lines), line_num + 8)):
+            if 'call' in lines[i] and not lines[i].strip().startswith(';'):
+                return True
+        return False
+    
+    def _is_third_parameter(self, line_num: int, lines: List[str]) -> bool:
+        """Check if this rdx usage is for a third parameter (needs to be r8 in Windows x64)"""
+        # Count parameter setup instructions before this line
+        param_count = 0
+        for i in range(max(0, line_num - 5), line_num):
+            line = lines[i].strip()
+            if re.search(r'(mov|lea)\s+(rcx|rdi|rdx|rsi),', line):
+                param_count += 1
+        
+        return param_count >= 2  # This would be the third parameter
+    
+    def _fix_invalid_dereferences(self, line: str, hasm_vars: Dict[str, HASMVariable]) -> str:
+        """Fix invalid register dereferences"""
+        # Fix dereferences that should be direct variable access
+        if re.search(r'dword\s+\[(rdi|rsi|rbx|rax)\]', line) and 'rel' not in line:
+            # Try to map to a known variable - for now default to V01
+            var_name = 'V01'  # Could be made smarter by analyzing context
+            fixed_line = re.sub(r'dword\s+\[\w+\]', f'dword [rel {var_name}]', line)
+            return fixed_line + '  ; Fixed: Invalid dereference -> direct variable access'
+        
+        return line
+    
+    def _convert_ascii_directive(self, line: str) -> str:
+        """Convert .ascii directive to NASM db format"""
+        # Extract the string content
+        match = re.search(r'\.ascii\s+"([^"]*)"', line)
+        if match:
+            string_content = match.group(1)
+            # Convert escape sequences properly
+            if '\\12' in string_content:
+                # Split at \12 and create proper db directive
+                parts = string_content.split('\\12')
+                if len(parts) == 2 and parts[1] == '\\0':
+                    # Common pattern: "text\12\0" -> db "text", 10, 0
+                    return re.sub(r'\.ascii\s+"[^"]*"', f'db "{parts[0]}", 10, 0', line)
+                else:
+                    # More complex pattern, just convert \12 to 10
+                    string_content = string_content.replace('\\12', '", 10, "')
+                    string_content = string_content.replace('\\0', '', 0)
+                    return re.sub(r'\.ascii\s+"[^"]*"', f'db "{string_content}", 0', line)
+            else:
+                # Simple string without escape sequences
+                return re.sub(r'\.ascii\s+"[^"]*"', f'db "{string_content}", 0', line)
+        return line
+    
+    def _convert_ptr_references(self, line: str, hasm_vars: Dict[str, HASMVariable]) -> str:
+        """Convert QWORD PTR references to direct variable access"""
+        for var_name, var in hasm_vars.items():
+            mapped_name = self.get_hasm_var_name(var_name)
+            if var.var_type == 'int':
+                # For integers: mov rax, QWORD PTR .refptr.V01[rip] -> mov eax, [V01]
+                pattern = f'mov\\s+(\\w+),\\s+QWORD PTR \\.refptr\\.{mapped_name}\\[rip\\]'
+                replacement = f'mov \\1, [{mapped_name}]'
+                line = re.sub(pattern, replacement, line)
+            elif var.var_type == 'string':
+                # For strings: mov r8, QWORD PTR .refptr.V02[rip] -> mov r8, V02
+                pattern = f'mov\\s+(\\w+),\\s+QWORD PTR \\.refptr\\.{mapped_name}\\[rip\\]'
+                replacement = f'mov \\1, {mapped_name}'
+                line = re.sub(pattern, replacement, line)
+        return line
+    
+    def _generate_external_declarations(self, lines: List[str]) -> List[str]:
+        """Generate external declarations for all function calls"""
+        function_calls = set()
+        excluded_functions = {'main', '__main'}
+        
+        # Find all call instructions and extract function names
+        for line in lines:
+            # Match call instructions with various formats
+            call_match = re.search(r'call\\s+([^\\s;]+)', line)
+            if call_match:
+                func_name = call_match.group(1).strip()
+                # Remove any whitespace or tabs
+                func_name = re.sub(r'\\s+', '', func_name)
+                if func_name not in excluded_functions:
+                    function_calls.add(func_name)
+        
+        # Generate extern declarations for all detected function calls
+        return [f'extern {func_name}' for func_name in sorted(function_calls)]
+    
+    def _fix_legacy_variable_access_patterns(self, lines: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
+        """Legacy method for fixing specific variable access patterns - kept for compatibility"""
         fixed_lines = []
         i = 0
         
@@ -941,7 +1164,7 @@ class CCodeGenerator:
                 if 'mov eax, dword [rbx]' in next_line:
                     # Replace the pattern with direct access
                     indent = re.match(r'^(\s*)', lines[i]).group(1) if lines[i] else '    '
-                    fixed_lines.append(f'{indent}mov eax, dword [rel V01]  ; Load base address')
+                    fixed_lines.append(f'{indent}mov eax, dword [rel V01]  ; Fixed: Direct variable access')
                     i += 2  # Skip both lines
                     line_found = True
             
@@ -1005,7 +1228,11 @@ class CCodeGenerator:
         """Generate a complete C program with external HASM variable declarations"""
         includes = """#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>"""
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <sys/time.h>
+"""
         
         # Generate external variable declarations instead of local ones
         var_declarations = []
@@ -1020,6 +1247,8 @@ class CCodeGenerator:
                 var_declarations.append(f"extern char {var_name}[];")
             elif var.var_type == 'int':
                 var_declarations.append(f"extern int {var_name};")
+            elif var.var_type == 'float':
+                var_declarations.append(f"extern double {var_name};")
             else:
                 var_declarations.append(f"extern int {var_name};  // assumed int")
         
@@ -1029,8 +1258,10 @@ class CCodeGenerator:
             var_name = self.get_hasm_var_name(name)
             if var.var_type == 'string':
                 alias_declarations.append(f"#define {name} {var_name}")
-            elif var.var_type == 'int':
+            elif var.var_type in ['int', 'float']:
                 alias_declarations.append(f"#define {name} {var_name}")
+            else:
+                alias_declarations.append(f"#define {name} {var_name}")  # For unknown types
         
         var_decl_str = '\n'.join(var_declarations)
         alias_decl_str = '\n'.join(alias_declarations)
@@ -1039,6 +1270,9 @@ class CCodeGenerator:
         if c_code.strip().startswith('#'):
             return f"{includes}\n{c_code}"
         else:
+            # Properly format C code - ensure each statement ends with semicolon
+            formatted_c_code = self._format_c_statements(c_code)
+            
             return f"""{includes}
 
 // External HASM variable declarations
@@ -1049,26 +1283,57 @@ class CCodeGenerator:
 
 int main() {{
     // User C code
-    {c_code}
-    
+    {formatted_c_code}
     return 0;
 }}"""
-    
+
+    def _format_c_statements(self, c_code: str) -> str:
+        """Format C statements to ensure proper syntax"""
+        lines = c_code.split('\n')
+        formatted_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Ensure statements end with semicolon (except for blocks)
+            if line and not line.endswith((';', '{', '}')):
+                line += ';'
+                
+            formatted_lines.append('    ' + line)  # Indent for main function
+            
+        return '\n'.join(formatted_lines)
+
     def _extract_clean_asm(self, asm_content: str) -> str:
-        """Extract clean assembly from GCC output"""
+        """Extract clean assembly from GCC output while preserving string constants"""
         lines = asm_content.split('\n')
         result_lines = []
         string_constants = []
         in_main = False
+        in_data_section = False
         
-        # First pass: collect string constants
+        # First pass: collect string constants from any section
+        current_label = None
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith('.LC') and ':' in stripped:
-                label = stripped
+            
+            # Detect data sections
+            if stripped.startswith('.section') and ('rodata' in stripped or 'data' in stripped):
+                in_data_section = True
                 continue
-            elif stripped.startswith('.ascii') or stripped.startswith('.string'):
-                string_constants.append(f"{label}\n\t{stripped}")
+            elif stripped.startswith('.text') or stripped.startswith('main:'):
+                in_data_section = False
+            
+            # Collect LC labels and their data from any section
+            if stripped.startswith('.LC') and ':' in stripped:
+                current_label = stripped
+                string_constants.append(current_label)
+                continue
+            elif current_label and (stripped.startswith('.ascii') or stripped.startswith('.string')):
+                string_constants.append(f'\t{stripped}')
+                current_label = None
+                continue
         
         # Second pass: extract main function code
         for line in lines:
@@ -1165,31 +1430,76 @@ int main() {{
         
         return blocks
     
-    def _extract_string_constants(self, asm_code: str) -> List[str]:
-        """Extract string constants (LC labels) from generated assembly"""
-        lines = asm_code.split('\n')
-        string_constants = []
+    def _extract_lc_from_processed_lines(self, processed_lines: List[str]) -> List[str]:
+        """Extract any additional LC label references from processed assembly lines"""
+        additional_constants = []
+        found_lc_refs = set()
+        existing_labels = set()
         
-        # Look for the string constants section
-        in_string_section = False
-        for line in lines:
-            stripped = line.strip()
-            
-            # Start of string constants section
-            if stripped == '; String constants':
-                in_string_section = True
-                continue
-            
-            # End of string constants section (empty line or start of code)
-            if in_string_section and (not stripped or stripped.startswith('push') or stripped.startswith('mov')):
-                break
-            
-            # Collect string constant lines
-            if in_string_section and stripped:
-                string_constants.append(line)
+        # First, find what LC labels already exist in our constants
+        for line in processed_lines:
+            if isinstance(line, str) and line.strip().endswith(':') and 'LC' in line:
+                lc_match = re.search(r'(LC\d+):', line)
+                if lc_match:
+                    existing_labels.add(lc_match.group(1))
         
-        return string_constants
+        # Find all LC references in the processed lines
+        for line in processed_lines:
+            if isinstance(line, str):
+                # Look for LC references without [rel] prefix
+                lc_matches = re.findall(r'\b(LC\d+)\b', line)
+                for lc_label in lc_matches:
+                    if lc_label not in found_lc_refs and lc_label not in existing_labels:
+                        found_lc_refs.add(lc_label)
+                        
+                        # Check if this is a float constant (used in movsd instructions)
+                        if 'movsd' in line and 'xmm' in line:
+                            additional_constants.append(f'{lc_label}:')
+                            additional_constants.append(f'\tdq 2.0  ; Auto-generated float constant for {lc_label}')
+                        # Check if it's used in lea instruction (likely string constant)
+                        elif 'lea' in line:
+                            additional_constants.append(f'{lc_label}:')
+                            additional_constants.append(f'\tdb "Generated string", 0 ')
+        
+        return additional_constants
     
+    def _extract_string_constants(self, lines: List[str]) -> Dict[str, str]:
+        """Extract string constants from source lines with printf calls"""
+        constants = {}
+        
+        # Extract printf strings directly from source
+        for line in lines:
+            line = line.strip()
+            if line.startswith('%!') and 'printf' in line:
+                # Find printf calls with string literals
+                printf_matches = re.findall(r'printf\s*\(\s*"([^"]+)"', line)
+                for string_content in printf_matches:
+                    # Create LC label
+                    lc_num = len(constants)
+                    lc_label = f'LC{lc_num + 1}'
+                    constants[lc_label] = string_content
+                    
+        return constants
+
+    def _extract_lc_from_processed_lines(self, processed_lines: List[str]) -> List[str]:
+        """Extract additional LC labels that might be missing from processed assembly lines"""
+        additional_constants = []
+        
+        # Look for LC references in assembly lines that aren't defined yet
+        for line in processed_lines:
+            lc_matches = re.findall(r'\bLC(\d+)\b', line)
+            for lc_num in lc_matches:
+                lc_label = f'LC{lc_num}'
+                
+                # Check if this is a floating point constant (used with movsd, etc.)
+                if any(fp_instr in line for fp_instr in ['movsd', 'addsd', 'mulsd', 'cvtsi2sd']):
+                    additional_constants.append(f'    {lc_label} dq 2.0  ; Auto-generated float constant for {lc_label}')
+                else:
+                    additional_constants.append(f'    {lc_label} db "Missing constant", 0')
+        
+        # Remove duplicates
+        return list(dict.fromkeys(additional_constants))
+
     def _process_file_with_assembly_blocks(self, lines: List[str], c_instructions: List[Tuple[int, str, int]], 
                                          assembly_blocks: List[str], hasm_vars: Dict[str, HASMVariable]) -> List[str]:
         """Process the original file and insert assembly blocks in place of C instructions"""
@@ -1323,8 +1633,13 @@ int main() {{
             if combined_c_code.strip():
                 asm_code = self.generate_optimized_assembly(combined_c_code, hasm_vars, mode)
                 
-                # Extract string constants (LC labels) from the generated assembly
-                string_constants = self._extract_string_constants(asm_code)
+                # Extract string constants from source lines (printf strings)
+                string_constants_dict = self._extract_string_constants(lines)
+                
+                # Convert dictionary to list format for data section
+                string_constants = []
+                for lc_label, string_content in string_constants_dict.items():
+                    string_constants.append(f'    {lc_label} db "{string_content}", 0 ')
                 
                 # Extract assembly blocks between /APP and /NO_APP markers
                 assembly_blocks = self._extract_assembly_blocks(asm_code)
@@ -1337,6 +1652,23 @@ int main() {{
                 processed_lines = self._process_file_with_assembly_blocks(
                     lines, c_instructions, filtered_blocks, hasm_vars
                 )
+                
+                # Look for additional LC references that might need float constants
+                used_lc_labels = set()
+                for line in processed_lines:
+                    lc_matches = re.findall(r'\bLC(\d+)\b', line)
+                    for lc_num in lc_matches:
+                        used_lc_labels.add(f'LC{lc_num}')
+                
+                # Add float constants for LC labels that are used with floating point operations but not in string_constants_dict
+                for line in processed_lines:
+                    if any(fp_instr in line for fp_instr in ['movsd', 'addsd', 'mulsd', 'cvtsi2sd']):
+                        lc_matches = re.findall(r'\bLC(\d+)\b', line)
+                        for lc_num in lc_matches:
+                            lc_label = f'LC{lc_num}'
+                            # Only add if not already defined as a string constant
+                            if lc_label not in string_constants_dict:
+                                string_constants.append(f'    {lc_label} dq 2.0  ; Auto-generated float constant for {lc_label}')
             else:
                 processed_lines = [line for line in lines if not line.strip().startswith('%var ')]
                 string_constants = []

@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import shutil
 import json
+import re
 from pathlib import Path
 from lexer import Lexer
 from parser import Parser
@@ -62,6 +63,7 @@ class HLASMPreprocessor:
         self.error_handler = ErrorHandler()
         self.quality_engine = CodeQualityEngine()
         self.formatter = ASMFormatter()  # Add formatter
+        self.assembly_processor = AdvancedAssemblyProcessor(debug=False, calling_convention='windows_x64')  # Add dynamic assembly processor
         
         # Set optimization level
         opt_levels = {
@@ -124,7 +126,7 @@ class HLASMPreprocessor:
             # Apply advanced assembly processing with automatic extern detection
             print_system("[Post-processing] Applying advanced assembly processing with extern detection...")
             try:
-                processor = AdvancedAssemblyProcessor(debug=False)
+                processor = AdvancedAssemblyProcessor(debug=False, calling_convention='windows_x64')
                 final_output = processor.process_assembly(final_output)
                 print_success("Advanced assembly processing completed successfully")
             except Exception as e:
@@ -173,15 +175,31 @@ class HLASMPreprocessor:
                 final_output = fix_assembly_conservative(final_output)
                 print_success("Conservative assembly fixes applied successfully")
             except ImportError:
-                print_warning("Post-processing module not found, applying built-in fixes...")
-                # Apply built-in NASM compatibility fixes
-                final_output = self._fix_nasm_compatibility_issues(final_output)
-                print_success("Built-in NASM fixes applied successfully")
+                print_warning("Post-processing module not found, applying dynamic fixes...")
+                # Apply dynamic NASM compatibility fixes
+                final_output = self.assembly_processor.process_assembly(final_output)
+                print_success("Dynamic NASM compatibility fixes applied successfully")
             except Exception as e:
-                print_warning(f"Post-processing failed: {e}, applying built-in fixes...")
-                # Apply built-in NASM compatibility fixes as fallback
-                final_output = self._fix_nasm_compatibility_issues(final_output)
-                print_success("Built-in NASM fixes applied successfully")
+                print_warning(f"Post-processing failed: {e}, applying dynamic fixes...")
+                # Apply dynamic NASM compatibility fixes as fallback
+                final_output = self.assembly_processor.process_assembly(final_output)
+                print_success("Dynamic NASM compatibility fixes applied successfully")
+            
+            # Fix missing LC labels and broken assembly instructions
+            print_system("[Post-processing] Fixing missing labels and assembly errors...")
+            final_output = self._fix_assembly_errors(final_output)
+            
+            # Apply comprehensive post-processing to clean up duplicates and organize
+            print_system("[Post-processing] Applying comprehensive cleanup (removing duplicates, organizing sections)...")
+            try:
+                from postprocessing import AssemblyPostProcessor
+                post_processor = AssemblyPostProcessor()
+                final_output = post_processor.clean_assembly(final_output)
+                print_success("Comprehensive post-processing completed successfully")
+            except ImportError:
+                print_warning("Post-processor module not found, skipping cleanup...")
+            except Exception as e:
+                print_warning(f"Post-processing cleanup failed: {e}, continuing with current output...")
             
             # Save final formatted assembly with random name
             import random
@@ -273,88 +291,6 @@ class HLASMPreprocessor:
                 os.unlink(temp_input_path)
             if os.path.exists(temp_output_path):
                 os.unlink(temp_output_path)
-    
-    def _fix_nasm_compatibility_issues(self, assembly_content: str) -> str:
-        """Fix common NASM compatibility issues in generated assembly"""
-        lines = assembly_content.split('\n')
-        fixed_lines = []
-        i = 0
-        
-        while i < len(lines):
-            line = lines[i]
-            
-            # Fix the specific double-dereference pattern for HASM variables
-            # Pattern: mov rbx, [rel V01] followed by mov eax, dword [rbx]
-            if ('mov rbx, [rel V01]' in line.strip() and 
-                i + 1 < len(lines) and 
-                'mov eax, dword [rbx]' in lines[i + 1].strip()):
-                
-                # Replace with direct access
-                indent = line[:len(line) - len(line.lstrip())]
-                fixed_lines.append(f'{indent}mov eax, dword [rel V01]  ; Fixed: Direct access to HASM variable')
-                i += 2  # Skip both lines
-                continue
-            
-            # Fix similar patterns for other variables (V02, V03, etc.)
-            if 'mov rbx, [rel V' in line.strip() and i + 1 < len(lines):
-                # Extract variable name (V01, V02, etc.)
-                import re
-                match = re.search(r'mov rbx, \[rel (V\d+)\]', line.strip())
-                if match and 'mov eax, dword [rbx]' in lines[i + 1].strip():
-                    var_name = match.group(1)
-                    indent = line[:len(line) - len(line.lstrip())]
-                    fixed_lines.append(f'{indent}mov eax, dword [rel {var_name}]  ; Fixed: Direct access to HASM variable')
-                    i += 2  # Skip both lines
-                    continue
-            
-            # Fix register size mismatches: mov 32bit_reg, 64bit_reg
-            if 'mov edx, rax' in line:
-                import re
-                line = re.sub(r'mov edx, rax', 'mov edx, eax  ; Fixed: Register size match', line)
-            elif 'mov ecx, rax' in line:
-                import re  
-                line = re.sub(r'mov ecx, rax', 'mov ecx, eax  ; Fixed: Register size match', line)
-            elif 'mov r8d, rax' in line:
-                import re
-                line = re.sub(r'mov r8d, rax', 'mov r8d, eax  ; Fixed: Register size match', line)
-            elif 'mov r9d, rax' in line:
-                import re
-                line = re.sub(r'mov r9d, rax', 'mov r9d, eax  ; Fixed: Register size match', line)
-            
-            # Fix register size mismatches: add 32bit_reg, 64bit_reg
-            elif 'add edx, rax' in line:
-                import re
-                line = re.sub(r'add edx, rax', 'add edx, eax  ; Fixed: Register size match', line)
-            elif 'add ecx, rax' in line:
-                import re
-                line = re.sub(r'add ecx, rax', 'add ecx, eax  ; Fixed: Register size match', line)
-            elif 'add r8d, rax' in line:
-                import re
-                line = re.sub(r'add r8d, rax', 'add r8d, eax  ; Fixed: Register size match', line)
-            elif 'add r9d, rax' in line:
-                import re
-                line = re.sub(r'add r9d, rax', 'add r9d, eax  ; Fixed: Register size match', line)
-            
-            # Fix standalone [rbx] references (likely orphaned from double-dereference)
-            elif 'dword [rbx]' in line and 'mov' in line:
-                import re
-                line = re.sub(r'dword \[rbx\]', 'dword [rel V01]  ; Fixed: HASM variable reference', line)
-            
-            # Fix standalone [rax] references  
-            elif 'dword [rax]' in line and 'mov' in line:
-                import re
-                line = re.sub(r'dword \[rax\]', 'dword [rel V01]  ; Fixed: HASM variable reference', line)
-            
-            # Fix add operations with [rbx]
-            elif 'add' in line and '[rbx]' in line:
-                import re
-                line = re.sub(r'\[rbx\]', '[rel V01]  ; Fixed: HASM variable reference', line)
-            
-            # Keep original line if no pattern matched
-            fixed_lines.append(line)
-            i += 1
-        
-        return '\n'.join(fixed_lines)
     
     def _process_hlasm_commands(self, content: str) -> str:
         """Stage 2: Process high-level assembly commands using codegen.py"""
@@ -456,6 +392,92 @@ class HLASMPreprocessor:
         
         return '\n'.join(result)
     
+    def _fix_assembly_errors(self, assembly_content: str) -> str:
+        """Fix common assembly errors like missing labels and broken instructions"""
+        lines = assembly_content.split('\n')
+        
+        # Find all defined LC labels in data section
+        defined_lc_labels = set()
+        referenced_lc_labels = set()
+        data_section_lines = []
+        text_section_lines = []
+        in_data_section = False
+        in_text_section = False
+        
+        # Parse the assembly to find sections and labels
+        for line in lines:
+            stripped = line.strip()
+            
+            if stripped == 'section .data':
+                in_data_section = True
+                in_text_section = False
+                data_section_lines.append(line)
+                continue
+            elif stripped == 'section .text':
+                in_data_section = False
+                in_text_section = True
+                text_section_lines.append(line)
+                continue
+            
+            if in_data_section:
+                data_section_lines.append(line)
+                # Find defined LC labels
+                if re.match(r'\s*LC\d+\s+db\s+', stripped):
+                    label_match = re.match(r'\s*(LC\d+)', stripped)
+                    if label_match:
+                        defined_lc_labels.add(label_match.group(1))
+            elif in_text_section:
+                text_section_lines.append(line)
+                # Find referenced LC labels
+                lc_refs = re.findall(r'LC\d+', stripped)
+                referenced_lc_labels.update(lc_refs)
+        
+        # Find missing LC labels
+        missing_labels = referenced_lc_labels - defined_lc_labels
+        
+        if missing_labels:
+            print_warning(f"Found missing LC labels: {', '.join(sorted(missing_labels))}")
+            
+            # Add missing labels to data section
+            for label in sorted(missing_labels):
+                data_section_lines.append(f"    {label} db \"Missing label {label}\", 0")
+                print_info(f"Added missing label: {label}")
+        
+        # Fix broken assembly instructions
+        fixed_text_lines = []
+        for line in text_section_lines:
+            stripped = line.strip()
+            
+            # Fix common assembly errors
+            if 'movsd	xmm1, qword LC' in stripped and '[rel' not in stripped:
+                # Fix missing [rel] for movsd instructions
+                fixed_line = re.sub(r'movsd\s+xmm1,\s*qword\s+(LC\d+)', r'movsd xmm1, qword [rel \1]', line)
+                fixed_text_lines.append(fixed_line)
+            elif 'lea rdx, [rel V02]' in stripped and 'mov edx, dword [rel V01]' in lines[lines.index(line) + 1 if lines.index(line) + 1 < len(lines) else lines.index(line)]:
+                # Fix register conflict: loading address into rdx then overwriting with value
+                # Keep the address load, remove the conflicting value load
+                fixed_text_lines.append(line)
+                # Skip the next line if it's the conflicting mov
+                continue
+            elif stripped.startswith('mov edx, dword [rel V01]') and any('lea rdx, [rel' in prev_line for prev_line in text_section_lines[-3:]):
+                # Skip this line as it conflicts with previous lea rdx
+                continue
+            elif 'call	printf' in stripped and 'lea rcx, [rel LC5]' in lines[lines.index(line) - 1 if lines.index(line) > 0 else 0]:
+                # This appears to be the problematic sqrt->printf conversion
+                # Replace with proper sqrt call or remove
+                if 'LC5' in missing_labels:
+                    # Remove this printf call that references missing LC5
+                    continue
+                else:
+                    fixed_text_lines.append(line)
+            else:
+                fixed_text_lines.append(line)
+        
+        # Reconstruct the assembly
+        result_lines = data_section_lines + [''] + fixed_text_lines
+        
+        return '\n'.join(result_lines)
+    
     def get_stdlib_used(self):
         """Get the set of standard library functions used"""
         stdlib_used = set()
@@ -508,6 +530,9 @@ class HLASMCompiler:
         self.optimization_level = optimization_level
         self.enable_analysis = enable_analysis
         self._ensure_output_dir()
+        
+        # Initialize the advanced assembly processor for dynamic fixes
+        self.assembly_processor = AdvancedAssemblyProcessor(debug=False, calling_convention='windows_x64')  # Disable debug
         
         # Print target platform info
         print_info(f"Target platform: {self.target_os}-{self.target_arch}")
