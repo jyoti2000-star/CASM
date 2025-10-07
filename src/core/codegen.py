@@ -58,8 +58,18 @@ class AssemblyCodeGenerator(ASTVisitor):
         lines = []
         
         # Add external function declarations
-        if self.used_functions:
-            for func in sorted(self.used_functions):
+        external_functions = set()
+        external_functions.update(self.used_functions)
+        
+        # Always add common C library functions that might be used by compiled C code
+        common_c_functions = {'printf', 'puts', 'putchar', 'scanf', 'strlen', 'strcpy', 
+                             'strcmp', 'malloc', 'free', 'pow', 'sqrt', 'sin', 'cos',
+                             'srand', 'rand', 'exit', 'abort'}
+        external_functions.update(common_c_functions)
+        
+        if external_functions:
+            lines.append("; External function declarations")
+            for func in sorted(external_functions):
                 lines.append(f"extern {func}")
             lines.append("")
         
@@ -192,11 +202,17 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_for(self, node: ForNode):
         """Visit for loop"""
-        start_label = self._generate_label("for_start")
-        end_label = self._generate_label("for_end")
-        counter_var = f"for_counter_{self.label_counter}"
+        # Generate unique ID for this for loop consistent across data and text sections
+        self.label_counter += 1
+        for_loop_id = self.label_counter
+        start_label = f"for_start_{for_loop_id}"
+        end_label = f"for_end_{for_loop_id}"
+        counter_var = f"for_counter_{for_loop_id}"
         
         self.text_section.append(f"    ; for {node.variable} in range({node.count})")
+        
+        # Add counter variable to data section first
+        self.data_section.append(f"    {counter_var} dd 0")
         
         # Initialize counter
         self.text_section.append(f"    mov dword [rel {counter_var}], 0")
@@ -215,9 +231,6 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.text_section.append(f"    inc dword [rel {counter_var}]")
         self.text_section.append(f"    jmp {start_label}")
         self.text_section.append(f"{end_label}:")
-        
-        # Add counter variable to data section
-        self.data_section.append(f"    {counter_var} dd 0")
     
     def visit_println(self, node: PrintlnNode):
         """Visit println statement"""

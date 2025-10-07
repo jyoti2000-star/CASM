@@ -75,9 +75,9 @@ class CASMParser:
         elif token.type == TokenType.ASSEMBLY_LINE:
             return self._parse_assembly_line()
         else:
-            # Unknown token, treat as assembly
-            self._advance()
-            return AssemblyNode(token.value)
+            # Unknown token, might be start of assembly line
+            # Collect all tokens on this line to form complete assembly
+            return self._parse_unknown_as_assembly()
     
     def _parse_var_declaration(self) -> VarDeclarationNode:
         """Parse variable declaration: %var name value"""
@@ -220,6 +220,22 @@ class CASMParser:
         """Parse raw assembly line"""
         token = self._advance()
         return AssemblyNode(token.value)
+    
+    def _parse_unknown_as_assembly(self) -> AssemblyNode:
+        """Parse unknown tokens as assembly line - collect entire line"""
+        # Start with the current token
+        assembly_parts = []
+        
+        # Collect all tokens until newline or EOF
+        while not self._check(TokenType.NEWLINE) and not self._is_at_end():
+            token = self._advance()
+            if token.type == TokenType.EOF:
+                break
+            assembly_parts.append(token.value)
+        
+        # Join all parts to form complete assembly line
+        assembly_code = ' '.join(assembly_parts)
+        return AssemblyNode(assembly_code)
     
     def _parse_c_code_block(self) -> CCodeBlockNode:
         """Parse C code block starting with %!"""

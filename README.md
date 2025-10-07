@@ -1,16 +1,12 @@
-# CASM - Clean Assembly Language Compiler
-
-A clean, focused assembly language compiler with high-level constructs for educational and practical use.
-
-## Features
-
-CASM provides essential programming constructs while generating efficient x86-64 Windows assembly:
+CASM (C Assembly) provides essential programming constructs while generating efficient x86-64 Windows assembly:
 
 - **Control Flow**: `%if/%else/%endif`, `%while/%endwhile`, `%for/%endfor`
 - **Variables**: `%var name value`
 - **I/O**: `%println message`, `%scanf format variable`
 - **Comments**: `;` for single-line comments
 - **Inline Assembly**: Direct assembly code support
+- **C Integration**: `%extern` headers and `%!` embedded C code blocks
+- **Hybrid Programming**: Seamless C and Assembly interoperability
 
 ## Quick Start
 
@@ -33,11 +29,8 @@ sudo apt install nasm gcc-mingw-w64 wine
 ### Usage
 
 ```bash
-# Compile and run
-python3 casm.py run hello.casm
-
-# Compile to executable only
-python3 casm.py compile program.casm
+# Compile and run CASM programs
+python3 casm.py compile hello.casm
 
 # Generate assembly code only
 python3 casm.py asm test.casm
@@ -88,6 +81,59 @@ mov rax, 42
 push rax
 ```
 
+### C Code Integration (CASM C Assembly)
+
+CASM supports seamless integration with C code through extern declarations and embedded C blocks:
+
+#### External Headers
+```assembly
+%extern stdio.h
+%extern math.h
+%extern string.h
+```
+
+#### Embedded C Code Blocks
+```assembly
+%extern stdio.h
+
+%var number 42
+
+; Embed C code with %!
+%! printf("Hello from C! Number: %d\n", 42);
+
+%if number > 40
+    %println "CASM: Number is greater than 40"
+    %! printf("C: Indeed, %d > 40\n", 42);
+%endif
+
+; Multi-line C code blocks
+%! int factorial(int n) {
+%!     if (n <= 1) return 1;
+%!     return n * factorial(n - 1);
+%! }
+%! 
+%! int result = factorial(5);
+%! printf("Factorial of 5 = %d\n", result);
+```
+
+#### Variable Sharing
+CASM variables are automatically available in C code as extern declarations:
+
+```assembly
+%extern stdio.h
+
+%var counter 10
+%var message "Hello World"
+
+%! printf("Counter from CASM: %d\n", counter);
+%! printf("Message from CASM: %s\n", message);
+
+; C code can also define functions callable from assembly
+%! int add_numbers(int a, int b) {
+%!     return a + b;
+%! }
+```
+
 ## Example Programs
 
 ### Hello World
@@ -128,14 +174,52 @@ push rax
 %println "Done counting!"
 ```
 
+### C Integration Example
+```assembly
+; hybrid.casm - Demonstrates C and Assembly integration
+%extern stdio.h
+%extern math.h
+
+%var radius 5.0
+%var area 0.0
+
+%println "=== Circle Area Calculator ==="
+%println "Using C math functions with CASM variables"
+
+%! // Calculate area using C math functions
+%! double pi = 3.14159;
+%! double calculated_area = pi * radius * radius;
+%! printf("Radius: %.2f\n", radius);
+%! printf("Area calculated in C: %.2f\n", calculated_area);
+
+%var area calculated_area
+%println "Area stored in CASM variable:"
+%println area
+
+%if area > 70
+    %println "That's a large circle!"
+    %! printf("Indeed, %.2f is quite large!\n", calculated_area);
+%endif
+```
+
 ## Architecture
 
-CASM uses a clean 4-stage compilation pipeline:
+CASM uses a clean 4-stage compilation pipeline with C integration support:
 
 1. **Lexical Analysis** (`src/core/lexer.py`) - Tokenizes CASM source code
-2. **Parsing** (`src/core/parser.py`) - Builds Abstract Syntax Tree (AST)
-3. **Code Generation** (`src/core/codegen.py`) - Converts AST to x86-64 assembly
-4. **Assembly & Linking** (`src/compiler.py`) - NASM + MinGW-w64 toolchain
+2. **C Code Processing** (`src/utils/c_processor.py`) - Handles `%extern` and `%!` blocks
+3. **Parsing** (`src/core/parser.py`) - Builds Abstract Syntax Tree (AST)
+4. **Code Generation** (`src/core/codegen.py`) - Converts AST to x86-64 assembly
+5. **Assembly & Linking** (`src/compiler.py`) - NASM + MinGW-w64 toolchain
+
+### C Integration Pipeline
+
+When C code is detected (`%extern` or `%!` blocks):
+1. **C Preprocessing**: Extract and process embedded C code
+2. **Header Management**: Handle extern declarations automatically
+3. **Variable Binding**: Make CASM variables available to C code
+4. **Code Generation**: Generate both C and assembly object files
+5. **Linking**: Combine all objects into final executable
 
 ### Directory Structure
 ```
@@ -148,13 +232,53 @@ casm_clean/
 │   │   ├── parser.py    # Parser
 │   │   ├── ast_nodes.py # AST node definitions
 │   │   └── codegen.py   # Code generator
+│   ├── utils/
+│   │   ├── c_processor.py # C code integration handler
+│   │   ├── build.py     # Build utilities
+│   │   ├── formatter.py # Assembly formatting
+│   │   └── colors.py    # Terminal colors
 │   ├── stdlib/
 │   │   └── minimal.py   # Minimal standard library
 │   └── compiler.py      # Main compiler class
 ├── tests/               # Test files
-├── examples/            # Example programs
+├── examples/            # Example programs (including C integration)
 └── output/             # Generated files
 ```
+
+## CASM C Assembly Integration
+
+CASM supports powerful hybrid programming through its **C Assembly** integration system. This allows you to:
+
+- Use standard C library functions alongside CASM constructs
+- Write complex algorithms in C while using CASM for system-level control
+- Share variables seamlessly between C and Assembly code
+- Leverage existing C libraries and functions
+
+### Key Integration Features
+
+1. **`%extern` Directives**: Include C headers for library functions
+2. **`%!` Code Blocks**: Embed C code directly in CASM programs
+3. **Automatic Variable Binding**: CASM variables accessible in C code
+4. **Mixed Compilation**: Single command compiles both C and Assembly
+5. **Standard Library Access**: Full access to C standard library functions
+
+### Usage Examples
+
+All existing CASM commands (`compile`, `asm`) automatically handle C integration:
+
+```bash
+# Compile hybrid C+Assembly program
+python3 casm.py compile my_hybrid_program.casm
+
+# Generate assembly (shows both C and Assembly output)
+python3 casm.py asm complex_algorithm.casm
+```
+
+The compiler automatically detects C code blocks and handles the complete build pipeline, including:
+- C code compilation
+- Assembly generation  
+- Object file linking
+- Executable creation
 
 ## Target Platform
 
@@ -170,9 +294,10 @@ Cross-compilation from macOS/Linux is supported via MinGW-w64 and Wine.
 
 The codebase emphasizes:
 - **Clean Architecture**: Separation of concerns, single responsibility
-- **Focused Feature Set**: Only essential language constructs
+- **Focused Feature Set**: Only essential language constructs plus powerful C integration
 - **Educational Value**: Clear, readable code for learning compiler design
-- **Practical Use**: Generates working executables
+- **Practical Use**: Generates working executables with full C library support
+- **Hybrid Programming**: Best of both worlds - C's expressiveness and Assembly's control
 
 ## License
 

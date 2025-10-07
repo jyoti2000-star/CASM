@@ -869,7 +869,7 @@ class CCodeProcessor:
         for line in lines:
             stripped = line.strip()
             
-            # Find .LC labels
+            # Find .LC labels (including .LC0)
             if stripped.startswith('.LC') and stripped.endswith(':'):
                 current_label = stripped[:-1]  # Remove the colon
                 continue
@@ -896,6 +896,39 @@ class CCodeProcessor:
                     # Create NASM-style string
                     string_lines.append(f"    {current_label} db \"{string_content}")
                     current_label = None
+            
+            # Handle floating point constants like .LC0
+            elif (stripped.startswith('.long') or stripped.startswith('.quad')) and current_label:
+                # This is likely a floating point constant - collect all parts
+                if not hasattr(self, '_current_fp_constant'):
+                    self._current_fp_constant = []
+                
+                # Convert GCC syntax to NASM syntax
+                if stripped.startswith('.long'):
+                    # Extract the value and convert to dd
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        value = parts[1]
+                        self._current_fp_constant.append(f"        dd {value}")
+                elif stripped.startswith('.quad'):
+                    # Extract the value and convert to dq
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        value = parts[1]
+                        self._current_fp_constant.append(f"        dq {value}")
+                
+                # Check if we have both parts of a double (two .long entries)
+                if len(self._current_fp_constant) >= 2 or stripped.startswith('.quad'):
+                    string_lines.append(f"    {current_label}:")
+                    for part in self._current_fp_constant:
+                        string_lines.append(part)
+                    self._current_fp_constant = []
+                    current_label = None
+            
+            # Handle .align directives followed by .LC labels
+            elif stripped.startswith('.align') and current_label:
+                # Keep the label for the next data
+                continue
         
         return '\n'.join(string_lines)
     

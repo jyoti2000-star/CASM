@@ -21,6 +21,8 @@ class CASMPrettyPrinter:
         self.indent_level = 0
         self.base_indent = "    "
         self.string_counter = 0  # Counter for string labels
+        self.control_counter = 0  # Counter for control flow labels
+        self.extra_variables = []  # Variables to add to data section
         
     def prettify(self, assembly_code: str, ast: ProgramNode, variable_map: Dict, c_assembly_segments: Dict = None) -> str:
         """Main entry point - prettify the assembly code with context awareness"""
@@ -29,6 +31,8 @@ class CASMPrettyPrinter:
         
         # Reset counters for consistent labeling
         self.string_counter = 0
+        self.control_counter = 0
+        self.extra_variables = []
         self.string_label_map = {}  # Map original labels to sequential ones
         self.collected_strings = {}  # Map string_label -> content
         
@@ -234,7 +238,14 @@ class CASMPrettyPrinter:
                             formatted.append(f"    ; CASM variable: {casm_name}")
                     formatted.append(f"    {stripped}")
                 else:
-                    formatted.append(line)
+                    formatted.append(f"    {stripped}")
+            elif not in_data_section:
+                formatted.append(line)
+        
+        # Add extra variables (like for loop counters) to the data section
+        if self.extra_variables:
+            for var_line in self.extra_variables:
+                formatted.append(var_line)
         
         # Add additional data items that might be needed (string constants, loop counters)
         self._add_generated_data_items(formatted)
@@ -247,9 +258,10 @@ class CASMPrettyPrinter:
     
     def _add_generated_data_items(self, formatted: List[str]):
         """Add generated data items like string constants and loop counters"""
-        # This will be populated when we encounter println, scanf, and for loops
-        # For now, we'll add placeholders that will be filled during AST processing
-        pass
+        # Add any extra variables that were collected during processing
+        if hasattr(self, 'extra_variables') and self.extra_variables:
+            for var_line in self.extra_variables:
+                formatted.append(var_line)
     
     def _format_text_section_with_context(self, sections: Dict, ast: ProgramNode) -> List[str]:
         """Format text section with context-aware C code placement"""
@@ -315,8 +327,10 @@ class CASMPrettyPrinter:
             
         elif isinstance(stmt, IfNode):
             # Generate real if assembly
-            end_label = f"if_end_{id(stmt)}"
-            else_label = f"else_{id(stmt)}" if stmt.else_body else None
+            # Generate consistent labels
+            self.control_counter += 1
+            end_label = f"if_end_{self.control_counter}"
+            else_label = f"else_{self.control_counter}" if stmt.else_body else None
             
             output.append(f"    ; if {stmt.condition}")
             
@@ -354,8 +368,10 @@ class CASMPrettyPrinter:
             
         elif isinstance(stmt, WhileNode):
             # Generate real while loop assembly
-            start_label = f"while_start_{id(stmt)}"
-            end_label = f"while_end_{id(stmt)}"
+            # Generate consistent labels
+            self.control_counter += 1
+            start_label = f"while_start_{self.control_counter}"
+            end_label = f"while_end_{self.control_counter}"
             
             output.append(f"    ; while {stmt.condition}")
             output.append(f"{start_label}:")
@@ -379,11 +395,16 @@ class CASMPrettyPrinter:
             
         elif isinstance(stmt, ForNode):
             # Generate real for loop assembly
-            start_label = f"for_start_{id(stmt)}"
-            end_label = f"for_end_{id(stmt)}"
-            counter_var = f"for_counter_{id(stmt)}"
+            # Generate consistent labels
+            self.control_counter += 1
+            start_label = f"for_start_{self.control_counter}"
+            end_label = f"for_end_{self.control_counter}"
+            counter_var = f"for_counter_{self.control_counter}"
             
             output.append(f"    ; for {stmt.variable} in range({stmt.count})")
+            
+            # Add counter variable to data section
+            self.extra_variables.append(f"    {counter_var} dd 0")
             
             # Initialize counter
             output.append(f"    mov dword [rel {counter_var}], 0")
@@ -445,7 +466,9 @@ class CASMPrettyPrinter:
                 format_str = format_str[1:-1]
             
             # Generate labels
-            format_label = f"fmt_scanf_{id(stmt)}"
+            # Generate consistent format label
+            self.control_counter += 1
+            format_label = f"fmt_scanf_{self.control_counter}"
             var_label = f"var_{stmt.variable}"
             
             # Generate scanf call assembly (Windows x64 calling convention)

@@ -20,6 +20,8 @@ class AssemblyFixer:
         self.referenced_labels = set()  # Track referenced labels
         self.if_counter = 1  # Counter for if labels
         self.defined_variables = set()  # Track defined variables to avoid duplicates
+        self.for_counter = 1  # Counter for for labels
+        self.while_counter = 1  # Counter for while labels
         
     def fix_assembly(self, assembly_code: str) -> str:
         """Main entry point - fix all assembly issues"""
@@ -79,7 +81,9 @@ class AssemblyFixer:
                 r'lea\s+\w+,\s*\[rel\s+(\w+)\]',
                 r'j[a-z]+\s+(\w+)',
                 r'call\s+(\w+)',
-                r'jmp\s+(\w+)'
+                r'jmp\s+(\w+)',
+                r'movsd\s+\w+,\s*QWORD\s+PTR\s+(\w+)\[rip\]',  # GCC floating point constants
+                r'lea\s+\w+,\s*(\w+)\[rip\]'  # GCC style label references
             ]
             
             for pattern in ref_patterns:
@@ -144,9 +148,13 @@ class AssemblyFixer:
             line = re.sub(r'\.LC(\d+)', r'LC\1', line)
         
         # Fix RIP-relative addressing format for NASM
-        if '[rip]' in line and 'LC' in line:
+        if '[rip]' in line:
             # Convert "lea rax, LC0[rip]" to "lea rax, [rel LC0]" 
             line = re.sub(r'lea\s+(\w+),\s*(\w+)\[rip\]', r'lea \1, [rel \2]', line)
+            # Convert "movsd xmm0, qword LC0[rip]" to "movsd xmm0, [rel LC0]"
+            line = re.sub(r'(\w+)\s+(\w+),\s*qword\s+(\w+)\[rip\]', r'\1 \2, [rel \3]', line)
+            # Convert "mov rax, qword LC0[rip]" to "mov rax, [rel LC0]"
+            line = re.sub(r'(\w+)\s+(\w+),\s*(\w+)\[rip\]', r'\1 \2, [rel \3]', line)
         
         # Fix random label names with clean ones
         line = self._fix_random_labels(line)
@@ -229,8 +237,16 @@ class AssemblyFixer:
         str_refs = {label for label in self.referenced_labels if label.startswith('str_')}
         str_defs = {label for label in self.defined_labels if label.startswith('str_')}
         
+        # Check for missing LC constants
+        lc_refs = {label for label in self.referenced_labels if label.startswith('LC')}
+        lc_defs = {label for label in self.defined_labels if label.startswith('LC')}
+        missing_lc = lc_refs - lc_defs
+        
         print_info(f"String references: {str_refs}")
         print_info(f"String definitions: {str_defs}")
+        print_info(f"LC references: {lc_refs}")
+        print_info(f"LC definitions: {lc_defs}")
+        print_info(f"Missing LC constants: {missing_lc}")
         
         # Find the data section and fix/add strings
         result_lines = []
@@ -251,6 +267,18 @@ class AssemblyFixer:
                 if data_lines:
                     fixed_data_lines = self._fix_data_section_strings(data_lines, str_refs)
                     result_lines.extend(fixed_data_lines)
+                
+                # Add missing LC constants before text section
+                if missing_lc:
+                    result_lines.append("")
+                    result_lines.append("    ; Missing LC constants")
+                    for lc_label in sorted(missing_lc):
+                        if lc_label == 'LC0':
+                            # Add the floating point constant for 2.0
+                            result_lines.append(f"    {lc_label}:")
+                            result_lines.append("        dq 2.0  ; 2.0 in double precision")
+                        else:
+                            result_lines.append(f"    {lc_label} db \"Missing constant {lc_label}\", 0")
                 
                 result_lines.append(line)
                 continue
