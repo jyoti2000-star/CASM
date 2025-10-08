@@ -11,5 +11,5 @@ sum_loop:
 
     mov dword [rel var_sum], eax
 
-println "Sum is:"
-println sum
+print "Sum is:"
+print sum
