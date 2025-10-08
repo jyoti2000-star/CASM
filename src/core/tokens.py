@@ -23,6 +23,7 @@ class TokenType(Enum):
     
     # Variable declarations
     VAR = "VAR"
+    EXTERN = "EXTERN"
     
     # Data types
     INT_TYPE = "INT_TYPE"

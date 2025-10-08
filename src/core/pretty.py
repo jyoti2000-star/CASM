@@ -34,6 +34,9 @@ class CASMPrettyPrinter:
         self.collected_strings = {}
         self.c_assembly_segments = gcc_blocks or {}
         
+        # Extract existing labels from assembly before regenerating
+        self.existing_labels = self._extract_labels(assembly_code)
+        
         # Collect string literals from AST for cross-referencing
         self._collect_all_strings(ast)
         
@@ -401,6 +404,31 @@ class CASMPrettyPrinter:
         
         return formatted
     
+    def _extract_labels(self, assembly_code: str) -> Dict:
+        """Extract existing control flow labels from assembly"""
+        labels = {}
+        lines = assembly_code.split('\n')
+        
+        # Look for control flow labels (if/else/while/for)
+        for line in lines:
+            line = line.strip()
+            if ':' in line and not line.startswith(';'):
+                label = line.replace(':', '').strip()
+                if any(prefix in label for prefix in ['if_end_', 'else_', 'while_start_', 'while_end_', 'for_start_', 'for_end_']):
+                    # Extract the number from the label 
+                    parts = label.split('_')
+                    if len(parts) >= 3:
+                        try:
+                            label_num = int(parts[-1])
+                            label_type = '_'.join(parts[:-1])
+                            if label_type not in labels:
+                                labels[label_type] = []
+                            labels[label_type].append((label_num, label))
+                        except ValueError:
+                            pass
+        
+        return labels
+
     def _add_generated_data_items(self, formatted: List[str]):
         """Add generated data items like string constants and loop counters"""
         # Add any extra variables that were collected during processing
@@ -410,29 +438,67 @@ class CASMPrettyPrinter:
     
     def _format_text_section_with_context(self, sections: Dict, ast: ProgramNode) -> List[str]:
         """Format text section with context-aware C code placement"""
-        formatted = []
-        formatted.append("section .text")
-        formatted.append("global main")
-        formatted.append("")
-        formatted.append("main:")
-        formatted.append("    push rbp")
-        formatted.append("    mov rbp, rsp")
-        formatted.append("    sub rsp, 32  ; Shadow space for Windows x64")
-        formatted.append("")
+        # Debug: Check what's in the text section
+        print(f"[DEBUG] Text section has {len(sections.get('text', []))} lines")
+        if sections.get('text'):
+            print(f"[DEBUG] First few text lines: {sections['text'][:5]}")
         
-        # Process AST to maintain structure
-        gcc_block_index = 0
-        formatted.extend(self._process_ast_with_gcc_blocks(ast, sections['gcc_blocks'], gcc_block_index))
+        # Check if we have C code placeholders
+        text_content = sections.get('text', [])
+        has_placeholders = any('CASM_BLOCK_' in line and 'Placeholder' in line for line in text_content)
+        print(f"[DEBUG] Has C placeholders: {has_placeholders}")
         
-        # Add exit code
-        formatted.append("")
-        formatted.append("    ; Program exit")
-        formatted.append("    mov rax, 0")
-        formatted.append("    add rsp, 32")
-        formatted.append("    pop rbp")
-        formatted.append("    ret")
-        
-        return formatted
+        # Use the original text section but insert C code where needed
+        if 'text' in sections and sections['text']:
+            formatted = []
+            text_lines = sections['text']
+            gcc_blocks = sections.get('gcc_blocks', [])
+            
+            # Find C code placeholders and replace them
+            block_index = 0
+            for line in text_lines:
+                if 'CASM_BLOCK_' in line and 'Placeholder' in line:
+                    # Insert actual C code assembly
+                    if block_index < len(gcc_blocks):
+                        formatted.append(f"    ; C code block: CASM_BLOCK_{block_index}")
+                        formatted.extend(gcc_blocks[block_index]['assembly'])
+                        block_index += 1
+                    else:
+                        formatted.append(line)  # Keep placeholder if no C code
+                else:
+                    formatted.append(line)
+            
+            # Remove duplicate labels from the formatted assembly
+            print("[DEBUG] About to remove duplicate labels")
+            cleaned_assembly = self._remove_duplicate_labels('\n'.join(formatted))
+            print("[DEBUG] Finished removing duplicate labels")
+            return cleaned_assembly.split('\n')
+        else:
+            print("[DEBUG] No text section found, falling back to AST processing")
+            # Fallback to AST processing if no original text section
+            formatted = []
+            formatted.append("section .text")
+            formatted.append("global main")
+            formatted.append("")
+            formatted.append("main:")
+            formatted.append("    push rbp")
+            formatted.append("    mov rbp, rsp")
+            formatted.append("    sub rsp, 32  ; Shadow space for Windows x64")
+            formatted.append("")
+            
+            # Process AST to maintain structure
+            gcc_block_index = 0
+            formatted.extend(self._process_ast_with_gcc_blocks(ast, sections['gcc_blocks'], gcc_block_index))
+            
+            # Add exit code
+            formatted.append("")
+            formatted.append("    ; Program exit")
+            formatted.append("    mov rax, 0")
+            formatted.append("    add rsp, 32")
+            formatted.append("    pop rbp")
+            formatted.append("    ret")
+            
+            return formatted
     
     def _process_ast_with_gcc_blocks(self, node: ASTNode, gcc_blocks: List[Dict], block_index: int) -> List[str]:
         """Process AST nodes and insert GCC blocks in proper context"""
@@ -507,11 +573,38 @@ class CASMPrettyPrinter:
                     output.append(f"    mov dword [rel {var_label}], eax")
             
         elif isinstance(stmt, IfNode):
-            # Generate real if assembly
-            # Generate consistent labels
-            self.control_counter += 1
-            end_label = f"if_end_{self.control_counter}"
-            else_label = f"else_{self.control_counter}" if stmt.else_body else None
+            # Use existing labels if available, otherwise generate new ones
+            if hasattr(self, 'existing_labels') and 'if_end' in self.existing_labels:
+                # Find the next available label pair from existing labels
+                if_pairs = []
+                for label_type in ['if_end', 'else']:
+                    if label_type in self.existing_labels:
+                        if_pairs.extend(self.existing_labels[label_type])
+                
+                # Use the control_counter to index into existing labels
+                if if_pairs:
+                    # Sort by label number and use the current counter
+                    if_pairs.sort(key=lambda x: x[0])
+                    if self.control_counter < len(if_pairs):
+                        # Find corresponding else label if it exists
+                        current_if_num = if_pairs[self.control_counter][0] if self.control_counter < len(if_pairs) else self.control_counter + 1
+                        end_label = f"if_end_{current_if_num}"
+                        else_label = f"else_{current_if_num}" if stmt.else_body and 'else' in self.existing_labels else None
+                    else:
+                        # Fallback to generated labels
+                        self.control_counter += 1
+                        end_label = f"if_end_{self.control_counter}"
+                        else_label = f"else_{self.control_counter}" if stmt.else_body else None
+                else:
+                    # Fallback to generated labels
+                    self.control_counter += 1
+                    end_label = f"if_end_{self.control_counter}"
+                    else_label = f"else_{self.control_counter}" if stmt.else_body else None
+            else:
+                # Generate new labels if no existing ones found
+                self.control_counter += 1
+                end_label = f"if_end_{self.control_counter}"
+                else_label = f"else_{self.control_counter}" if stmt.else_body else None
             
             output.append(f"    ; if {stmt.condition}")
             
@@ -661,9 +754,6 @@ class CASMPrettyPrinter:
         elif isinstance(stmt, CCodeBlockNode):
             # Handle the new marker-based C compilation system
             indent = self.base_indent * (self.indent_level + 1)
-            
-            # Only add the original C statement as a comment
-            output.append(f"{indent}; {stmt.c_code}")
             
             # Get the actual compiled assembly for this block
             block_id = getattr(stmt, '_block_id', None)
@@ -867,6 +957,37 @@ class CASMPrettyPrinter:
             asm_lines.append(f"    cmp eax, 0")
         
         return asm_lines, 'je'
+    
+    def _remove_duplicate_labels(self, assembly_text: str) -> str:
+        """Remove duplicate label definitions from assembly code"""
+        lines = assembly_text.split('\n')
+        seen_labels = set()
+        filtered_lines = []
+        duplicate_count = 0
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Check if this is a label definition (ends with ':' and doesn't contain other content)
+            if ':' in stripped and not stripped.startswith(';'):
+                # Extract just the label part (before the colon)
+                potential_label = stripped.split(':')[0].strip()
+                
+                # If this looks like a control flow label (else_, if_end_, etc.)
+                if any(pattern in potential_label for pattern in ['else_', 'if_end_', 'while_', 'for_']):
+                    if potential_label in seen_labels:
+                        # Skip this duplicate label
+                        print_info(f"Removing duplicate label: {potential_label}")
+                        duplicate_count += 1
+                        continue
+                    else:
+                        seen_labels.add(potential_label)
+                        print_info(f"Keeping first occurrence of label: {potential_label}")
+            
+            filtered_lines.append(line)
+        
+        print_info(f"Removed {duplicate_count} duplicate labels")
+        return '\n'.join(filtered_lines)
 
 # Global instance
 pretty_printer = CASMPrettyPrinter()

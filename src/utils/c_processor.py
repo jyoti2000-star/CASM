@@ -711,14 +711,22 @@ class CCodeProcessor:
         """Generate C header with includes and extern declarations"""
         header_lines = []
         
-        # Add standard C headers
-        header_lines.extend([
-            '#include <stdio.h>',
-            '#include <stdlib.h>',
-            '#include <string.h>',
-        ])
+        # Check if any C code blocks already contain includes
+        has_includes = False
+        for code_block in self.c_code_blocks:
+            if '#include' in code_block:
+                has_includes = True
+                break
         
-        # Add extern headers
+        # Only add standard headers if no includes are present in C blocks
+        if not has_includes:
+            header_lines.extend([
+                '#include <stdio.h>',
+                '#include <stdlib.h>',
+                '#include <string.h>',
+            ])
+        
+        # Add extern headers (from @extern directives)
         for header in self.headers:
             if header.endswith('.h'):
                 header_lines.append(f'#include "{header}"')
@@ -735,7 +743,7 @@ class CCodeProcessor:
                 size = var_info.get('size', None)
                 
                 # Convert CASM types to C types
-                if var_type == 'str':
+                if var_type == 'str' or var_type == 'string':
                     c_type = 'char*'
                 elif var_type == 'buffer':
                     c_type = 'char*'  # Buffers are char arrays

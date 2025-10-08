@@ -168,41 +168,9 @@ class AssemblyFixer:
         return line
     
     def _fix_random_labels(self, line: str) -> str:
-        """Replace random label names with clean sequential ones"""
-        # Pattern for if_end_<random_number>
-        if_pattern = r'if_end_\d+'
-        if re.search(if_pattern, line):
-            # Replace with clean if label
-            clean_label = f'if_end_{self.if_counter}'
-            line = re.sub(if_pattern, clean_label, line)
-        
-        # Pattern for else_<random_number>
-        else_pattern = r'else_\d+'
-        if re.search(else_pattern, line):
-            # Replace with clean else label
-            clean_label = f'else_{self.if_counter}'
-            line = re.sub(else_pattern, clean_label, line)
-        
-        # Pattern for for_start_<random_number>, for_end_<random_number>
-        for_pattern = r'for_(start|end)_\d+'
-        if re.search(for_pattern, line):
-            if not hasattr(self, 'for_counter'):
-                self.for_counter = 1
-            def replace_for(match):
-                return f'for_{match.group(1)}_{self.for_counter}'
-            line = re.sub(for_pattern, replace_for, line)
-            def replace_for(match):
-                return f'for_{match.group(1)}_{self.for_counter}'
-            line = re.sub(for_pattern, replace_for, line)
-        
-        # Pattern for while_start_<random_number>, while_end_<random_number>
-        while_pattern = r'while_(start|end)_\d+'
-        if re.search(while_pattern, line):
-            self.while_counter += 1
-            def replace_while(match):
-                return f'while_{match.group(1)}_{self.while_counter}'
-            line = re.sub(while_pattern, replace_while, line)
-        
+        """Replace random label names with clean sequential ones - DISABLED"""
+        # DISABLED: This function was causing duplicate label issues
+        # The code generator now produces unique labels correctly
         return line
     
     def _fix_string_references(self, line: str) -> str:
@@ -215,18 +183,9 @@ class AssemblyFixer:
         return line
     
     def _fix_label_consistency(self, line: str) -> str:
-        """Fix label consistency issues like if_end_1 vs if_end_2"""
-        # Standardize all if_end labels to use "1"
-        if 'if_end_' in line:
-            line = re.sub(r'if_end_\d+', 'if_end_1', line)
-        
-        # Same for other label types
-        if 'for_end_' in line or 'for_start_' in line:
-            line = re.sub(r'for_(end|start)_\d+', r'for_\1_1', line)
-        
-        if 'while_end_' in line or 'while_start_' in line:
-            line = re.sub(r'while_(end|start)_\d+', r'while_\1_1', line)
-        
+        """Fix label consistency issues - DISABLED"""
+        # DISABLED: This function was causing duplicate label issues
+        # The code generator now produces unique labels correctly
         return line
     
     def _add_missing_strings(self, lines: List[str]) -> List[str]:

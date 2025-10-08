@@ -145,6 +145,10 @@ class ASTVisitor(ABC):
         pass
     
     @abstractmethod
+    def visit_assignment(self, node: AssignmentNode):
+        pass
+    
+    @abstractmethod
     def visit_if(self, node: IfNode):
         pass
     
@@ -174,6 +178,10 @@ class ASTVisitor(ABC):
     
     @abstractmethod
     def visit_c_code_block(self, node: CCodeBlockNode):
+        pass
+    
+    @abstractmethod
+    def visit_asm_block(self, node: AsmBlockNode):
         pass
     
     @abstractmethod

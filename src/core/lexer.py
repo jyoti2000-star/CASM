@@ -36,11 +36,13 @@ class CASMLexer:
             # Data types with @ prefix (handled separately)
             'int': TokenType.INT_TYPE,
             'str': TokenType.STR_TYPE,
+            'string': TokenType.STR_TYPE,  # Alternative string type name
             'bool': TokenType.BOOL_TYPE,
             'float': TokenType.FLOAT_TYPE,
             'buffer': TokenType.BUFFER_TYPE,
             'in': TokenType.IN,
             'range': TokenType.RANGE,
+            'extern': TokenType.EXTERN,
         }
         
         # Operators (ordered by length for proper matching)

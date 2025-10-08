@@ -59,7 +59,11 @@ class CASMParser:
         if token.type == TokenType.AT_SYMBOL:
             return self._parse_var_declaration()
         elif token.type == TokenType.IDENTIFIER:
-            return self._parse_assignment()
+            # Look ahead to see if this is an assignment or assembly
+            if self._is_assignment():
+                return self._parse_assignment()
+            else:
+                return self._parse_unknown_as_assembly()
         elif token.type == TokenType.IF:
             return self._parse_if_statement()
         elif token.type == TokenType.WHILE:
@@ -81,9 +85,31 @@ class CASMParser:
             # Collect all tokens on this line to form complete assembly
             return self._parse_unknown_as_assembly()
     
-    def _parse_var_declaration(self) -> VarDeclarationNode:
-        """Parse variable declaration: @type name = value"""
+    def _is_assignment(self) -> bool:
+        """Check if the current identifier is followed by an assignment operator"""
+        # Save current position
+        saved_position = self.current
+        
+        # Skip the identifier
+        if self._check(TokenType.IDENTIFIER):
+            self._advance()
+            
+            # Check if next token is assignment operator
+            is_assign = self._check(TokenType.ASSIGN)
+            
+            # Restore position
+            self.current = saved_position
+            return is_assign
+        
+        return False
+    
+    def _parse_var_declaration(self) -> ASTNode:
+        """Parse variable declaration: @type name = value or @extern <header>"""
         self._consume(TokenType.AT_SYMBOL, "Expected '@'")
+        
+        # Check if this is an extern directive
+        if self._check(TokenType.EXTERN):
+            return self._parse_extern_directive()
         
         # Get the type
         if not self._check_types([TokenType.INT_TYPE, TokenType.STR_TYPE, TokenType.BOOL_TYPE, 
@@ -120,7 +146,7 @@ class CASMParser:
         if not value:
             if var_type == "int":
                 value = "0"
-            elif var_type == "str":
+            elif var_type in ["str", "string"]:
                 value = '""'
             elif var_type == "bool":
                 value = "false"
@@ -130,6 +156,39 @@ class CASMParser:
                 value = ""  # No value needed for buffers
         
         return VarDeclarationNode(name, value, var_type, size)
+    
+    def _parse_extern_directive(self) -> ExternDirectiveNode:
+        """Parse extern directive: @extern <header>"""
+        self._consume(TokenType.EXTERN, "Expected 'extern'")
+        
+        # Check for angle brackets or just a regular identifier/string
+        header_name = ""
+        
+        if self._check(TokenType.LESS_THAN):
+            self._advance()  # consume '<'
+            # Collect everything until '>'
+            header_parts = []
+            while not self._check(TokenType.GREATER_THAN) and not self._is_at_end():
+                token = self._advance()
+                if token.type != TokenType.EOF:
+                    header_parts.append(token.value)
+            self._consume(TokenType.GREATER_THAN, "Expected '>'")
+            header_name = ''.join(header_parts)
+        elif self._check(TokenType.STRING):
+            # String literal header
+            string_token = self._advance()
+            header_name = string_token.value.strip('"\'')
+        else:
+            # Regular identifier (like stdio.h)
+            # Collect until newline as header name
+            header_parts = []
+            while not self._check(TokenType.NEWLINE) and not self._is_at_end():
+                token = self._advance()
+                if token.type != TokenType.EOF:
+                    header_parts.append(token.value)
+            header_name = ''.join(header_parts).strip()
+        
+        return ExternDirectiveNode(header_name)
     
     def _parse_assignment(self) -> AssignmentNode:
         """Parse variable assignment: variable = expression"""
@@ -220,8 +279,15 @@ class CASMParser:
         self._consume(TokenType.RANGE, "Expected 'range'")
         self._consume(TokenType.LEFT_PAREN, "Expected '('")
         
-        count_token = self._consume(TokenType.NUMBER, "Expected number")
-        count = count_token.value
+        # Accept either a number or an identifier for the count
+        if self._check(TokenType.NUMBER):
+            count_token = self._advance()
+            count = count_token.value
+        elif self._check(TokenType.IDENTIFIER):
+            count_token = self._advance()
+            count = count_token.value
+        else:
+            raise ParseError("Expected number or variable name in range()", self._peek())
         
         self._consume(TokenType.RIGHT_PAREN, "Expected ')'")
         
