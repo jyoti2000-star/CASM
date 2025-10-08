@@ -30,6 +30,7 @@ class CASMPrettyPrinter:
         self.current_block_id = 0
         self.extra_variables = []
         self.variable_labels = variable_labels or {}
+        self.variable_map = variable_labels or {}  # Use passed variable labels instead of empty map
         self.collected_strings = {}
         self.c_assembly_segments = gcc_blocks or {}
         
@@ -82,8 +83,14 @@ class CASMPrettyPrinter:
         output.append("")
         
         # Data section - organized
-        output.extend(self._format_data_section(sections['data']))
+        data_section = self._format_data_section(sections['data'])
+        output.extend(data_section)
         output.append("")
+        
+        # BSS section - uninitialized data
+        if sections.get('bss') and any(line.strip() for line in sections['bss']):
+            output.extend(self._format_bss_section(sections['bss']))
+            output.append("")
         
         # Text section with context-aware C code placement
         output.extend(self._format_text_section_with_context(sections, ast))
@@ -189,6 +196,7 @@ class CASMPrettyPrinter:
             'header': [],
             'externals': [],
             'data': [],
+            'bss': [],
             'text': [],
             'gcc_blocks': []
         }
@@ -229,19 +237,20 @@ class CASMPrettyPrinter:
             # Regular assembly parsing
             if stripped.startswith('extern'):
                 sections['externals'].append(line)
-            elif stripped.startswith('section .data') or current_section == 'data':
-                if stripped.startswith('section .text'):
-                    current_section = 'text'
-                    sections['text'].append(line)
-                else:
-                    sections['data'].append(line)
-                    if stripped.startswith('section .data'):
-                        current_section = 'data'
-            elif stripped.startswith('section .text') or current_section == 'text':
-                sections['text'].append(line)
+            elif stripped.startswith('section .data'):
+                current_section = 'data'
+                sections['data'].append(line)
+            elif stripped.startswith('section .bss'):
+                current_section = 'bss'
+                sections['bss'].append(line)
+            elif stripped.startswith('section .text'):
                 current_section = 'text'
-            else:
+                sections['text'].append(line)
+            elif current_section in sections:
                 sections[current_section].append(line)
+            else:
+                # Default to header if no section is set
+                sections['header'].append(line)
         
         return sections
     
@@ -285,8 +294,22 @@ class CASMPrettyPrinter:
         
         output.append("")
         
-        # Data section - organized
-        output.extend(self._format_data_section(sections['data']))
+        # Data section - organized, including any misplaced strings from BSS
+        misplaced_strings = []
+        if sections.get('bss'):
+            for line in sections['bss']:
+                stripped = line.strip()
+                if ' db ' in stripped and (stripped.startswith('str_') or stripped.startswith('LC')):
+                    misplaced_strings.append(f"    {stripped}")
+        
+        data_section = self._format_data_section(sections['data'])
+        if misplaced_strings:
+            # Insert misplaced strings into the data section
+            data_insert_index = 1  # After "section .data"
+            for i, string_line in enumerate(misplaced_strings):
+                data_section.insert(data_insert_index + i, string_line)
+        
+        output.extend(data_section)
         output.append("")
         
         # Text section with context-aware C code placement
@@ -345,6 +368,39 @@ class CASMPrettyPrinter:
         
         return formatted
     
+    def _format_bss_section(self, bss_lines: List[str]) -> List[str]:
+        """Format the BSS section with proper organization"""
+        formatted = []
+        in_bss_section = False
+        
+        for line in bss_lines:
+            stripped = line.strip()
+            
+            if stripped.startswith('section .bss'):
+                formatted.append("section .bss")
+                in_bss_section = True
+                continue
+            
+            if in_bss_section and stripped:
+                # Check if this is a string declaration that belongs in .data section
+                if ' db ' in stripped and (stripped.startswith('str_') or stripped.startswith('LC')):
+                    # This is a string declaration that was incorrectly placed in .bss
+                    # We'll move it to the data section in the main rebuild method
+                    continue
+                elif stripped.startswith('var_') and ' resb ' in stripped:
+                    # This is a proper BSS declaration (uninitialized buffer)
+                    formatted.append(f"    {stripped}")
+                elif stripped.startswith('var_'):
+                    # Other variable declarations
+                    formatted.append(f"    {stripped}")
+                else:
+                    # Other BSS items (but not string data)
+                    formatted.append(f"    {stripped}")
+            elif not in_bss_section:
+                formatted.append(line)
+        
+        return formatted
+    
     def _add_generated_data_items(self, formatted: List[str]):
         """Add generated data items like string constants and loop counters"""
         # Add any extra variables that were collected during processing
@@ -398,8 +454,7 @@ class CASMPrettyPrinter:
         current_index = block_index
         
         if isinstance(stmt, VarDeclarationNode):
-            output.append(f"    ; Variable declaration: {stmt.name} = {stmt.value}")
-            # Generate actual variable initialization assembly
+            # Generate actual variable initialization assembly (remove verbose comments)
             var_label = f"var_{stmt.name}"
             try:
                 # Try to parse as integer
@@ -411,8 +466,45 @@ class CASMPrettyPrinter:
                     src_label = f"var_{stmt.value}"
                     output.append(f"    mov eax, dword [rel {src_label}]")
                     output.append(f"    mov dword [rel {var_label}], eax")
-                else:
-                    output.append(f"    ; Complex expression: {stmt.value}")
+                # Skip complex expression comments
+            
+        elif isinstance(stmt, AssignmentNode):
+            # Generate assignment assembly
+            var_label = f"var_{stmt.name}"
+            expression = stmt.value.strip()
+            
+            # Handle simple arithmetic like "i + 1" or "i - 1"
+            if '+' in expression:
+                parts = expression.split('+')
+                if len(parts) == 2:
+                    left = parts[0].strip()
+                    right = parts[1].strip()
+                    
+                    # Load left operand
+                    if left == stmt.name:
+                        output.append(f"    mov eax, dword [rel {var_label}]")
+                    elif left.isdigit():
+                        output.append(f"    mov eax, {left}")
+                    else:
+                        output.append(f"    mov eax, dword [rel var_{left}]")
+                    
+                    # Add right operand
+                    if right.isdigit():
+                        output.append(f"    add eax, {right}")
+                    else:
+                        output.append(f"    add eax, dword [rel var_{right}]")
+                    
+                    # Store result
+                    output.append(f"    mov dword [rel {var_label}], eax")
+            elif expression.isdigit():
+                # Simple numeric assignment
+                output.append(f"    mov dword [rel {var_label}], {expression}")
+            else:
+                # Variable assignment
+                if expression in self.variable_map:
+                    src_label = f"var_{expression}"
+                    output.append(f"    mov eax, dword [rel {src_label}]")
+                    output.append(f"    mov dword [rel {var_label}], eax")
             
         elif isinstance(stmt, IfNode):
             # Generate real if assembly
@@ -424,13 +516,13 @@ class CASMPrettyPrinter:
             output.append(f"    ; if {stmt.condition}")
             
             # Generate condition evaluation assembly
-            condition_asm = self._generate_condition_assembly(stmt.condition)
+            condition_asm, jump_instruction = self._generate_condition_assembly(stmt.condition)
             output.extend(condition_asm)
             
             if else_label:
-                output.append(f"    je {else_label}")
+                output.append(f"    {jump_instruction} {else_label}")
             else:
-                output.append(f"    je {end_label}")
+                output.append(f"    {jump_instruction} {end_label}")
             
             self.indent_level += 1
             
@@ -466,9 +558,9 @@ class CASMPrettyPrinter:
             output.append(f"{start_label}:")
             
             # Generate condition evaluation assembly
-            condition_asm = self._generate_condition_assembly(stmt.condition)
+            condition_asm, jump_instruction = self._generate_condition_assembly(stmt.condition)
             output.extend(condition_asm)
-            output.append(f"    je {end_label}")
+            output.append(f"    {jump_instruction} {end_label}")
             
             self.indent_level += 1
             
@@ -569,9 +661,9 @@ class CASMPrettyPrinter:
         elif isinstance(stmt, CCodeBlockNode):
             # Handle the new marker-based C compilation system
             indent = self.base_indent * (self.indent_level + 1)
-            output.append(f"{indent}; === C CODE BLOCK ===")
-            output.append(f"{indent}; Original C: {stmt.c_code}")
-            output.append(f"{indent}; Compiled with combined GCC compilation")
+            
+            # Only add the original C statement as a comment
+            output.append(f"{indent}; {stmt.c_code}")
             
             # Get the actual compiled assembly for this block
             block_id = getattr(stmt, '_block_id', None)
@@ -580,18 +672,13 @@ class CASMPrettyPrinter:
                 if marker_key in self.c_assembly_segments:
                     assembly_code = self.c_assembly_segments[marker_key]
                     if assembly_code.strip():
-                        output.append(f"{indent}; Generated assembly:")
+                        # Add assembly instructions directly without extra comments
                         for asm_line in assembly_code.split('\n'):
                             if asm_line.strip():
                                 output.append(f"{indent}{asm_line}")
-                    else:
-                        output.append(f"{indent}; (Empty assembly block)")
-                else:
-                    output.append(f"{indent}; (Assembly not found for {marker_key})")
-            else:
-                output.append(f"{indent}; (No block ID available)")
-            
-            output.append(f"{indent}; === END C CODE BLOCK ===")
+                    # Don't add anything for empty assembly blocks
+                # Don't add anything for missing assembly
+            # Don't add anything for missing block ID
         
         elif isinstance(stmt, ExternDirectiveNode):
             output.append(f"    ; extern {stmt.header_name}")
@@ -722,8 +809,8 @@ class CASMPrettyPrinter:
         
         return '\n'.join(final_lines)
     
-    def _generate_condition_assembly(self, condition: str) -> List[str]:
-        """Generate assembly code for condition evaluation"""
+    def _generate_condition_assembly(self, condition: str) -> tuple[List[str], str]:
+        """Generate assembly code for condition evaluation and return the appropriate jump instruction"""
         asm_lines = []
         condition = condition.strip()
         
@@ -764,7 +851,7 @@ class CASMPrettyPrinter:
                     asm_lines.append(f"    ; TODO: Complex right operand: {right}")
                     asm_lines.append(f"    cmp eax, 0  ; placeholder")
                 
-                return asm_lines
+                return asm_lines, comparison_ops[op]
         
         # Fallback for simple boolean conditions
         if condition in self.variable_map:
@@ -779,7 +866,7 @@ class CASMPrettyPrinter:
             asm_lines.append(f"    mov eax, 1  ; assume true")
             asm_lines.append(f"    cmp eax, 0")
         
-        return asm_lines
+        return asm_lines, 'je'
 
 # Global instance
 pretty_printer = CASMPrettyPrinter()

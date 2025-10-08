@@ -56,22 +56,24 @@ class CASMParser:
             return CommentNode(token.value)
         
         # Parse language constructs
-        if token.type == TokenType.VAR:
+        if token.type == TokenType.AT_SYMBOL:
             return self._parse_var_declaration()
+        elif token.type == TokenType.IDENTIFIER:
+            return self._parse_assignment()
         elif token.type == TokenType.IF:
             return self._parse_if_statement()
         elif token.type == TokenType.WHILE:
             return self._parse_while_statement()
         elif token.type == TokenType.FOR:
             return self._parse_for_statement()
-        elif token.type == TokenType.PRINTLN:
-            return self._parse_println_statement()
-        elif token.type == TokenType.SCANF:
-            return self._parse_scanf_statement()
+        elif token.type == TokenType.PRINT:
+            return self._parse_print_statement()
+        elif token.type == TokenType.SCAN:
+            return self._parse_scan_statement()
         elif token.type == TokenType.C_CODE_BLOCK:
             return self._parse_c_code_block()
-        elif token.type == TokenType.EXTERN:
-            return self._parse_extern_directive()
+        elif token.type == TokenType.ASM_BLOCK:
+            return self._parse_asm_block()
         elif token.type == TokenType.ASSEMBLY_LINE:
             return self._parse_assembly_line()
         else:
@@ -80,11 +82,30 @@ class CASMParser:
             return self._parse_unknown_as_assembly()
     
     def _parse_var_declaration(self) -> VarDeclarationNode:
-        """Parse variable declaration: %var name value"""
-        self._consume(TokenType.VAR, "Expected '%var'")
+        """Parse variable declaration: @type name = value"""
+        self._consume(TokenType.AT_SYMBOL, "Expected '@'")
+        
+        # Get the type
+        if not self._check_types([TokenType.INT_TYPE, TokenType.STR_TYPE, TokenType.BOOL_TYPE, 
+                                 TokenType.FLOAT_TYPE, TokenType.BUFFER_TYPE]):
+            raise ParseError("Expected type after '@'", self._peek())
+        
+        type_token = self._advance()
+        var_type = type_token.value
         
         name_token = self._consume(TokenType.IDENTIFIER, "Expected variable name")
         name = name_token.value
+        
+        # Check for array/buffer size notation: name[size]
+        size = None
+        if self._check(TokenType.LEFT_BRACKET):
+            self._advance()  # consume '['
+            size_token = self._consume(TokenType.NUMBER, "Expected array size")
+            size = int(size_token.value)
+            self._consume(TokenType.RIGHT_BRACKET, "Expected ']'")
+        
+        # Expect = sign
+        self._consume(TokenType.ASSIGN, "Expected '=' after variable name")
         
         # Rest of the line is the value
         value_parts = []
@@ -94,10 +115,40 @@ class CASMParser:
                 value_parts.append(token.value)
         
         value = ' '.join(value_parts).strip()
-        if not value:
-            value = "0"  # Default value
         
-        return VarDeclarationNode(name, value)
+        # Set default values based on type if no value provided
+        if not value:
+            if var_type == "int":
+                value = "0"
+            elif var_type == "str":
+                value = '""'
+            elif var_type == "bool":
+                value = "false"
+            elif var_type == "float":
+                value = "0.0"
+            elif var_type == "buffer":
+                value = ""  # No value needed for buffers
+        
+        return VarDeclarationNode(name, value, var_type, size)
+    
+    def _parse_assignment(self) -> AssignmentNode:
+        """Parse variable assignment: variable = expression"""
+        name_token = self._advance()  # consume identifier
+        name = name_token.value
+        
+        # Expect = sign
+        self._consume(TokenType.ASSIGN, "Expected '=' after variable name")
+        
+        # Rest of the line is the expression
+        value_parts = []
+        while not self._check(TokenType.NEWLINE) and not self._is_at_end():
+            token = self._advance()
+            if token.type != TokenType.EOF:
+                value_parts.append(token.value)
+        
+        value = ' '.join(value_parts).strip()
+        
+        return AssignmentNode(name, value)
     
     def _parse_if_statement(self) -> IfNode:
         """Parse if statement: %if condition ... %else ... %endif"""
@@ -185,9 +236,9 @@ class CASMParser:
         
         return ForNode(variable, count, body)
     
-    def _parse_println_statement(self) -> PrintlnNode:
-        """Parse println statement: %println message"""
-        self._consume(TokenType.PRINTLN, "Expected '%println'")
+    def _parse_print_statement(self) -> PrintlnNode:
+        """Parse print statement: print message"""
+        self._consume(TokenType.PRINT, "Expected 'print'")
         
         # Parse message (can be string or expression)
         if self._check(TokenType.STRING):
@@ -204,15 +255,23 @@ class CASMParser:
         
         return PrintlnNode(message)
     
-    def _parse_scanf_statement(self) -> ScanfNode:
-        """Parse scanf statement: %scanf format variable"""
-        self._consume(TokenType.SCANF, "Expected '%scanf'")
+    def _parse_scan_statement(self) -> ScanfNode:
+        """Parse scan statement: scan variable"""
+        self._consume(TokenType.SCAN, "Expected 'scan'")
         
-        format_token = self._consume(TokenType.STRING, "Expected format string")
-        format_string = format_token.value
+        # Parse variable name (could be identifier or type name)
+        if self._check(TokenType.IDENTIFIER):
+            var_token = self._advance()
+        elif self._check_types([TokenType.BUFFER_TYPE, TokenType.INT_TYPE, TokenType.STR_TYPE, 
+                               TokenType.BOOL_TYPE, TokenType.FLOAT_TYPE]):
+            var_token = self._advance()
+        else:
+            raise ParseError("Expected variable name", self._peek())
         
-        var_token = self._consume(TokenType.IDENTIFIER, "Expected variable name")
         variable = var_token.value
+        
+        # For scan, we'll use %s as default format string
+        format_string = '"%s"'
         
         return ScanfNode(format_string, variable)
     
@@ -238,36 +297,48 @@ class CASMParser:
         return AssemblyNode(assembly_code)
     
     def _parse_c_code_block(self) -> CCodeBlockNode:
-        """Parse C code block starting with %!"""
-        self._consume(TokenType.C_CODE_BLOCK, "Expected '%!'")
+        """Parse C code block: _c_ ... _endc_"""
+        self._consume(TokenType.C_CODE_BLOCK, "Expected '_c_'")
         
-        # For line-by-line C code, get the rest of the line
-        c_code = ""
-        if not self._is_at_end() and self._peek().type == TokenType.ASSEMBLY_LINE:
-            c_code = self._advance().value
+        # Collect all code between _c_ and _endc_
+        c_code_parts = []
         
+        while not self._is_at_end():
+            if self._check(TokenType.C_CODE_END):
+                self._advance()  # consume _endc_
+                break
+            
+            # Collect tokens as C code
+            token = self._advance()
+            if token.type == TokenType.NEWLINE:
+                c_code_parts.append('\n')
+            elif token.type != TokenType.EOF:
+                c_code_parts.append(token.value)
+        
+        c_code = ' '.join(c_code_parts).strip()
         return CCodeBlockNode(c_code)
     
-    def _parse_extern_directive(self) -> 'ExternDirectiveNode':
-        """Parse extern directive: %extern <filename>"""
-        self._consume(TokenType.EXTERN, "Expected '%extern'")
+    def _parse_asm_block(self) -> AsmBlockNode:
+        """Parse assembly block: _asm_ ... _endasm_"""
+        self._consume(TokenType.ASM_BLOCK, "Expected '_asm_'")
         
-        # Collect all remaining tokens on this line to form the header name
-        header_parts = []
-        while not self._check(TokenType.NEWLINE) and not self._is_at_end():
+        # Collect all code between _asm_ and _endasm_
+        asm_code_parts = []
+        
+        while not self._is_at_end():
+            if self._check(TokenType.ASM_END):
+                self._advance()  # consume _endasm_
+                break
+            
+            # Collect tokens as assembly code
             token = self._advance()
-            if token.type != TokenType.EOF:
-                header_parts.append(token.value)
+            if token.type == TokenType.NEWLINE:
+                asm_code_parts.append('\n')
+            elif token.type != TokenType.EOF:
+                asm_code_parts.append(token.value)
         
-        header_name = ''.join(header_parts).strip()
-        
-        # Clean up the header name (remove quotes if present)
-        if header_name.startswith('"') and header_name.endswith('"'):
-            header_name = header_name[1:-1]
-        elif header_name.startswith('<') and header_name.endswith('>'):
-            header_name = header_name[1:-1]
-        
-        return ExternDirectiveNode(header_name)
+        asm_code = ' '.join(asm_code_parts).strip()
+        return AsmBlockNode(asm_code)
     
     # Utility methods
     def _advance(self) -> Token:
@@ -281,6 +352,12 @@ class CASMParser:
         if self._is_at_end():
             return False
         return self._peek().type == token_type
+    
+    def _check_types(self, token_types: List[TokenType]) -> bool:
+        """Check if current token is one of the given types"""
+        if self._is_at_end():
+            return False
+        return self._peek().type in token_types
     
     def _consume(self, token_type: TokenType, message: str) -> Token:
         """Consume token of expected type or raise error"""

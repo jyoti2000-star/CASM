@@ -9,16 +9,19 @@ from typing import List, Dict, Set
 import re
 from .ast_nodes import *
 from ..utils.formatter import formatter
-from ..utils.colors import print_info, print_success, print_warning, print_error
+from ..utils.colors import print_info, print_success, print_error, print_warning
 
 class AssemblyCodeGenerator(ASTVisitor):
     """Generate x86-64 Windows assembly from CASM AST"""
     
     def __init__(self):
+        """Initialize code generator with empty sections"""
         self.data_section = []
+        self.bss_section = []
         self.text_section = []
         self.string_labels = {}
         self.variable_labels = {}
+        self.variable_info = {}  # Store complete variable information for C integration
         self.label_counter = 0
         self.used_functions = set()
     
@@ -26,16 +29,18 @@ class AssemblyCodeGenerator(ASTVisitor):
         """Generate complete assembly program"""
         # Reset state
         self.data_section = []
+        self.bss_section = []
         self.text_section = []
         self.string_labels = {}
         self.variable_labels = {}
+        self.variable_info = {}
         self.label_counter = 0
         self.used_functions = set()
         
         # Pass variable information to C processor
         try:
             from ..utils.c_processor import c_processor
-            c_processor.set_casm_variables(self.variable_labels)
+            c_processor.set_casm_variables(self.variable_info)
         except ImportError:
             print_warning("C processor not available")
         
@@ -63,7 +68,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Always add common C library functions that might be used by compiled C code
         common_c_functions = {'printf', 'puts', 'putchar', 'scanf', 'strlen', 'strcpy', 
-                             'strcmp', 'malloc', 'free', 'pow', 'sqrt', 'sin', 'cos',
+                             'strcmp', 'strstr', 'malloc', 'free', 'pow', 'sqrt', 'sin', 'cos',
                              'srand', 'rand', 'exit', 'abort'}
         external_functions.update(common_c_functions)
         
@@ -85,6 +90,14 @@ class AssemblyCodeGenerator(ASTVisitor):
             lines.append("section .data")
             lines.extend(self.data_section)
             lines.append("")
+            print(f"[DEBUG] Added .data section with {len(self.data_section)} items")
+        
+        # BSS section (uninitialized data)
+        if hasattr(self, 'bss_section') and self.bss_section:
+            lines.append("section .bss")
+            lines.extend(self.bss_section)
+            lines.append("")
+            print(f"[DEBUG] Added .bss section with {len(self.bss_section)} items")
         
         # Text section
         lines.append("section .text")
@@ -137,20 +150,131 @@ class AssemblyCodeGenerator(ASTVisitor):
             stmt.accept(self)
     
     def visit_var_declaration(self, node: VarDeclarationNode):
-        """Visit variable declaration"""
+        """Visit variable declaration with type support"""
         label = f"var_{node.name}"
         self.variable_labels[node.name] = label
         
-        # Add to data section
-        try:
-            # Try to parse as integer
-            value = int(node.value)
-            self.data_section.append(f"    {label} dd {value}")
-        except ValueError:
-            # Treat as string/expression
-            self.data_section.append(f"    {label} dd 0  ; {node.value}")
+        # Store complete variable information for C integration
+        self.variable_info[node.name] = {
+            'type': node.var_type,
+            'size': node.size,
+            'label': label,
+            'value': node.value
+        }
         
-        self.text_section.append(f"    ; Variable: {node.name} = {node.value}")
+        var_type = node.var_type
+        var_size = node.size
+        value = node.value
+        
+        print(f"[DEBUG] Processing variable: {node.name}, type: {var_type}, size: {var_size}, value: '{value}'")
+        
+        if var_type == "buffer" and var_size:
+            # Buffers go in .bss section (uninitialized data)
+            self.bss_section.append(f"    {label} resb {var_size}  ; buffer[{var_size}]")
+            self.text_section.append(f"    ; Buffer: {node.name}[{var_size}] in .bss")
+            print(f"[DEBUG] Added buffer to bss_section: {label} resb {var_size}")
+            
+        elif var_type == "int":
+            try:
+                int_value = int(value)
+                self.data_section.append(f"    {label} dd {int_value}  ; int {node.name}")
+            except ValueError:
+                self.data_section.append(f"    {label} dd 0  ; int {node.name} = {value}")
+            self.text_section.append(f"    ; Variable: int {node.name} = {value}")
+            
+        elif var_type == "bool":
+            bool_value = 1 if value.lower() in ['true', '1', 'yes'] else 0
+            self.data_section.append(f"    {label} db {bool_value}  ; bool {node.name}")
+            self.text_section.append(f"    ; Variable: bool {node.name} = {value}")
+            
+        elif var_type == "float":
+            try:
+                # Convert float to IEEE 754 format or use default
+                float_value = float(value)
+                # For simplicity, store as a string and let assembler handle it
+                self.data_section.append(f"    {label} dq {float_value}  ; float {node.name}")
+            except ValueError:
+                self.data_section.append(f"    {label} dq 0.0  ; float {node.name} = {value}")
+            self.text_section.append(f"    ; Variable: float {node.name} = {value}")
+            
+        elif var_type == "str":
+            # Remove quotes if present
+            str_value = value.strip()
+            if str_value.startswith('"') and str_value.endswith('"'):
+                str_value = str_value[1:-1]
+            
+            # Add null terminator and escape sequences
+            str_value = str_value.replace('\\n', '", 10, "').replace('\\t', '", 9, "')
+            self.data_section.append(f'    {label} db "{str_value}", 0  ; str {node.name}')
+            self.text_section.append(f"    ; Variable: str {node.name} = {value}")
+            
+        elif var_type == "int" and var_size:
+            # Integer array
+            if value and value.strip():
+                # Parse comma-separated values
+                values = [v.strip() for v in value.split(',')]
+                values_str = ', '.join(values)
+                self.data_section.append(f"    {label} dd {values_str}  ; int {node.name}[{var_size}]")
+            else:
+                # Initialize with zeros
+                self.data_section.append(f"    {label} times {var_size} dd 0  ; int {node.name}[{var_size}]")
+            self.text_section.append(f"    ; Array: int {node.name}[{var_size}]")
+            
+        else:
+            # Fallback to old behavior
+            try:
+                int_value = int(value)
+                self.data_section.append(f"    {label} dd {int_value}")
+            except ValueError:
+                self.data_section.append(f"    {label} dd 0  ; {value}")
+            self.text_section.append(f"    ; Variable: {node.name} = {value}")
+    
+    def visit_assignment(self, node: AssignmentNode):
+        """Visit variable assignment"""
+        # Find the variable label
+        var_label = self.variable_labels.get(node.name, f"var_{node.name}")
+        
+        # Parse the expression (for now, handle simple cases)
+        expression = node.value.strip()
+        
+        # Handle simple arithmetic like "i + 1" or "i - 1"
+        if '+' in expression:
+            parts = expression.split('+')
+            if len(parts) == 2:
+                left = parts[0].strip()
+                right = parts[1].strip()
+                
+                # Load left operand
+                if left == node.name:
+                    self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+                elif left.isdigit():
+                    self.text_section.append(f"    mov eax, {left}")
+                else:
+                    # Assume it's another variable
+                    self.text_section.append(f"    mov eax, dword [rel var_{left}]")
+                
+                # Add right operand
+                if right.isdigit():
+                    self.text_section.append(f"    add eax, {right}")
+                else:
+                    # Assume it's another variable
+                    self.text_section.append(f"    add eax, dword [rel var_{right}]")
+                
+                # Store result
+                self.text_section.append(f"    mov dword [rel {var_label}], eax")
+                return
+        
+        # Handle simple assignment like "i = 5"
+        if expression.isdigit():
+            self.text_section.append(f"    mov dword [rel {var_label}], {expression}")
+        else:
+            # Variable assignment like "i = j"
+            if expression in self.variable_labels:
+                source_label = self.variable_labels[expression]
+                self.text_section.append(f"    mov eax, dword [rel {source_label}]")
+            else:
+                self.text_section.append(f"    mov eax, dword [rel var_{expression}]")
+            self.text_section.append(f"    mov dword [rel {var_label}], eax")
     
     def visit_if(self, node: IfNode):
         """Visit if statement"""
@@ -159,13 +283,13 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         self.text_section.append(f"    ; if {node.condition}")
         
-        # Evaluate the condition properly
-        self._evaluate_condition(node.condition)
+        # Evaluate the condition and get the appropriate jump instruction
+        jump_instruction = self._evaluate_condition_with_jump(node.condition)
         
         if else_label:
-            self.text_section.append(f"    je {else_label}")
+            self.text_section.append(f"    {jump_instruction} {else_label}")
         else:
-            self.text_section.append(f"    je {end_label}")
+            self.text_section.append(f"    {jump_instruction} {end_label}")
         
         # If body
         for stmt in node.if_body:
@@ -186,12 +310,12 @@ class AssemblyCodeGenerator(ASTVisitor):
         start_label = self._generate_label("while_start")
         end_label = self._generate_label("while_end")
         
-        self.text_section.append(f"    ; while {node.condition}")
         self.text_section.append(f"{start_label}:")
+        self.text_section.append(f"    ; while {node.condition}")
         
-        # Evaluate the condition properly
-        self._evaluate_condition(node.condition)
-        self.text_section.append(f"    je {end_label}")
+        # Evaluate the condition and get the appropriate jump instruction
+        jump_instruction = self._evaluate_condition_with_jump(node.condition)
+        self.text_section.append(f"    {jump_instruction} {end_label}")
         
         # Loop body
         for stmt in node.body:
@@ -301,7 +425,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Update C processor with current CASM variables before processing
         try:
             from ..utils.c_processor import c_processor
-            c_processor.set_casm_variables(self.variable_labels)
+            c_processor.set_casm_variables(self.variable_info)
             
             # Add C code block to collection and get marker
             block_marker = c_processor.add_c_code_block(node.c_code)
@@ -323,6 +447,27 @@ class AssemblyCodeGenerator(ASTVisitor):
             self._fallback_c_processing(node.c_code)
         
         print_success(f"C code collected: {node.c_code}")
+    
+    def visit_asm_block(self, node: AsmBlockNode):
+        """Visit assembly block"""
+        print_info(f"Processing assembly block: '{node.asm_code}'")
+        
+        if not node.asm_code.strip():
+            # Empty assembly block
+            self.text_section.append("    ; Empty assembly block")
+            return
+        
+        # Split assembly code into lines and add each line
+        asm_lines = node.asm_code.strip().split('\n')
+        self.text_section.append("    ; === Raw Assembly Block ===")
+        for line in asm_lines:
+            line = line.strip()
+            if line:
+                # Add proper indentation if not already present
+                if not line.startswith('    ') and not line.endswith(':'):
+                    line = f"    {line}"
+                self.text_section.append(line)
+        self.text_section.append("    ; === End Assembly Block ===")
     
     def finalize_c_code(self):
         """Compile all C code and replace placeholders with actual assembly"""
@@ -458,6 +603,70 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.label_counter += 1
         return f"{prefix}_{self.label_counter}"
     
+    def _evaluate_condition_with_jump(self, condition: str):
+        """Evaluate a condition and return the appropriate jump instruction to skip the block"""
+        condition = condition.strip()
+        
+        # Handle comparisons like "variable > value", "variable == value", etc.
+        comparison_ops = ['>=', '<=', '==', '!=', '>', '<']
+        
+        for op in comparison_ops:
+            if op in condition:
+                left, right = condition.split(op, 1)
+                left = left.strip()
+                right = right.strip()
+                
+                # Load left operand into eax
+                if left.isdigit():
+                    self.text_section.append(f"    mov eax, {left}")
+                elif left in self.variable_labels:
+                    var_label = self.variable_labels[left]
+                    self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+                else:
+                    # Try to treat as variable name
+                    self.text_section.append(f"    mov eax, dword [rel var_{left}]")
+                
+                # Compare with right operand
+                if right.isdigit():
+                    self.text_section.append(f"    cmp eax, {right}")
+                elif right in self.variable_labels:
+                    var_label = self.variable_labels[right]
+                    self.text_section.append(f"    cmp eax, dword [rel {var_label}]")
+                else:
+                    # Try to treat as variable name
+                    self.text_section.append(f"    cmp eax, dword [rel var_{right}]")
+                
+                # Return the opposite jump to skip the if block when condition is false
+                if op == '<':
+                    return 'jge'    # Jump if greater or equal (opposite of <)
+                elif op == '<=':
+                    return 'jg'     # Jump if greater (opposite of <=)
+                elif op == '>':
+                    return 'jle'    # Jump if less or equal (opposite of >)
+                elif op == '>=':
+                    return 'jl'     # Jump if less (opposite of >=)
+                elif op == '==':
+                    return 'jne'    # Jump if not equal (opposite of ==)
+                elif op == '!=':
+                    return 'je'     # Jump if equal (opposite of !=)
+        
+        # Handle simple variable checks (non-zero)
+        if condition in self.variable_labels:
+            var_label = self.variable_labels[condition]
+            self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+            self.text_section.append(f"    cmp eax, 0")
+        elif condition.isdigit():
+            # Direct number comparison
+            self.text_section.append(f"    mov eax, {condition}")
+            self.text_section.append(f"    cmp eax, 0")
+        else:
+            # Try to treat as variable name
+            self.text_section.append(f"    mov eax, dword [rel var_{condition}]")
+            self.text_section.append(f"    cmp eax, 0")
+        
+        # For simple variable/number checks, jump if zero (false)
+        return 'je'
+
     def _evaluate_condition(self, condition: str):
         """Evaluate a condition and set flags for conditional jumps"""
         # Parse common condition patterns

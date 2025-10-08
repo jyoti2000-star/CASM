@@ -19,18 +19,26 @@ class CASMLexer:
         
         # Essential keywords only
         self.keywords = {
-            '%if': TokenType.IF,
-            '%else': TokenType.ELSE,
-            '%endif': TokenType.ENDIF,
-            '%while': TokenType.WHILE,
-            '%endwhile': TokenType.ENDWHILE,
-            '%for': TokenType.FOR,
-            '%endfor': TokenType.ENDFOR,
-            '%var': TokenType.VAR,
-            '%println': TokenType.PRINTLN,
-            '%scanf': TokenType.SCANF,
-            '%!': TokenType.C_CODE_BLOCK,  # C code block marker
-            '%extern': TokenType.EXTERN,   # extern directive for headers
+            'if': TokenType.IF,
+            'else': TokenType.ELSE,
+            'endif': TokenType.ENDIF,
+            'while': TokenType.WHILE,
+            'endwhile': TokenType.ENDWHILE,
+            'for': TokenType.FOR,
+            'endfor': TokenType.ENDFOR,
+            'print': TokenType.PRINT,
+            'scan': TokenType.SCAN,
+            '_c_': TokenType.C_CODE_BLOCK,  # C code block start marker
+            '_endc_': TokenType.C_CODE_END, # C code block end marker
+            '_asm_': TokenType.ASM_BLOCK,   # Assembly block start marker
+            '_endasm_': TokenType.ASM_END,  # Assembly block end marker
+            
+            # Data types with @ prefix (handled separately)
+            'int': TokenType.INT_TYPE,
+            'str': TokenType.STR_TYPE,
+            'bool': TokenType.BOOL_TYPE,
+            'float': TokenType.FLOAT_TYPE,
+            'buffer': TokenType.BUFFER_TYPE,
             'in': TokenType.IN,
             'range': TokenType.RANGE,
         }
@@ -49,6 +57,7 @@ class CASMLexer:
             ('*', TokenType.MULTIPLY),
             ('/', TokenType.DIVIDE),
             ('%', TokenType.MODULO),
+            ('@', TokenType.AT_SYMBOL),
         ]
         
         # Punctuation
@@ -121,32 +130,15 @@ class CASMLexer:
                 i = new_i
                 continue
             
-            # Keywords and identifiers (including % keywords)
-            if line[i].isalpha() or line[i] in ['%', '_']:
+            # Keywords and identifiers
+            if line[i].isalpha() or line[i] == '_':
                 identifier, new_i = self._extract_identifier(line, i)
                 
                 # Check if it's a keyword
                 token_type = self.keywords.get(identifier.lower(), TokenType.IDENTIFIER)
                 
-                # Special handling for %! - capture rest of line as C code
-                if identifier == '%!':
-                    c_code = line[new_i:].strip()
-                    tokens.append(Token(TokenType.C_CODE_BLOCK, '%!',
-                                      self.current_line, self.current_column, line))
-                    if c_code:
-                        tokens.append(Token(TokenType.ASSEMBLY_LINE, c_code,
-                                          self.current_line, new_i, line))
-                    break  # Rest of line processed
-                
-                # Special case: if it's not a keyword but starts with %, it might be assembly
-                elif token_type == TokenType.IDENTIFIER and identifier.startswith('%'):
-                    # Unknown % directive, treat as raw assembly
-                    tokens.append(Token(TokenType.ASSEMBLY_LINE, line[i:].strip(),
-                                      self.current_line, self.current_column, line))
-                    break  # Rest of line is assembly
-                else:
-                    tokens.append(Token(token_type, identifier,
-                                      self.current_line, self.current_column, line))
+                tokens.append(Token(token_type, identifier,
+                              self.current_line, self.current_column, line))
                 
                 i = new_i
                 continue

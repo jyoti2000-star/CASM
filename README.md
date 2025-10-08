@@ -1,18 +1,23 @@
-CASM (C Assembly) provides essential programming constructs while generating efficient x86-64 Windows assembly:
+# CASM - Clean Assembly Language
 
-- **Control Flow**: `%if/%else/%endif`, `%while/%endwhile`, `%for/%endfor`
-- **Variables**: `%var name value`
-- **I/O**: `%println message`, `%scanf format variable`
+CASM is a modern, clean assembly-style language that compiles to efficient x86-64 Windows assembly. It provides intuitive syntax for essential programming constructs while maintaining the power and control of assembly language.
+
+## Features
+
+- **Clean Syntax**: Modern, readable syntax with `@type` variable declarations
+- **Control Flow**: `if/endif`, `while/endwhile`, `for/endfor` constructs
+- **Variables**: Typed variable declarations with automatic memory management
+- **I/O Operations**: Simple `print` and `scan` statements
+- **C Integration**: Seamless C code blocks with `_c_` and `_endc_` delimiters
+- **Raw Assembly**: Direct assembly code support alongside high-level constructs
 - **Comments**: `;` for single-line comments
-- **Inline Assembly**: Direct assembly code support
-- **C Integration**: `%extern` headers and `%!` embedded C code blocks
-- **Hybrid Programming**: Seamless C and Assembly interoperability
+- **Hybrid Programming**: Mix high-level constructs with low-level assembly
 
 ## Quick Start
 
 ### Installation
 
-Requires:
+Requirements:
 - Python 3.7+
 - NASM assembler
 - MinGW-w64 (for Windows cross-compilation)
@@ -36,295 +41,344 @@ python3 casm.py compile hello.casm
 python3 casm.py asm test.casm
 ```
 
-## Language Reference
+## Language Syntax Reference
 
 ### Variable Declaration
-```assembly
-%var counter 0
-%var message "Hello World"
-%var buffer 1024
+
+Variables are declared with `@type name = value` syntax:
+
+```casm
+@int counter = 0
+@int age = 25
+@string message = "Hello World"
+@float price = 99.99
+```
+
+### Variable Assignment
+
+After declaration, variables can be assigned new values:
+
+```casm
+@int x = 10
+x = 15
+x = x + 5
+```
+
+### Input/Output Operations
+
+#### Print Statement
+```casm
+print "Hello, World!"
+print "The answer is:"
+print 42
+```
+
+#### Scan Statement
+```casm
+@int number = 0
+print "Enter a number:"
+scan number
+print "You entered:"
+print number
 ```
 
 ### Control Flow
-```assembly
-%if counter < 10
-    %println "Counter is less than 10"
-%else
-    %println "Counter is 10 or greater"
-%endif
 
-%while counter < 5
-    %println counter
-    %var counter counter+1
-%endwhile
+#### If Statements
+```casm
+@int age = 18
 
-%for i in range(10)
-    %println i
-%endfor
+if age >= 18
+    print "You are an adult"
+endif
+
+if age < 13
+    print "You are a child"
+else
+    print "You are a teenager or adult"
+endif
 ```
 
-### Input/Output
-```assembly
-%println "Enter a number:"
-%scanf "%d" number
-%println "You entered:"
-%println number
+#### While Loops
+```casm
+@int counter = 0
+
+while counter < 5
+    print "Counter:"
+    print counter
+    counter = counter + 1
+endwhile
 ```
 
-### Comments and Raw Assembly
-```assembly
-; This is a comment
-%println "Hello"    ; End-of-line comment
+#### For Loops
+```casm
+for i in range(10)
+    print "Iteration:"
+    print i
+endfor
+```
 
-; Raw assembly is fully supported alongside CASM constructs
+### Comments
+```casm
+; This is a single-line comment
+@int x = 5  ; Comments can be at the end of lines
+
+; Comments are ignored by the compiler
+; They help document your code
+```
+
+### C Code Integration
+
+CASM supports seamless integration with C code using `_c_` and `_endc_` delimiters:
+
+```casm
+@int number = 42
+
+_c_
+printf("Hello from C! Number: %d\n", number);
+
+int factorial(int n) {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+}
+
+int result = factorial(5);
+printf("Factorial of 5 = %d\n", result);
+_endc_
+
+print "Back in CASM"
+```
+
+### Raw Assembly Integration
+
+You can mix raw assembly code directly with CASM constructs:
+
+```casm
+@int my_var = 100
+
+; Raw assembly alongside CASM
 mov rax, 42
 push rax
-pop rbx
 
-; Mix CASM variables with raw assembly
-%var my_number 100
-mov rax, [my_number]    ; Load CASM variable into register
-add rax, 50             ; Add 50 using raw assembly
-mov [my_number], rax    ; Store back to CASM variable
+; Access CASM variables from assembly
+mov eax, dword [rel var_my_var]
+add eax, 50
+mov dword [rel var_my_var], eax
 
-; Raw assembly loops and control flow
-%var counter 0
-loop_start:
-    mov rax, [counter]
-    inc rax
-    mov [counter], rax
-    cmp rax, 10
-    jl loop_start
-
-; System calls and low-level operations
-mov rax, 1              ; sys_write
-mov rdi, 1              ; stdout
-mov rsi, message        ; message buffer
-mov rdx, 13             ; message length
-syscall
-
-; Stack operations
-push rbp
-mov rbp, rsp
-sub rsp, 32             ; Allocate stack space
-
-; Register manipulation
-xor rax, rax            ; Clear register
-mov rbx, 0x12345678     ; Load immediate value
-shl rbx, 4              ; Shift left
-or rax, rbx             ; Bitwise OR
-
-; Function calls and returns
-call my_function
-mov rsp, rbp
-pop rbp
-ret
-
-my_function:
-    ; Raw assembly function
-    mov rax, 42
-    ret
+if my_var > 120
+    print "Variable was modified by assembly!"
+endif
 ```
 
-### C Code Integration (CASM C Assembly)
-
-CASM supports seamless integration with C code through extern declarations and embedded C blocks:
-
-#### External Headers
-```assembly
-%extern stdio.h
-%extern math.h
-%extern string.h
-```
-
-#### Embedded C Code Blocks
-```assembly
-%extern stdio.h
-
-%var number 42
-
-; Embed C code with %!
-%! printf("Hello from C! Number: %d\n", 42);
-
-%if number > 40
-    %println "CASM: Number is greater than 40"
-    %! printf("C: Indeed, %d > 40\n", 42);
-%endif
-
-; Multi-line C code blocks
-%! int factorial(int n) {
-%!     if (n <= 1) return 1;
-%!     return n * factorial(n - 1);
-%! }
-%! 
-%! int result = factorial(5);
-%! printf("Factorial of 5 = %d\n", result);
-```
-
-#### Variable Sharing
-CASM variables are automatically available in C code as extern declarations:
-
-```assembly
-%extern stdio.h
-
-%var counter 10
-%var message "Hello World"
-
-%! printf("Counter from CASM: %d\n", counter);
-%! printf("Message from CASM: %s\n", message);
-
-; C code can also define functions callable from assembly
-%! int add_numbers(int a, int b) {
-%!     return a + b;
-%! }
-```
-
-## Example Programs
+## Complete Example Programs
 
 ### Hello World
-```assembly
+```casm
 ; hello.casm
-%println "Hello, World!"
+print "Hello, World!"
 ```
 
-### Simple Calculator
-```assembly
-; calc.casm
-%var num1 0
-%var num2 0
-%var result 0
+### Interactive Calculator
+```casm
+; calculator.casm
+@int num1 = 0
+@int num2 = 0
+@int result = 0
 
-%println "Enter first number:"
-%scanf "%d" num1
+print "=== Simple Calculator ==="
+print "Enter first number:"
+scan num1
 
-%println "Enter second number:"
-%scanf "%d" num2
+print "Enter second number:"
+scan num2
 
-; Add the numbers (simplified)
-%var result num1+num2
-%println "Result:"
-%println result
+result = num1 + num2
+
+print "Sum:"
+print result
+
+result = num1 * num2
+print "Product:"
+print result
 ```
 
-### Counting Loop
-```assembly
-; count.casm
-%var i 0
+### Counting and Loops
+```casm
+; loops.casm
+@int i = 0
 
-%while i < 10
-    %println i
-    %var i i+1
-%endwhile
+print "=== While Loop Example ==="
+while i < 5
+    print "Count:"
+    print i
+    i = i + 1
+endwhile
 
-%println "Done counting!"
+print "=== For Loop Example ==="
+for j in range(3)
+    print "For loop iteration:"
+    print j
+endfor
+
+print "Done!"
+```
+
+### Conditional Logic
+```casm
+; conditions.casm
+@int score = 85
+
+print "=== Grade Calculator ==="
+print "Score:"
+print score
+
+if score >= 90
+    print "Grade: A"
+else
+    if score >= 80
+        print "Grade: B"
+    else
+        if score >= 70
+            print "Grade: C"
+        else
+            print "Grade: F"
+        endif
+    endif
+endif
 ```
 
 ### C Integration Example
-```assembly
-; hybrid.casm - Demonstrates C and Assembly integration
-%extern stdio.h
-%extern math.h
+```casm
+; hybrid.casm
+@int radius = 5
 
-%var radius 5.0
-%var area 0.0
+print "=== Circle Calculator ==="
 
-%println "=== Circle Area Calculator ==="
-%println "Using C math functions with CASM variables"
+_c_
+#include <stdio.h>
+#include <math.h>
 
-%! // Calculate area using C math functions
-%! double pi = 3.14159;
-%! double calculated_area = pi * radius * radius;
-%! printf("Radius: %.2f\n", radius);
-%! printf("Area calculated in C: %.2f\n", calculated_area);
+double pi = 3.14159;
+double area = pi * radius * radius;
+double circumference = 2 * pi * radius;
 
-%var area calculated_area
-%println "Area stored in CASM variable:"
-%println area
+printf("Using C math functions:\n");
+printf("Radius: %d\n", radius);
+printf("Area: %.2f\n", area);
+printf("Circumference: %.2f\n", circumference);
 
-%if area > 70
-    %println "That's a large circle!"
-    %! printf("Indeed, %.2f is quite large!\n", calculated_area);
-%endif
+// Define a C function
+int is_large_circle(double r) {
+    return r > 10;
+}
+
+if (is_large_circle(radius)) {
+    printf("This is a large circle!\n");
+} else {
+    printf("This is a small circle.\n");
+}
+_endc_
+
+print "Back to CASM:"
+if radius > 3
+    print "CASM also thinks this circle is decent sized"
+endif
 ```
 
 ### Assembly Integration Example
-```assembly
-; mixed.casm - Demonstrates raw assembly mixed with CASM constructs
-%var array_size 5
-%var sum 0
-%var numbers_array 1024  ; Allocate space for array
+```casm
+; assembly_mix.casm
+@int array_size = 5
+@int sum = 0
 
-%println "=== Assembly + CASM Array Sum ==="
+print "=== Mixed Assembly/CASM Example ==="
 
-; Initialize array with raw assembly
-mov rdi, [numbers_array]    ; Get array address
-mov rcx, 0                  ; Counter
-
-init_loop:
-    mov [rdi + rcx*4], ecx  ; Store counter value in array
-    inc rcx
-    cmp rcx, [array_size]
-    jl init_loop
-
-%println "Array initialized with assembly"
-
-; Calculate sum using mixed approach
-mov rsi, 0                  ; Sum register
-mov rcx, 0                  ; Counter
-mov rdi, [numbers_array]    ; Array address
+; Use raw assembly for performance-critical operations
+mov ecx, 0              ; Initialize counter
+mov eax, 0              ; Initialize sum
 
 sum_loop:
-    mov eax, [rdi + rcx*4]  ; Load array element
-    add rsi, rax            ; Add to sum
-    inc rcx
+    add eax, ecx        ; Add counter to sum
+    inc ecx             ; Increment counter
+    cmp ecx, dword [rel var_array_size]
+    jl sum_loop         ; Continue if counter < array_size
+
+; Store assembly result in CASM variable
+mov dword [rel var_sum], eax
+
+print "Sum calculated using assembly:"
+print sum
+
+; Continue with CASM logic
+if sum > 10
+    print "The sum is greater than 10"
     
-    ; Use CASM for loop control
-    %if rcx < array_size
-        jmp sum_loop
-    %endif
+    ; More assembly for complex operations
+    mov eax, dword [rel var_sum]
+    imul eax, 2         ; Multiply by 2
+    mov dword [rel var_sum], eax
+    
+    print "Doubled sum:"
+    print sum
+endif
+```
 
-; Store result in CASM variable using assembly
-mov [sum], rsi
+## Advanced Features
 
-%println "Sum calculated using assembly:"
-%println sum
+### Variable Types
 
-; Direct register manipulation for final calculation
-mov rax, [sum]
-imul rax, 2                 ; Multiply by 2
-mov rbx, 10
-xor rdx, rdx
-div rbx                     ; Divide by 10
+CASM supports several data types:
 
-%println "Processed result (sum * 2 / 10):"
-; Raw assembly to print the result
-push rax
-%println rax
-pop rax
+```casm
+@int whole_number = 42
+@float decimal_number = 3.14
+@string text = "Hello"
+@char single_char = 'A'
+```
+
+### Complex Expressions
+
+```casm
+@int a = 10
+@int b = 20
+@int c = 0
+
+c = a + b * 2
+c = (a + b) / 2
+c = a * a + b * b
+```
+
+### Nested Control Structures
+
+```casm
+@int i = 0
+@int j = 0
+
+while i < 3
+    j = 0
+    while j < 2
+        print "Nested loop:"
+        print i
+        print j
+        j = j + 1
+    endwhile
+    i = i + 1
+endwhile
 ```
 
 ## Architecture
 
-CASM uses a clean 4-stage compilation pipeline with C integration support:
+CASM uses a clean compilation pipeline:
 
-1. **Lexical Analysis** (`src/core/lexer.py`) - Tokenizes CASM source code
-2. **C Code Processing** (`src/utils/c_processor.py`) - Handles `%extern` and `%!` blocks
-3. **Parsing** (`src/core/parser.py`) - Builds Abstract Syntax Tree (AST)
-4. **Code Generation** (`src/core/codegen.py`) - Converts AST to x86-64 assembly
-5. **Assembly & Linking** (`src/compiler.py`) - NASM + MinGW-w64 toolchain
-
-### C Integration Pipeline
-
-When C code is detected (`%extern` or `%!` blocks):
-1. **C Preprocessing**: Extract and process embedded C code
-2. **Header Management**: Handle extern declarations automatically
-3. **Variable Binding**: Make CASM variables available to C code
-4. **Code Generation**: Generate both C and assembly object files
-5. **Linking**: Combine all objects into final executable
+1. **Lexical Analysis** - Tokenizes source code with clean syntax
+2. **Parsing** - Builds Abstract Syntax Tree (AST) from tokens
+3. **Code Generation** - Converts AST to x86-64 assembly
+4. **C Integration** - Processes embedded C code blocks
+5. **Assembly & Linking** - Uses NASM + MinGW-w64 toolchain
 
 ### Directory Structure
 ```
-casm_clean/
+CASM/
 ├── casm.py              # Main entry point
 ├── src/
 │   ├── core/
@@ -334,56 +388,46 @@ casm_clean/
 │   │   ├── ast_nodes.py # AST node definitions
 │   │   └── codegen.py   # Code generator
 │   ├── utils/
-│   │   ├── c_processor.py # C code integration handler
-│   │   ├── build.py     # Build utilities
+│   │   ├── c_processor.py # C code integration
 │   │   ├── formatter.py # Assembly formatting
 │   │   └── colors.py    # Terminal colors
-│   ├── stdlib/
-│   │   └── minimal.py   # Minimal standard library
 │   └── compiler.py      # Main compiler class
-├── tests/               # Test files
-├── examples/            # Example programs (including C integration)
-└── output/             # Generated files
+├── examples/            # Example programs
+├── test/               # Test files
+└── output/             # Generated assembly files
 ```
 
-## CASM C Assembly Integration
+## Syntax Comparison
 
-CASM supports powerful hybrid programming through its **C Assembly** integration system. This allows you to:
+### Old vs New Syntax
 
-- Use standard C library functions alongside CASM constructs
-- Write complex algorithms in C while using CASM for system-level control
-- Share variables seamlessly between C and Assembly code
-- Leverage existing C libraries and functions
-
-### Key Integration Features
-
-1. **`%extern` Directives**: Include C headers for library functions
-2. **`%!` Code Blocks**: Embed C code directly in CASM programs
-3. **Automatic Variable Binding**: CASM variables accessible in C code
-4. **Mixed Compilation**: Single command compiles both C and Assembly
-5. **Standard Library Access**: Full access to C standard library functions
-
-### Usage Examples
-
-All existing CASM commands (`compile`, `asm`) automatically handle C integration:
-
-```bash
-# Compile hybrid C+Assembly program
-python3 casm.py compile my_hybrid_program.casm
-
-# Generate assembly (shows both C and Assembly output)
-python3 casm.py asm complex_algorithm.casm
+**Old Syntax:**
+```casm
+%var counter 0
+%if counter < 10
+    %println "Less than 10"
+%endif
+%while counter < 5
+    %println counter
+    %var counter counter+1
+%endwhile
 ```
 
-The compiler automatically detects C code blocks and handles the complete build pipeline, including:
-- C code compilation
-- Assembly generation  
-- Object file linking
-- Executable creation
+**New Clean Syntax:**
+```casm
+@int counter = 0
+if counter < 10
+    print "Less than 10"
+endif
+while counter < 5
+    print counter
+    counter = counter + 1
+endwhile
+```
 
 ## Target Platform
 
-- **Architecture**: x86-64 only
+- **Architecture**: x86-64
 - **Operating System**: Windows (PE32+ executables)
 - **Calling Convention**: Windows x64
 - **Assembler**: NASM (Intel syntax)
@@ -394,11 +438,11 @@ Cross-compilation from macOS/Linux is supported via MinGW-w64 and Wine.
 ## Development
 
 The codebase emphasizes:
-- **Clean Architecture**: Separation of concerns, single responsibility
-- **Focused Feature Set**: Only essential language constructs plus powerful C integration
-- **Educational Value**: Clear, readable code for learning compiler design
-- **Practical Use**: Generates working executables with full C library support
-- **Hybrid Programming**: Best of both worlds - C's expressiveness and Assembly's control
+- **Clean Architecture**: Clear separation of concerns
+- **Modern Syntax**: Intuitive and readable language design
+- **Educational Value**: Clean code for learning compiler design
+- **Practical Use**: Generates working executables
+- **Hybrid Programming**: Seamless integration of high-level and low-level code
 
 ## License
 

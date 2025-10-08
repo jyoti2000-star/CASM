@@ -24,14 +24,28 @@ class TokenType(Enum):
     # Variable declarations
     VAR = "VAR"
     
+    # Data types
+    INT_TYPE = "INT_TYPE"
+    STR_TYPE = "STR_TYPE"
+    BOOL_TYPE = "BOOL_TYPE"
+    FLOAT_TYPE = "FLOAT_TYPE"
+    BUFFER_TYPE = "BUFFER_TYPE"
+    
     # Essential I/O
-    PRINTLN = "PRINTLN"
-    SCANF = "SCANF"
+    PRINT = "PRINT"           # print statement
+    SCAN = "SCAN"             # scan statement
     
     # C Code Integration
-    C_CODE_BLOCK = "C_CODE_BLOCK"  # %! marker for C code
+    C_CODE_BLOCK = "C_CODE_BLOCK"  # _c_ marker for C code start
+    C_CODE_END = "C_CODE_END"      # _endc_ marker for C code end
     C_INLINE = "C_INLINE"          # Inline C expressions
-    EXTERN = "EXTERN"              # extern directive for headers
+    
+    # Assembly Integration
+    ASM_BLOCK = "ASM_BLOCK"        # _asm_ marker for assembly block start
+    ASM_END = "ASM_END"            # _endasm_ marker for assembly block end
+    
+    # Variable declaration prefix
+    AT_SYMBOL = "AT_SYMBOL"        # @ symbol for variable declarations
     
     # Operators
     ASSIGN = "ASSIGN"          # =

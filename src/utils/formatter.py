@@ -21,12 +21,17 @@ class AssemblyFormatter:
     def format_assembly(self, assembly_code: str) -> str:
         """Format assembly code"""
         lines = assembly_code.split('\n')
+        
+        # First pass: clean excessive comments and group instructions
+        cleaned_lines = self._clean_excessive_comments(lines)
+        
         formatted_lines = []
         current_section = None
         
-        for line in lines:
+        for line in cleaned_lines:
             formatted_line = self._format_line(line, current_section)
-            formatted_lines.append(formatted_line)
+            if formatted_line is not None:  # Skip None lines (filtered out)
+                formatted_lines.append(formatted_line)
             
             # Track current section
             stripped = line.strip().lower()
@@ -38,6 +43,55 @@ class AssemblyFormatter:
         
         return '\n'.join(final_lines)
     
+    def _clean_excessive_comments(self, lines: List[str]) -> List[str]:
+        """Remove excessive comments but keep original C statement comments"""
+        cleaned = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Skip excessive block comments
+            if any(pattern in line for pattern in [
+                '; === C CODE BLOCK ===',
+                '; === END C CODE BLOCK ===',
+                '; Compiled with combined GCC compilation',
+                '; Generated assembly:',
+                '; Variable declaration:',
+                '; Complex expression:',
+                '/ /',  # Remove // style comments
+            ]):
+                i += 1
+                continue
+            
+            # Keep original C statement comments (they contain function calls, etc.)
+            if line.startswith('; Original C:'):
+                # Extract the actual C statement and create a clean comment
+                c_statement = line.replace('; Original C:', '').strip()
+                cleaned.append(f"    ; {c_statement}")
+                
+                # Skip the next few lines until we hit actual assembly instructions
+                i += 1
+                while i < len(lines):
+                    next_line = lines[i].strip()
+                    if (next_line and 
+                        not next_line.startswith(';') and 
+                        not next_line.startswith('/') and
+                        not any(skip in next_line for skip in ['===', 'Compiled', 'Generated'])):
+                        break
+                    i += 1
+                continue
+            
+            # Keep assembly instructions, labels, and directives
+            if (line and 
+                not line.startswith('/') and
+                not any(skip in line for skip in ['===', 'Compiled', 'Generated', 'Variable declaration', 'Complex expression'])):
+                cleaned.append(lines[i])
+            
+            i += 1
+        
+        return cleaned
+    
     def _format_line(self, line: str, current_section: str) -> str:
         """Format a single line"""
         stripped = line.strip()
@@ -46,13 +100,19 @@ class AssemblyFormatter:
         if not stripped:
             return ''
         
-        # Comments
+        # Skip certain unwanted patterns
+        if any(pattern in stripped for pattern in [
+            '/ /',       # Remove // style comments
+        ]):
+            return None  # Signal to skip this line
+        
+        # Comments - keep them simple
         if stripped.startswith(';'):
-            return self._format_comment(stripped)
+            return f"    {stripped}"
         
         # Labels
         if stripped.endswith(':') and not any(op in stripped for op in ['mov', 'add', 'sub', 'call']):
-            return self._format_label(stripped)
+            return stripped  # Labels start at column 0
         
         # Directives (section, extern, global, etc.)
         if any(stripped.startswith(word) for word in ['section', 'extern', 'global', 'db', 'dd', 'dq', 'dw']):

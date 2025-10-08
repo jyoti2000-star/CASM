@@ -26,13 +26,25 @@ class ProgramNode(ASTNode):
         return visitor.visit_program(self)
 
 @dataclass
+@dataclass
 class VarDeclarationNode(ASTNode):
-    """Variable declaration: %var name value"""
+    """Variable declaration: %var [type] name [size] value"""
+    name: str
+    value: str
+    var_type: str = "int"  # int, str, bool, float, buffer
+    size: Optional[int] = None  # For arrays/buffers
+    
+    def accept(self, visitor):
+        return visitor.visit_var_declaration(self)
+
+@dataclass
+class AssignmentNode(ASTNode):
+    """Variable assignment: variable = expression"""
     name: str
     value: str
     
     def accept(self, visitor):
-        return visitor.visit_var_declaration(self)
+        return visitor.visit_assignment(self)
 
 @dataclass
 class IfNode(ASTNode):
@@ -103,6 +115,14 @@ class CCodeBlockNode(ASTNode):
     
     def accept(self, visitor):
         return visitor.visit_c_code_block(self)
+
+@dataclass
+class AsmBlockNode(ASTNode):
+    """Embedded assembly code block"""
+    asm_code: str
+    
+    def accept(self, visitor):
+        return visitor.visit_asm_block(self)
 
 @dataclass
 class ExternDirectiveNode(ASTNode):

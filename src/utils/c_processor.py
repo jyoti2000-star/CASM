@@ -606,7 +606,7 @@ class CCodeProcessor:
         
         return functions
     
-    def _clean_gcc_assembly_simple(self, assembly: str) -> str:
+    def _clean_gcc_assembly_simple(self, assembly: str, block_id: str = "") -> str:
         """Simple cleaning of GCC assembly - remove directives but keep instructions"""
         lines = assembly.split('\n')
         cleaned_lines = []
@@ -629,10 +629,19 @@ class CCodeProcessor:
             if not stripped:
                 continue
             
-            # Keep actual assembly instructions
-            if stripped and not stripped.startswith('.') and not stripped.startswith('#'):
-                # Simple register name fixes for NASM
+            # Keep actual assembly instructions and labels (.L labels are needed for jumps)
+            if stripped and not stripped.startswith('#'):
+                # Keep .L labels (needed for jumps) but skip other directives starting with .
+                if stripped.startswith('.') and not stripped.startswith('.L'):
+                    continue
+                    
+                # Make .L labels unique by adding block ID prefix
                 cleaned_line = line.replace('\t', '    ')  # Convert tabs to spaces
+                if block_id and '.L' in cleaned_line:
+                    # Replace .L labels with unique ones: .L2 -> .B0_L2 (where B0 is block 0)
+                    import re
+                    cleaned_line = re.sub(r'\.L(\d+)', rf'.{block_id}_L\1', cleaned_line)
+                
                 cleaned_lines.append(cleaned_line)
         
         return '\n'.join(cleaned_lines)
@@ -723,12 +732,30 @@ class CCodeProcessor:
             if isinstance(var_info, dict):
                 var_type = var_info['type']
                 label = var_info['label']
+                size = var_info.get('size', None)
+                
+                # Convert CASM types to C types
+                if var_type == 'str':
+                    c_type = 'char*'
+                elif var_type == 'buffer':
+                    c_type = 'char*'  # Buffers are char arrays
+                elif var_type == 'bool':
+                    c_type = 'int'  # bool maps to int in C
+                elif var_type == 'float':
+                    c_type = 'double'  # Use double for float compatibility
+                elif var_type == 'int':
+                    if size is not None:
+                        c_type = 'int*'  # Arrays are pointers in C
+                    else:
+                        c_type = 'int'
+                else:
+                    c_type = 'int'  # Default fallback
             else:
-                var_type = 'int'  # Default type
+                c_type = 'int'  # Default type
                 label = var_info
             
             # Declare with both the CASM name and the label for compatibility
-            header_lines.append(f'extern {var_type} {label};')
+            header_lines.append(f'extern {c_type} {label};')
         
         if self.casm_variables:
             header_lines.append('')
@@ -846,8 +873,8 @@ class CCodeProcessor:
             elif "CASM_BLOCK_" in stripped and "_END:" in stripped and current_block:
                 # End of block - save the collected assembly
                 raw_assembly = '\n'.join(current_assembly)
-                # Clean the assembly but keep the core instructions
-                cleaned = self._clean_gcc_assembly_simple(raw_assembly)
+                # Clean the assembly but keep the core instructions, making labels unique
+                cleaned = self._clean_gcc_assembly_simple(raw_assembly, current_block)
                 segments[current_block] = cleaned
                 print_info(f"Extracted {len(current_assembly)} lines for {current_block}")
                 print_info(f"Cleaned assembly for {current_block}:\n{cleaned}")
@@ -858,7 +885,62 @@ class CCodeProcessor:
                 current_assembly.append(line)
         
         print_info(f"Final segments extracted: {list(segments.keys())}")
+        
+        # Post-process to fix cross-block label references
+        segments = self._fix_cross_block_labels(segments)
+        
         return segments
+    
+    def _fix_cross_block_labels(self, segments: Dict[str, str]) -> Dict[str, str]:
+        """Fix label references that span across different C code blocks"""
+        print_info("Fixing cross-block label references...")
+        
+        # Collect all label definitions and their block IDs
+        label_definitions = {}  # original_label -> (block_id, new_label)
+        label_references = {}   # block_id -> [(original_label, line_number)]
+        
+        # First pass: find all label definitions
+        for block_id, assembly in segments.items():
+            lines = assembly.split('\n')
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                # Look for label definitions like ".BLOCK_15_L2:"
+                import re
+                label_match = re.match(r'\.(' + block_id + r'_L\d+):', stripped)
+                if label_match:
+                    new_label = label_match.group(1)
+                    # Extract original label (L2 from BLOCK_15_L2)
+                    original_match = re.search(r'_L(\d+)', new_label)
+                    if original_match:
+                        original_label = f"L{original_match.group(1)}"
+                        label_definitions[original_label] = (block_id, new_label)
+                        print_info(f"Found label definition: .{original_label} -> .{new_label} in {block_id}")
+        
+        # Second pass: find and fix label references
+        fixed_segments = {}
+        for block_id, assembly in segments.items():
+            lines = assembly.split('\n')
+            fixed_lines = []
+            
+            for line in lines:
+                fixed_line = line
+                # Look for label references like "je .L2" or "jmp .L3"
+                import re
+                for match in re.finditer(r'\.L(\d+)(?!\w)', line):
+                    original_label = f"L{match.group(1)}"
+                    if original_label in label_definitions:
+                        def_block_id, new_label = label_definitions[original_label]
+                        # Replace the reference with the correct block-prefixed label
+                        old_ref = f".L{match.group(1)}"
+                        new_ref = f".{new_label}"
+                        fixed_line = fixed_line.replace(old_ref, new_ref)
+                        print_info(f"Fixed reference in {block_id}: {old_ref} -> {new_ref}")
+                
+                fixed_lines.append(fixed_line)
+            
+            fixed_segments[block_id] = '\n'.join(fixed_lines)
+        
+        return fixed_segments
     
     def _extract_string_constants(self, assembly: str) -> str:
         """Extract and convert string constants from GCC to NASM format"""
@@ -876,25 +958,66 @@ class CCodeProcessor:
             
             # Find .ascii strings and convert to NASM format
             if stripped.startswith('.ascii') and current_label:
-                # Extract the string content
-                match = re.search(r'\.ascii\s+"([^"]*)"', stripped)
+                # Extract the string content more robustly
+                import re
+                match = re.search(r'\.ascii\s+"(.*)"', stripped)
                 if match:
                     string_content = match.group(1)
-                    # Convert \12 to proper newline and \0 to null terminator
-                    if '\\12\\0' in string_content:
-                        # Handle the case where both \12 and \0 are present
-                        string_content = string_content.replace('\\12\\0', '", 10, 0')
-                    elif '\\12' in string_content:
-                        string_content = string_content.replace('\\12', '", 10, "')
-                        if string_content.endswith('"'):
-                            string_content = string_content[:-1] + '0'
-                    elif '\\0' in string_content:
-                        string_content = string_content.replace('\\0', '", 0')
-                    else:
-                        string_content += '", 0'
+                    
+                    # Handle escape sequences properly by building a clean sequence
+                    # Convert escape sequences to NASM format
+                    result_parts = []
+                    i = 0
+                    current_str = ""
+                    
+                    while i < len(string_content):
+                        if i + 1 < len(string_content) and string_content[i:i+2] in ['\\n', '\\r', '\\t']:
+                            # Handle standard escape sequences
+                            if current_str:
+                                result_parts.append(f'"{current_str}"')
+                                current_str = ""
+                            if string_content[i:i+2] == '\\n':
+                                result_parts.append('10')
+                            elif string_content[i:i+2] == '\\r':
+                                result_parts.append('13')
+                            elif string_content[i:i+2] == '\\t':
+                                result_parts.append('9')
+                            i += 2
+                        elif i + 2 < len(string_content) and string_content[i:i+3] in ['\\12', '\\15']:
+                            # Handle octal escape sequences
+                            if current_str:
+                                result_parts.append(f'"{current_str}"')
+                                current_str = ""
+                            if string_content[i:i+3] == '\\12':
+                                result_parts.append('10')
+                            elif string_content[i:i+3] == '\\15':
+                                result_parts.append('13')
+                            i += 3
+                        elif i + 1 < len(string_content) and string_content[i:i+2] == '\\0':
+                            # Handle null terminator
+                            if current_str:
+                                result_parts.append(f'"{current_str}"')
+                                current_str = ""
+                            result_parts.append('0')
+                            i += 2
+                        else:
+                            current_str += string_content[i]
+                            i += 1
+                    
+                    # Add any remaining string content
+                    if current_str:
+                        result_parts.append(f'"{current_str}"')
+                    
+                    # Ensure we have a null terminator
+                    if not result_parts or result_parts[-1] != '0':
+                        result_parts.append('0')
+                    
+                    # Join the parts
+                    if result_parts:
+                        string_content = ', '.join(result_parts)
                     
                     # Create NASM-style string
-                    string_lines.append(f"    {current_label} db \"{string_content}")
+                    string_lines.append(f"    {current_label} db {string_content}")
                     current_label = None
             
             # Handle floating point constants like .LC0
