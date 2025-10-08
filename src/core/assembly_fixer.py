@@ -214,19 +214,34 @@ class AssemblyFixer:
         text_section_start = -1
         
         for i, line in enumerate(lines):
-            if line.strip().startswith('section .data'):
+            stripped = line.strip()
+            if stripped.startswith('section .data'):
                 in_data_section = True
                 result_lines.append(line)
                 continue
-            elif line.strip().startswith('section .text'):
-                text_section_start = i
-                in_data_section = False
-                
+
+            # If we encounter a different section while in data mode, flush data_lines
+            if in_data_section and (stripped.startswith('section .bss') or (stripped.startswith('section') and not stripped.startswith('section .data'))):
                 # Process data section to fix string labeling
                 if data_lines:
                     fixed_data_lines = self._fix_data_section_strings(data_lines, str_refs)
                     result_lines.extend(fixed_data_lines)
-                
+                    data_lines = []
+
+                # Append the non-data section header (e.g., section .bss) and continue
+                in_data_section = False
+                result_lines.append(line)
+                continue
+
+            if stripped.startswith('section .text'):
+                text_section_start = i
+                # If we were still collecting data lines, flush them before text
+                if in_data_section and data_lines:
+                    fixed_data_lines = self._fix_data_section_strings(data_lines, str_refs)
+                    result_lines.extend(fixed_data_lines)
+                    data_lines = []
+                in_data_section = False
+
                 # Add missing LC constants before text section
                 if missing_lc:
                     result_lines.append("")
@@ -238,10 +253,10 @@ class AssemblyFixer:
                             result_lines.append("        dq 2.0  ; 2.0 in double precision")
                         else:
                             result_lines.append(f"    {lc_label} db \"Missing constant {lc_label}\", 0")
-                
+
                 result_lines.append(line)
                 continue
-            
+
             if in_data_section:
                 data_lines.append(line)
             else:

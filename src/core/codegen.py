@@ -137,12 +137,22 @@ class AssemblyCodeGenerator(ASTVisitor):
             c_assembly_segments = getattr(c_processor, '_last_assembly_segments', {})
             
             prettified_code = pretty_printer.prettify(assembly_code, ast, self.variable_labels, c_assembly_segments)
-            
+
+            # Dump prettified code to a temp file for debugging inspection
+            try:
+                with open('/tmp/casm_prettified_debug.asm', 'w', encoding='utf-8') as _df:
+                    _df.write(prettified_code)
+            except Exception:
+                pass
+
             # Fix assembly for NASM compatibility
             fixed_code = assembly_fixer.fix_assembly(prettified_code)
-            
+
+            # Ensure string definitions are placed in .data (post-pass)
+            final_code = self._move_strings_to_data(fixed_code)
+
             print_success("Assembly code generated, prettified and fixed for NASM")
-            return fixed_code
+            return final_code
         except ImportError as e:
             print_warning(f"Pretty printer or fixer not available: {e}")
             # Fallback to regular formatting if pretty printer fails
@@ -154,6 +164,57 @@ class AssemblyCodeGenerator(ASTVisitor):
         """Visit program root node"""
         for stmt in node.statements:
             stmt.accept(self)
+
+    def _move_strings_to_data(self, assembly: str) -> str:
+        """Ensure any `str_... db ...` lines are in section .data and not in .bss.
+
+        This is a small, defensive post-pass to avoid string declarations ending up
+        in the BSS after other transformation passes.
+        """
+        import re
+
+        lines = assembly.split('\n')
+
+        # Collect all string db lines (deduplicated, preserve order)
+        string_lines = []
+        seen = set()
+        str_re = re.compile(r"^\s*(str_[\w\d_]+\s+db\s+.*)$")
+        for line in lines:
+            m = str_re.match(line)
+            if m:
+                s = m.group(1).strip()
+                if s not in seen:
+                    seen.add(s)
+                    string_lines.append(s)
+
+        if not string_lines:
+            return assembly
+
+        # Remove all occurrences of those string lines from the assembly
+        new_lines = []
+        for line in lines:
+            if str_re.match(line):
+                # skip string lines (we will reinsert under .data)
+                continue
+            new_lines.append(line)
+
+        # Find insertion point: after 'section .data' header if present, else before first section
+        out = []
+        inserted = False
+        for i, line in enumerate(new_lines):
+            out.append(line)
+            if not inserted and line.strip().startswith('section .data'):
+                # Insert strings after this header
+                for s in string_lines:
+                    out.append(f"    {s}")
+                inserted = True
+
+        if not inserted:
+            # No data section found; prepend one at top
+            header = ["section .data"] + [f"    {s}" for s in string_lines] + [""]
+            out = header + out
+
+        return '\n'.join(out)
     
     def visit_var_declaration(self, node: VarDeclarationNode):
         """Visit variable declaration with type support"""
