@@ -1,6 +1,4 @@
-# CASM - Clean Assembly Language
-
-CASM is a modern, readable assembly-oriented language that compiles to x86-64 (Windows) assembly. It aims to blend simple high-level constructs with low-level assembly and inline C where helpful.
+CASM (C Assembly) is a modern, readable assembly-oriented language that compiles to x86-64 (Windows) assembly. It aims to blend simple high-level constructs with low-level assembly and inline C where helpful.
 
 This README documents the current (updated) syntax and toolchain behavior used by this repository.
 
