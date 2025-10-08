@@ -1,7 +1,5 @@
 CASM (C Assembly) is a modern, readable assembly-oriented language that compiles to x86-64 (Windows) assembly. It aims to blend simple high-level constructs with low-level assembly and inline C where helpful.
 
-This README documents the current (updated) syntax and toolchain behavior used by this repository.
-
 ## Highlights (what's new)
 
 - Implicit embedded C detection: C-style lines (lines starting with `#` or ending with `;`) are detected automatically and collected into C blocks. You no longer need legacy `_c_` / `_endc_` markers.
