@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-C Code processor for CASM
-Processes embedded C code blocks marked with %!
-"""
-
 import re
 import tempfile
 import os

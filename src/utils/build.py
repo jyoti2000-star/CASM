@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Build utilities for CASM
-Helper functions for compilation and linking
-"""
-
 import os
 import shutil
 import subprocess

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Minimal standard library for CASM
-Contains only essential functions: if, while, for, println, scanf
-"""
-
 from typing import Dict, List, Set
 
 class MinimalStdLib:

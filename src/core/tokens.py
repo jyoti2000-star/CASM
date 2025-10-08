@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Token definitions for CASM
-Clean, focused token types for essential functionality only
-"""
-
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-CASM - Clean Assembly Language Compiler
-Main entry point with clean command-line interface
-"""
-
 import sys
 import os
 
@@ -36,8 +30,8 @@ def validate_file(file_path: str) -> bool:
         print_error(f"File not found: {file_path}")
         return False
     
-    if not file_path.endswith('.casm'):
-        print_warning(f"Expected .casm file, got: {file_path}")
+    if not file_path.endswith('.asm'):
+        print_warning(f"Expected .asm file, got: {file_path}")
         print_info("Continuing anyway...")
     
     return True

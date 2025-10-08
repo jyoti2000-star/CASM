@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Pretty printer for CASM - Context-aware assembly cleanup
-Intelligently organizes combined C and assembly code while preserving structure
-"""
-
 import re
 from typing import List, Dict, Tuple, Optional
 from .ast_nodes import *
@@ -48,13 +42,10 @@ class CASMPrettyPrinter:
         
         output = []
         
-        # Header with comments
+        # Header (preserve original header lines, including original comments)
         if 'header' in sections:
             output.extend(self._format_header(sections['header']))
             output.append("")
-        
-        # External declarations - always ensure they are included
-        output.append("; External function declarations")
         
         # Always ensure we have the necessary external function declarations
         required_functions = ['abort', 'cos', 'exit', 'free', 'malloc', 'pow', 
@@ -83,9 +74,9 @@ class CASMPrettyPrinter:
             print_debug(f"No existing externs found, adding all required functions: {required_functions}")
         else:
             print_debug(f"Found existing externs: {existing_externs}")
-        
+
         output.append("")
-        
+
         # Data section - organized
         # Detect string declarations that were mistakenly placed in .bss and
         # move them into the data section so strings are defined in .data.
@@ -113,8 +104,11 @@ class CASMPrettyPrinter:
         
         # Text section with context-aware C code placement
         output.extend(self._format_text_section_with_context(sections, ast))
-        
-        return '\n'.join(output)
+
+        # Final normalization: un-indent then indent consistently and tidy spacing
+        final = '\n'.join(output)
+        final = self._normalize_indentation(final)
+        return final
     
     def _collect_all_strings(self, ast: ProgramNode):
         """Pre-process AST to collect all string literals for consistent labeling"""
@@ -291,13 +285,9 @@ class CASMPrettyPrinter:
     def _rebuild_with_context(self, sections: Dict, ast: ProgramNode) -> str:
         """Rebuild assembly with proper context and structure"""
         output = []
-        
-        # Header section
+        # Header section (preserve original comments/lines)
         output.extend(self._format_header(sections['header']))
         output.append("")
-        
-        # External declarations - cleaned up
-        output.append("; External function declarations")
         
         # Always ensure we have the necessary external function declarations
         required_functions = ['abort', 'cos', 'exit', 'free', 'malloc', 'pow', 
@@ -326,9 +316,9 @@ class CASMPrettyPrinter:
             print_debug(f"No existing externs found, adding all required functions: {required_functions}")
         else:
             print_debug(f"Found existing externs: {existing_externs}")
-        
+
         output.append("")
-        
+
         # Data section - organized, including any misplaced strings from BSS
         misplaced_strings = []
         if sections.get('bss'):
@@ -343,14 +333,16 @@ class CASMPrettyPrinter:
             data_insert_index = 1  # After "section .data"
             for i, string_line in enumerate(misplaced_strings):
                 data_section.insert(data_insert_index + i, string_line)
-        
+
         output.extend(data_section)
         output.append("")
-        
+
         # Text section with context-aware C code placement
         output.extend(self._format_text_section_with_context(sections, ast))
-        
-        return '\n'.join(output)
+
+        # Normalize indentation and spacing
+        final = '\n'.join(output)
+        return self._normalize_indentation(final)
     
     def _format_header(self, header_lines: List[str]) -> List[str]:
         """Format the header section"""
@@ -377,12 +369,7 @@ class CASMPrettyPrinter:
             if in_data_section and stripped:
                 # Clean up data declarations
                 if stripped.startswith('str_') or stripped.startswith('var_'):
-                    # Add context comment for variables
-                    if stripped.startswith('var_'):
-                        var_label = stripped.split()[0]
-                        if var_label in self.c_variables:
-                            casm_name = self.c_variables[var_label]['casm_name']
-                            formatted.append(f"    ; CASM variable: {casm_name}")
+                    # Preserve declaration lines but avoid inserting extra comments
                     formatted.append(f"    {stripped}")
                 else:
                     formatted.append(f"    {stripped}")
@@ -397,7 +384,7 @@ class CASMPrettyPrinter:
         # Add additional data items that might be needed (string constants, loop counters)
         self._add_generated_data_items(formatted)
         
-        # Add all collected strings at the end of data section
+        # Add all collected strings at the end of data section (no extra comments)
         for string_label, content in self.collected_strings.items():
             formatted.append(f"    {string_label} db {content}")
         
@@ -483,6 +470,14 @@ class CASMPrettyPrinter:
         
         # Use the original text section but insert C code where needed
         if 'text' in sections and sections['text']:
+            # If the original text already contains generated assembly markers,
+            # keep the original text as-is (preserve user's original statements)
+            gen_markers = any(re.search(r'Generated assembly for CASM_BLOCK_\d+', l) for l in text_content)
+            if gen_markers:
+                # Remove duplicate labels but otherwise preserve original lines
+                cleaned_assembly = self._remove_duplicate_labels('\n'.join(text_content))
+                return cleaned_assembly.split('\n')
+
             formatted = []
             text_lines = sections['text']
             gcc_blocks = sections.get('gcc_blocks', [])
@@ -491,13 +486,12 @@ class CASMPrettyPrinter:
             block_index = 0
             for line in text_lines:
                 if 'CASM_BLOCK_' in line and 'Placeholder' in line:
-                    # Insert actual C code assembly
+                    # Insert actual C code assembly (preserve only actual assembly lines)
                     if block_index < len(gcc_blocks):
-                        formatted.append(f"    ; C code block: CASM_BLOCK_{block_index}")
-                        formatted.extend(gcc_blocks[block_index]['assembly'])
-                        block_index += 1
+                        formatted.extend(gcc_blocks[block_index].get('assembly', []))
                     else:
                         formatted.append(line)  # Keep placeholder if no C code
+                    block_index += 1
                 else:
                     formatted.append(line)
             
@@ -643,7 +637,7 @@ class CASMPrettyPrinter:
                 end_label = f"if_end_{self.control_counter}"
                 else_label = f"else_{self.control_counter}" if stmt.else_body else None
             
-            output.append(f"    ; if {stmt.condition}")
+            # Preserve original comment nodes only; do not emit generated comment here
             
             # Generate condition evaluation assembly
             condition_asm, jump_instruction = self._generate_condition_assembly(stmt.condition)
@@ -656,12 +650,13 @@ class CASMPrettyPrinter:
             
             self.indent_level += 1
             
-            # Process if body
+            # Process if body (grouped per statement)
             for if_stmt in stmt.if_body:
                 if_output, current_index = self._process_statement_with_context(
                     if_stmt, gcc_blocks, current_index
                 )
                 output.extend(if_output)
+            output.append("")
             
             # Process else body if exists
             if stmt.else_body:
@@ -673,6 +668,7 @@ class CASMPrettyPrinter:
                         else_stmt, gcc_blocks, current_index
                     )
                     output.extend(else_output)
+                output.append("")
             
             output.append(f"{end_label}:")
             self.indent_level -= 1
@@ -684,7 +680,7 @@ class CASMPrettyPrinter:
             start_label = f"while_start_{self.control_counter}"
             end_label = f"while_end_{self.control_counter}"
             
-            output.append(f"    ; while {stmt.condition}")
+            # Do not emit generated comment; keep only labels and instructions
             output.append(f"{start_label}:")
             
             # Generate condition evaluation assembly
@@ -699,6 +695,7 @@ class CASMPrettyPrinter:
                     while_stmt, gcc_blocks, current_index
                 )
                 output.extend(while_output)
+            output.append("")
             
             output.append(f"    jmp {start_label}")
             output.append(f"{end_label}:")
@@ -716,7 +713,7 @@ class CASMPrettyPrinter:
             end_label = f"for_end_{counter_hash}"
             counter_var = f"for_counter_{counter_hash}"
             
-            output.append(f"    ; for {stmt.variable} in range({stmt.count})")
+            # Do not emit generated comment for for-loop header
             
             # Initialize counter (variable already defined in data section)
             output.append(f"    mov dword [rel {counter_var}], 0")
@@ -734,6 +731,7 @@ class CASMPrettyPrinter:
                     for_stmt, gcc_blocks, current_index
                 )
                 output.extend(for_output)
+            output.append("")
             
             # Increment counter
             output.append(f"    inc dword [rel {counter_var}]")
@@ -743,7 +741,7 @@ class CASMPrettyPrinter:
             
         elif isinstance(stmt, PrintlnNode):
             # Generate real printf assembly
-            output.append(f"    ; println {stmt.message}")
+            # Keep original print-related comments only via CommentNode; do not emit generated comment
             
             # Clean the message
             message = stmt.message.strip()
@@ -765,12 +763,13 @@ class CASMPrettyPrinter:
             # Add printf call assembly (Windows x64 calling convention)
             output.append(f"    lea rcx, [rel {string_label}]")
             output.append(f"    call printf")
+            output.append("")
             
             # Note: String would need to be added to data section
             
         elif isinstance(stmt, ScanfNode):
             # Generate real scanf assembly
-            output.append(f"    ; scanf {stmt.format_string} -> {stmt.variable}")
+            # Do not emit generated comment for scanf
             
             # Clean format string
             format_str = stmt.format_string.strip()
@@ -787,13 +786,24 @@ class CASMPrettyPrinter:
             output.append(f"    lea rcx, [rel {format_label}]")
             output.append(f"    lea rdx, [rel {var_label}]")
             output.append(f"    call scanf")
+            output.append("")
             
         elif isinstance(stmt, CCodeBlockNode):
             # Handle the new marker-based C compilation system
             indent = self.base_indent * (self.indent_level + 1)
-            
+
             # Get the actual compiled assembly for this block
             block_id = getattr(stmt, '_block_id', None)
+            # If we have the original C code for this block, emit it as comments
+            try:
+                c_text = stmt.c_code
+            except Exception:
+                c_text = None
+            if c_text:
+                for l in c_text.split('\n'):
+                    if l.strip():
+                        # Emit as top-level comment so it's visible in assembly output
+                        output.append(f"; {l.strip()}")
             if block_id is not None:
                 marker_key = f"CASM_BLOCK_{block_id}"
                 if marker_key in self.c_assembly_segments:
@@ -803,19 +813,24 @@ class CASMPrettyPrinter:
                         for asm_line in assembly_code.split('\n'):
                             if asm_line.strip():
                                 output.append(f"{indent}{asm_line}")
-                    # Don't add anything for empty assembly blocks
-                # Don't add anything for missing assembly
-            # Don't add anything for missing block ID
         
         elif isinstance(stmt, ExternDirectiveNode):
-            output.append(f"    ; extern {stmt.header_name}")
+            # Emit the original extern directive as an assembly line
+            if stmt.is_c_include:
+                if stmt.use_angle:
+                    output.append(f"#include <{stmt.header_name}>")
+                else:
+                    output.append(f"#include \"{stmt.header_name}\"")
+            else:
+                output.append(f"extern {stmt.header_name}")
             
         elif isinstance(stmt, AssemblyNode):
             indent = self.base_indent * (self.indent_level + 1)
             output.append(f"{indent}{stmt.code}")
             
         elif isinstance(stmt, CommentNode):
-            output.append(f"    {stmt.text}")
+            # Preserve original comment nodes verbatim
+            output.append(stmt.text)
         
         return output, current_index
     
@@ -841,30 +856,24 @@ class CASMPrettyPrinter:
             
             # Handle labels
             if stripped.endswith(':') and not stripped.startswith('.'):
-                if 'casm_c_block' in stripped:
-                    in_function = True
-                    cleaned.append(f"{base_indent}; C function start")
-                else:
-                    cleaned.append(f"{base_indent}{stripped}")
+                cleaned.append(f"{base_indent}{stripped}")
                 continue
             
             # Handle instructions inside function
             if in_function and stripped:
-                # Clean up the instruction
+                # Clean up the instruction and append
                 clean_instr = self._clean_instruction(stripped)
                 if clean_instr:
                     cleaned.append(f"{asm_indent}{clean_instr}")
-                
                 # Check for function end
                 if stripped == 'ret':
-                    cleaned.append(f"{base_indent}; C function end")
                     in_function = False
             elif stripped.startswith('.'):
                 # Handle data declarations
                 if '.ascii' in stripped or 'db ' in stripped:
                     cleaned.append(f"{asm_indent}{self._clean_data_declaration(stripped)}")
                 else:
-                    cleaned.append(f"{base_indent}; {stripped}")
+                    cleaned.append(f"{base_indent}{stripped}")
         
         return cleaned
     
@@ -881,9 +890,8 @@ class CASMPrettyPrinter:
             instruction = re.sub(r'\[rbp\]', '[rbp]', instruction)
             
         elif instruction.startswith('call'):
-            # Map C function calls to comments
-            if 'printf' in instruction:
-                return f"{instruction}  ; C printf call"
+            # Keep call instruction as-is
+            return instruction
         
         # Map variable references in comments
         for var_label, var_info in self.c_variables.items():
@@ -900,7 +908,7 @@ class CASMPrettyPrinter:
             match = re.search(r'"([^"]*)"', declaration)
             if match:
                 string_content = match.group(1)
-                return f'db "{string_content}", 0  ; C string constant'
+                return f'db "{string_content}", 0'
         
         return declaration
     
@@ -935,6 +943,45 @@ class CASMPrettyPrinter:
             final_lines.append(line)
         
         return '\n'.join(final_lines)
+
+    def _normalize_indentation(self, assembly_code: str) -> str:
+        """Normalize indentation: unindent everything then re-indent
+
+        Rules:
+        - Labels (lines ending with ':') start at column 0
+        - Instructions are indented by 4 spaces
+        - Original comment lines (starting with ';' or '#') are preserved as-is
+        - Blank lines preserved but consecutive blanks collapsed to one
+        """
+        lines = assembly_code.split('\n')
+        out = []
+        prev_blank = False
+
+        for line in lines:
+            if not line.strip():
+                if not prev_blank:
+                    out.append('')
+                prev_blank = True
+                continue
+
+            prev_blank = False
+            stripped = line.strip()
+
+            # Preserve original comments starting with ';' or '#'
+            if stripped.startswith(';') or stripped.startswith('#'):
+                out.append(stripped)
+                continue
+
+            # Labels
+            if stripped.endswith(':'):
+                out.append(stripped)
+                continue
+
+            # Otherwise treat as instruction or directive and indent
+            out.append(f"    {stripped}")
+
+        # Ensure trailing newline
+        return '\n'.join(out) + '\n'
     
     def _generate_condition_assembly(self, condition: str) -> tuple[List[str], str]:
         """Generate assembly code for condition evaluation and return the appropriate jump instruction"""
@@ -965,8 +1012,7 @@ class CASMPrettyPrinter:
                 elif left.isdigit():
                     asm_lines.append(f"    mov eax, {left}")
                 else:
-                    asm_lines.append(f"    ; TODO: Complex left operand: {left}")
-                    asm_lines.append(f"    mov eax, 0  ; placeholder")
+                    asm_lines.append(f"    mov eax, 0")
                 
                 # Generate assembly for right operand and comparison
                 if right in self.variable_map:
@@ -975,8 +1021,7 @@ class CASMPrettyPrinter:
                 elif right.isdigit():
                     asm_lines.append(f"    cmp eax, {right}")
                 else:
-                    asm_lines.append(f"    ; TODO: Complex right operand: {right}")
-                    asm_lines.append(f"    cmp eax, 0  ; placeholder")
+                    asm_lines.append(f"    cmp eax, 0")
                 
                 return asm_lines, comparison_ops[op]
         
@@ -989,8 +1034,7 @@ class CASMPrettyPrinter:
             asm_lines.append(f"    mov eax, {condition}")
             asm_lines.append(f"    cmp eax, 0")
         else:
-            asm_lines.append(f"    ; TODO: Complex condition: {condition}")
-            asm_lines.append(f"    mov eax, 1  ; assume true")
+            asm_lines.append(f"    mov eax, 1")
             asm_lines.append(f"    cmp eax, 0")
         
         return asm_lines, 'je'

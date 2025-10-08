@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Core CASM compiler and processor
-Combines lexing, parsing, and code generation in clean architecture
-"""
-
 import os
 import sys
 import tempfile

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Lexical analyzer for CASM
-Clean, focused lexer for essential language features
-"""
-
 from typing import List, Tuple, Optional, Dict
 import re
 from .tokens import Token, TokenType, LexerError

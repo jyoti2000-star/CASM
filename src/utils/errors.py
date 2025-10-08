@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Error handling utilities for CASM
-Clean error reporting and debugging support
-"""
-
 from typing import List, Optional
 from .core.tokens import Token, LexerError
 from .core.parser import ParseError

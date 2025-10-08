@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Parser for CASM language
-Clean, focused parser for essential language constructs
-"""
-
 from typing import List, Optional
 from .tokens import Token, TokenType, LexerError
 from .ast_nodes import *

@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Simple syntax checker for CASM files.
-
-This module reuses the existing lexer and parser to detect lexical and
-parse-time errors before code generation. It exposes a small API:
-
-  check_syntax(content: str, filename: Optional[str]) -> List[dict]
-
-Each error dict contains: {'line': int|None, 'column': int|None, 'message': str}
-
-The checker is intentionally lightweight and reports the first lexer or
-parser error encountered.
-"""
-
 from typing import List, Optional
 
 from ..core.lexer import CASMLexer

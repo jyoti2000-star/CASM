@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Color utilities for CASM
-Provides colored output for better user experience
-"""
-
 class Colors:
     """ANSI color codes for terminal output"""
     # By default use colored output

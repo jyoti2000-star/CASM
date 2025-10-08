@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Assembly formatter for CASM
-Provides clean, well-formatted assembly output
-"""
-
 import re
 from typing import List, Dict, Set
 from ..utils.colors import print_info, print_success, print_warning

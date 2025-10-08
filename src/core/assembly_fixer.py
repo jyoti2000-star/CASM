@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-Assembly Fixer for CASM
-Fixes common issues in generated assembly to make it NASM-compatible
-"""
-
 import re
 from typing import Dict, List, Set
 from ..utils.colors import print_info, print_success, print_warning, print_error

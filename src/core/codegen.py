@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-Code generator for CASM
-Converts AST to x86-64 Windows assembly
-"""
-
 from typing import List, Dict, Set
 import secrets
 import re
@@ -77,7 +72,6 @@ class AssemblyCodeGenerator(ASTVisitor):
         external_functions.update(common_c_functions)
         
         if external_functions:
-            lines.append("; External function declarations")
             for func in sorted(external_functions):
                 lines.append(f"extern {func}")
             lines.append("")
@@ -656,6 +650,11 @@ class AssemblyCodeGenerator(ASTVisitor):
             
             # Add NOP-wrapped placeholder for the assembly that will be filled after compilation
             self.text_section.append(f"    ; C code block: {block_marker}")
+            # Emit original C code as comments so the assembly output shows the source C statements
+            if node.c_code and node.c_code.strip():
+                for c_line in node.c_code.split('\n'):
+                    if c_line.strip():
+                        self.text_section.append(f"    ; {c_line.strip()}")
             self.text_section.append(f"    nop  ; Start of C block {block_marker}")
             self.text_section.append(f"    ; {{{block_marker}}} ; Placeholder for assembly")
             self.text_section.append(f"    nop  ; End of C block {block_marker}")
@@ -739,7 +738,16 @@ class AssemblyCodeGenerator(ASTVisitor):
                         # Replace with actual assembly
                         assembly_code = assembly_segments[marker]
                         if assembly_code.strip():
-                            updated_sections.append("    ; Generated assembly for " + marker)
+                            # Remove the previously emitted C-block header/comments/NOPs
+                            header = f"    ; C code block: {marker}"
+                            # search backwards for the header and trim anything from it onward
+                            for i in range(len(updated_sections)-1, -1, -1):
+                                if updated_sections[i] == header:
+                                    # remove header and anything after it
+                                    del updated_sections[i:]
+                                    break
+
+                            # Insert only the cleaned assembly instructions (no generated comment)
                             for asm_line in assembly_code.split('\n'):
                                 if asm_line.strip():
                                     updated_sections.append(f"    {asm_line}")

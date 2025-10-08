@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-
-"""
-AST Node definitions for CASM
-Clean, focused abstract syntax tree nodes
-"""
-
 from abc import ABC, abstractmethod
 from typing import List, Any, Optional
 from dataclasses import dataclass
