@@ -20,6 +20,7 @@ from .stdlib.minimal import stdlib
 from .utils.c_processor import c_processor
 from .utils.formatter import formatter
 from .utils.colors import print_info, print_success, print_warning, print_error, print_system
+from .utils.syntax import check_syntax, format_errors
 
 class CASMProcessor:
     """Core CASM language processor"""
@@ -36,13 +37,22 @@ class CASMProcessor:
             with open(input_file, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            print_system(f"Processing {input_file}...")
+            # Reduce noisy system output; keep as debug-level
+            from .utils.colors import print_debug
+            print_debug(f"Processing {input_file}...")
             
-            # Process embedded C code first
-            if '%!' in content:
-                print_info("Found embedded C code, preprocessing...")
-                content = c_processor.process_c_code(content)
-            
+            # Legacy explicit embedded C indicator removed; lexer now detects C lines
+            # Run syntax checks (lexer + parser) before proceeding to codegen
+            with open(input_file, 'r', encoding='utf-8') as _f:
+                raw_content = _f.read()
+
+            syntax_errors = check_syntax(raw_content, filename=input_file)
+            if syntax_errors:
+                # Print errors and abort processing
+                err_text = format_errors(syntax_errors, filename=input_file)
+                print_error(err_text)
+                raise Exception('Syntax errors detected; aborting compilation')
+
             # Tokenize
             tokens = self.lexer.tokenize(content)
             non_eof_tokens = [t for t in tokens if t.type.value != 'EOF']
@@ -60,12 +70,15 @@ class CASMProcessor:
             return assembly_code
             
         except Exception as e:
-            print_error(f"Failed to process {input_file}: {e}")
+            # Allow the exception to propagate so the top-level CLI prints a single
+            # consolidated error message. Do not print here to avoid duplicates.
             raise
         
         finally:
             # Cleanup C processor
             c_processor.cleanup()
+
+    # Note: implicit C detection is now handled in the lexer (C_INLINE tokens)
 
 class CASMCompiler:
     """Complete CASM compiler with build pipeline"""
@@ -77,27 +90,30 @@ class CASMCompiler:
     def compile_to_assembly(self, input_file: str, output_file: str = None) -> bool:
         """Compile CASM to assembly file"""
         try:
-            print_system(f"Assembly generation for {input_file}...")
+            # The higher-level CLI now controls visible messages; avoid duplicate system prints
+            from .utils.colors import print_debug
+            print_debug(f"Assembly generation for {input_file}...")
+
             # Generate assembly
             assembly_code = self.processor.process_file(input_file)
-            
+
             # Determine output file
             if output_file is None:
                 output_file = str(Path(input_file).with_suffix('.asm'))
-            
+
             # Ensure output directory exists
             os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
-            
+
             # Add debug info and format
             final_assembly = formatter.add_debug_info(assembly_code, input_file)
-            
+
             # Write assembly file
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(final_assembly)
-            
+
             print_success(f"Assembly generated: {output_file}")
             return True
-            
+
         except Exception as e:
             print(f"[ERROR] Assembly generation failed: {e}")
             return False

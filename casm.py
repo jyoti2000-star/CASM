@@ -18,44 +18,18 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.compiler import processor, compiler
-from src.utils.colors import print_info, print_success, print_error, print_warning, print_system, Colors, bold
+from src.utils.colors import print_info, print_success, print_final_success, print_error, print_warning, print_system, Colors, bold
 
 def print_help():
-    """Print usage information"""
-    print(f"{Colors.CYAN}{bold('CASM - Clean Assembly Language Compiler')}{Colors.RESET}")
-    print("=" * 50)
-    print("A clean, focused assembly language with high-level constructs")
+    """Print minimal usage information"""
+    print("python3 casm.py <command> <file> [options]")
     print("")
-    print(f"{bold('Usage:')} python3 casm.py <command> <file> [options]")
-    print("")
-    print(f"{Colors.ORANGE}{bold('Commands:')}{Colors.RESET}")
-    print("  compile <file.casm>  - Compile to executable only") 
-    print("  asm <file.casm>      - Generate assembly code only")
+    print("Commands:")
+    print("  compile <file.casm>  - Compile to executable")
+    print("  asm <file.casm>      - Generate assembly")
     print("  help                 - Show this help")
     print("")
-    print(f"{Colors.GREEN}{bold('Language Features:')}{Colors.RESET}")
-    print("  %var name value      - Declare variable")
-    print("  %if condition        - If statement")
-    print("  %while condition     - While loop")
-    print("  %for var in range(n) - For loop")
-    print("  %println message     - Print line")
-    print("  %scanf format var    - Read input")
-    print(f"  {Colors.YELLOW}%!{Colors.RESET}                   - Embed C code block")
     print("")
-    print(f"{Colors.BLUE}{bold('Examples:')}{Colors.RESET}")
-    print("  python3 casm.py compile program.casm")
-    print("  python3 casm.py asm test.casm")
-    print("")
-    print(f"{Colors.PURPLE}{bold('C Code Integration:')}{Colors.RESET}")
-    print("  %!")
-    print("  int add(int a, int b) {")
-    print("      return a + b;")
-    print("  }")
-    print("")
-    print(f"{bold('Files:')}")
-    print("  Input: .casm files")
-    print("  Output: .exe executables, .asm assembly files")
-
 def validate_file(file_path: str) -> bool:
     """Validate input file"""
     if not os.path.exists(file_path):
@@ -94,13 +68,21 @@ def main():
     success = False
     
     if command == 'compile':
-        print_system(f"Compiling {input_file}...")
-        success = compiler.compile_to_executable(input_file, run_after=False)
+        try:
+            success = compiler.compile_to_executable(input_file, run_after=False)
+        except Exception as e:
+            print_error(str(e))
+            sys.exit(1)
     
     elif command == 'asm':
-        print_system(f"Generating assembly for {input_file}...")
+        # quiet: don't print a duplicate system message here (compiler will handle higher-level messaging)
         output_file = os.path.join("output", Path(input_file).stem + ".asm")
-        success = compiler.compile_to_assembly(input_file, output_file)
+        try:
+            success = compiler.compile_to_assembly(input_file, output_file)
+        except Exception as e:
+            # Single consolidated error message with details
+            print_error(str(e))
+            sys.exit(1)
     
     else:
         print_error(f"Unknown command: {command}")
@@ -109,8 +91,15 @@ def main():
     
     if not success:
         sys.exit(1)
-    
-    print_success("Operation completed successfully!")
+
+    # Single final success message that includes the produced path depending on the mode
+    if command == 'asm':
+        print_final_success(f"Assembly generated: {output_file}")
+    elif command == 'compile':
+        # Match compiler default: output executable is placed in 'output/<stem>.exe'
+        exe_name = Path(input_file).stem + ".exe"
+        exe_path = os.path.join("output", exe_name)
+        print_final_success(f"Executable generated: {exe_path}")
 
 if __name__ == "__main__":
     main()

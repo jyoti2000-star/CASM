@@ -37,16 +37,7 @@ class TokenType(Enum):
     SCAN = "SCAN"             # scan statement
     
     # C Code Integration
-    C_CODE_BLOCK = "C_CODE_BLOCK"  # _c_ marker for C code start
-    C_CODE_END = "C_CODE_END"      # _endc_ marker for C code end
     C_INLINE = "C_INLINE"          # Inline C expressions
-    
-    # Assembly Integration
-    ASM_BLOCK = "ASM_BLOCK"        # _asm_ marker for assembly block start
-    ASM_END = "ASM_END"            # _endasm_ marker for assembly block end
-    
-    # Variable declaration prefix
-    AT_SYMBOL = "AT_SYMBOL"        # @ symbol for variable declarations
     
     # Operators
     ASSIGN = "ASSIGN"          # =

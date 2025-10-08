@@ -24,6 +24,7 @@ class CASMParser:
     def __init__(self):
         self.tokens = []
         self.current = 0
+        self._anon_var_counter = 0
     
     def parse(self, tokens: List[Token]) -> ProgramNode:
         """Parse tokens into AST"""
@@ -56,8 +57,10 @@ class CASMParser:
             return CommentNode(token.value)
         
         # Parse language constructs
-        if token.type == TokenType.AT_SYMBOL:
+        if token.type == TokenType.VAR:
             return self._parse_var_declaration()
+        elif token.type == TokenType.EXTERN:
+            return self._parse_extern_directive()
         elif token.type == TokenType.IDENTIFIER:
             # Look ahead to see if this is an assignment or assembly
             if self._is_assignment():
@@ -74,10 +77,9 @@ class CASMParser:
             return self._parse_print_statement()
         elif token.type == TokenType.SCAN:
             return self._parse_scan_statement()
-        elif token.type == TokenType.C_CODE_BLOCK:
-            return self._parse_c_code_block()
-        elif token.type == TokenType.ASM_BLOCK:
-            return self._parse_asm_block()
+        elif token.type == TokenType.C_INLINE:
+            return self._parse_c_inline_block()
+        
         elif token.type == TokenType.ASSEMBLY_LINE:
             return self._parse_assembly_line()
         else:
@@ -104,45 +106,69 @@ class CASMParser:
         return False
     
     def _parse_var_declaration(self) -> ASTNode:
-        """Parse variable declaration: @type name = value or @extern <header>"""
-        self._consume(TokenType.AT_SYMBOL, "Expected '@'")
-        
-        # Check if this is an extern directive
-        if self._check(TokenType.EXTERN):
-            return self._parse_extern_directive()
-        
-        # Get the type
-        if not self._check_types([TokenType.INT_TYPE, TokenType.STR_TYPE, TokenType.BOOL_TYPE, 
+        """Parse new-style variable declaration: var type name [= value];
+
+        Examples:
+            var int n 5
+            var int n = 5;
+        """
+        # Expect 'var'
+        self._consume(TokenType.VAR, "Expected 'var' for variable declaration")
+
+        # Next should be a type token
+        if not self._check_types([TokenType.INT_TYPE, TokenType.STR_TYPE, TokenType.BOOL_TYPE,
                                  TokenType.FLOAT_TYPE, TokenType.BUFFER_TYPE]):
-            raise ParseError("Expected type after '@'", self._peek())
-        
+            raise ParseError("Expected type after 'var'", self._peek())
+
         type_token = self._advance()
         var_type = type_token.value
-        
-        name_token = self._consume(TokenType.IDENTIFIER, "Expected variable name")
-        name = name_token.value
-        
-        # Check for array/buffer size notation: name[size]
+
+        # Handle optional identifier or anonymous array declaration
         size = None
+        name = None
+
         if self._check(TokenType.LEFT_BRACKET):
-            self._advance()  # consume '['
+            # Anonymous array: var <type>[size]
+            name = f"{var_type}_auto_{self._anon_var_counter}"
+            self._anon_var_counter += 1
+            self._advance()
             size_token = self._consume(TokenType.NUMBER, "Expected array size")
             size = int(size_token.value)
             self._consume(TokenType.RIGHT_BRACKET, "Expected ']'")
-        
-        # Expect = sign
-        self._consume(TokenType.ASSIGN, "Expected '=' after variable name")
-        
-        # Rest of the line is the value
+        else:
+            name_token = self._consume(TokenType.IDENTIFIER, "Expected variable name")
+            name = name_token.value
+
+            # Optional array size after identifier
+            if self._check(TokenType.LEFT_BRACKET):
+                self._advance()
+                size_token = self._consume(TokenType.NUMBER, "Expected array size")
+                size = int(size_token.value)
+                self._consume(TokenType.RIGHT_BRACKET, "Expected ']'")
+
+        # Value can be provided with '=' or directly as a token sequence
         value_parts = []
-        while not self._check(TokenType.NEWLINE) and not self._is_at_end():
-            token = self._advance()
-            if token.type != TokenType.EOF:
+        if self._check(TokenType.ASSIGN):
+            self._advance()  # consume '='
+            while not self._check(TokenType.SEMICOLON) and not self._check(TokenType.NEWLINE) and not self._is_at_end():
+                token = self._advance()
+                if token.type != TokenType.EOF:
+                    value_parts.append(token.value)
+        else:
+            while not self._check(TokenType.SEMICOLON) and not self._check(TokenType.NEWLINE) and not self._is_at_end() and self._peek().type != TokenType.EOF:
+                # Stop if next token is a keyword that indicates end of declaration
+                if self._peek().type in [TokenType.PRINT, TokenType.SCAN, TokenType.IF, TokenType.WHILE, TokenType.FOR]:
+                    break
+                token = self._advance()
                 value_parts.append(token.value)
-        
+
+        # Consume optional semicolon
+        if self._check(TokenType.SEMICOLON):
+            self._advance()
+
         value = ' '.join(value_parts).strip()
-        
-        # Set default values based on type if no value provided
+
+        # Default value handling
         if not value:
             if var_type == "int":
                 value = "0"
@@ -153,8 +179,8 @@ class CASMParser:
             elif var_type == "float":
                 value = "0.0"
             elif var_type == "buffer":
-                value = ""  # No value needed for buffers
-        
+                value = ""
+
         return VarDeclarationNode(name, value, var_type, size)
     
     def _parse_extern_directive(self) -> ExternDirectiveNode:
@@ -163,32 +189,48 @@ class CASMParser:
         
         # Check for angle brackets or just a regular identifier/string
         header_name = ""
-        
+        is_c_include = False
+        use_angle = False
+
         if self._check(TokenType.LESS_THAN):
+            # C include with <...>
+            # Be tolerant: consume until '>' or end-of-line/EOF
             self._advance()  # consume '<'
-            # Collect everything until '>'
             header_parts = []
-            while not self._check(TokenType.GREATER_THAN) and not self._is_at_end():
+            saw_greater = False
+            while not self._is_at_end():
+                if self._check(TokenType.GREATER_THAN):
+                    saw_greater = True
+                    self._advance()  # consume '>'
+                    break
+                # Stop if newline encountered (malformed include like '< math .h>')
+                if self._check(TokenType.NEWLINE):
+                    break
                 token = self._advance()
                 if token.type != TokenType.EOF:
                     header_parts.append(token.value)
-            self._consume(TokenType.GREATER_THAN, "Expected '>'")
-            header_name = ''.join(header_parts)
+
+            # Normalize header name (remove whitespace introduced between tokens)
+            raw_header = ''.join(header_parts).strip()
+            header_name = raw_header.replace(' ', '')
+            is_c_include = True
+            use_angle = saw_greater
         elif self._check(TokenType.STRING):
-            # String literal header
+            # C include with quoted string
+            is_c_include = True
+            use_angle = False
             string_token = self._advance()
             header_name = string_token.value.strip('"\'')
         else:
-            # Regular identifier (like stdio.h)
-            # Collect until newline as header name
-            header_parts = []
+            # Assembler extern symbol (identifier) or plain text until newline
+            parts = []
             while not self._check(TokenType.NEWLINE) and not self._is_at_end():
                 token = self._advance()
                 if token.type != TokenType.EOF:
-                    header_parts.append(token.value)
-            header_name = ''.join(header_parts).strip()
-        
-        return ExternDirectiveNode(header_name)
+                    parts.append(token.value)
+            header_name = ''.join(parts).strip()
+
+        return ExternDirectiveNode(header_name, is_c_include=is_c_include, use_angle=use_angle)
     
     def _parse_assignment(self) -> AssignmentNode:
         """Parse variable assignment: variable = expression"""
@@ -362,49 +404,20 @@ class CASMParser:
         assembly_code = ' '.join(assembly_parts)
         return AssemblyNode(assembly_code)
     
-    def _parse_c_code_block(self) -> CCodeBlockNode:
-        """Parse C code block: _c_ ... _endc_"""
-        self._consume(TokenType.C_CODE_BLOCK, "Expected '_c_'")
-        
-        # Collect all code between _c_ and _endc_
-        c_code_parts = []
-        
-        while not self._is_at_end():
-            if self._check(TokenType.C_CODE_END):
-                self._advance()  # consume _endc_
-                break
-            
-            # Collect tokens as C code
+    def _parse_c_inline_block(self) -> CCodeBlockNode:
+        """Collect contiguous C_INLINE tokens into a single C code block"""
+        parts = []
+        while not self._is_at_end() and self._check(TokenType.C_INLINE):
             token = self._advance()
-            if token.type == TokenType.NEWLINE:
-                c_code_parts.append('\n')
-            elif token.type != TokenType.EOF:
-                c_code_parts.append(token.value)
-        
-        c_code = ' '.join(c_code_parts).strip()
+            parts.append(token.value)
+            # Consume any trailing NEWLINE tokens between C_INLINE lines
+            if self._check(TokenType.NEWLINE):
+                self._advance()
+
+        c_code = '\n'.join(parts).strip()
         return CCodeBlockNode(c_code)
     
-    def _parse_asm_block(self) -> AsmBlockNode:
-        """Parse assembly block: _asm_ ... _endasm_"""
-        self._consume(TokenType.ASM_BLOCK, "Expected '_asm_'")
-        
-        # Collect all code between _asm_ and _endasm_
-        asm_code_parts = []
-        
-        while not self._is_at_end():
-            if self._check(TokenType.ASM_END):
-                self._advance()  # consume _endasm_
-                break
-            
-            # Collect tokens as assembly code
-            token = self._advance()
-            if token.type == TokenType.NEWLINE:
-                asm_code_parts.append('\n')
-            elif token.type != TokenType.EOF:
-                asm_code_parts.append(token.value)
-        
-        asm_code = ' '.join(asm_code_parts).strip()
-        return AsmBlockNode(asm_code)
+    # ASM block markers removed; raw assembly lines are parsed via ASSEMBLY_LINE
     
     # Utility methods
     def _advance(self) -> Token:

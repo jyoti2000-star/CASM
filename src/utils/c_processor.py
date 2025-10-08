@@ -22,16 +22,28 @@ class CCodeProcessor:
         self.temp_dir = None
         self.casm_variables = {}  # Track CASM variables
         self.c_variables = {}     # Track C variables
-        self.headers = []         # Track extern headers
+        # Track extern headers as tuples: (header_name, use_angle)
+        # use_angle=True -> #include <header>
+        # use_angle=False -> #include "header"
+        self.headers = []         # List[Tuple[str, bool]]
         self.c_code_blocks = []   # Collect all C code blocks with markers
         self.assembly_segments = {} # Store extracted assembly segments by marker ID
         self.marker_counter = 0   # Counter for generating unique block markers
         
-    def add_header(self, header_name: str):
-        """Add header file for C compilation"""
-        if header_name not in self.headers:
-            self.headers.append(header_name)
-            print_info(f"Added header: {header_name}")
+    def add_header(self, header_name: str, use_angle: bool = False):
+        """Add header file for C compilation.
+
+        header_name: bare header (e.g. math.h or mylib.h or windows.h)
+        use_angle: when True emit #include <header_name>, otherwise #include "header_name"
+        """
+        # Avoid duplicates by header name
+        for (h, ua) in self.headers:
+            if h == header_name:
+                # already present; keep existing use_angle value
+                return
+
+        self.headers.append((header_name, use_angle))
+        print_info(f"Added header: {header_name} (use_angle={use_angle})")
         
     def set_casm_variables(self, variables: dict):
         """Set CASM variables for C code access"""
@@ -143,6 +155,20 @@ class CCodeProcessor:
         self._extract_c_variables(processed_code)
         
         return processed_code
+
+    def _get_var_label(self, name: str) -> str:
+        """Return the assembler label for a CASM variable name.
+
+        If the variable was discovered in self.casm_variables, return its
+        configured 'label'. Otherwise fall back to the predictable
+        'var_<name>' form.
+        """
+        if name in self.casm_variables:
+            info = self.casm_variables[name]
+            if isinstance(info, dict) and 'label' in info:
+                return info['label']
+            return info
+        return f'var_{name}'
     
     def _extract_c_variables(self, c_code: str):
         """Extract C variable declarations for CASM access"""
@@ -197,8 +223,10 @@ class CCodeProcessor:
                         label = var_info
                     
                     # Declare with both the CASM name and the label for compatibility
-                    f.write(f'extern {var_type} {label};\n')
-                    f.write(f'#define {var_name} {label}\n')  # Allow C code to use CASM variable names
+                        f.write(f'extern {var_type} {label};\n')
+                        # Allow C code to use CASM variable names (both `name` and `var_name`)
+                        f.write(f'#define {var_name} {label}\n')
+                        f.write(f'#define var_{var_name} {label}\n')
                 
                 f.write('\n')
                 
@@ -465,15 +493,15 @@ class CCodeProcessor:
                 return [
                     f"    ; {line}",
                     f"    mov eax, {value}",
-                    f"    mov [var_{left}], eax"
+                        f"    mov [" + self._get_var_label(left) + "], eax"
                 ]
             except ValueError:
                 # Check if it's a simple variable reference
                 if right.isidentifier():
                     return [
                         f"    ; {line}",
-                        f"    mov eax, [var_{right}]",
-                        f"    mov [var_{left}], eax"
+                        f"    mov eax, [" + self._get_var_label(right) + "]",
+                        f"    mov [" + self._get_var_label(left) + "], eax"
                     ]
                 else:
                     # Complex expression - generate comment only for now
@@ -577,7 +605,7 @@ class CCodeProcessor:
                 return [
                     f"    ; Declaration: {line}",
                     f"    mov eax, {init_val}",
-                    f"    mov [var_{var_name}], eax"
+                    f"    mov [" + self._get_var_label(var_name) + "], eax"
                 ]
             else:
                 return [
@@ -726,12 +754,18 @@ class CCodeProcessor:
                 '#include <string.h>',
             ])
         
-        # Add extern headers (from @extern directives)
-        for header in self.headers:
-            if header.endswith('.h'):
-                header_lines.append(f'#include "{header}"')
+        # Add extern headers (from extern directives). Headers are stored as
+        # (header_name, use_angle) tuples.
+        for header_entry in self.headers:
+            if isinstance(header_entry, tuple):
+                header, use_angle = header_entry
             else:
+                header, use_angle = header_entry, False
+
+            if use_angle:
                 header_lines.append(f'#include <{header}>')
+            else:
+                header_lines.append(f'#include "{header}"')
         
         header_lines.append('')
         
@@ -762,8 +796,11 @@ class CCodeProcessor:
                 c_type = 'int'  # Default type
                 label = var_info
             
-            # Declare with both the CASM name and the label for compatibility
+            # Declare the assembler symbol as extern and add defines so C
+            # code can reference either the CASM name or the var_ prefixed name.
             header_lines.append(f'extern {c_type} {label};')
+            header_lines.append(f'#define {var_name} {label}')
+            header_lines.append(f'#define var_{var_name} {label}')
         
         if self.casm_variables:
             header_lines.append('')
@@ -823,16 +860,16 @@ class CCodeProcessor:
         
         try:
             result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print_success(f"GCC compilation successful")
-            if result.stdout:
-                print_info(f"GCC stdout: {result.stdout}")
-            if result.stderr:
-                print_info(f"GCC stderr: {result.stderr}")
+            print_success("GCC compilation successful")
         except subprocess.CalledProcessError as e:
-            print_error(f"Error compiling combined C code: {e}")
-            print_error(f"GCC stdout: {e.stdout}")
-            print_error(f"GCC stderr: {e.stderr}")
-            return {}
+            # Build an informative message and raise so the caller can print it once
+            stderr = e.stderr.strip() if e.stderr else ''
+            stdout = e.stdout.strip() if e.stdout else ''
+            msg = f"GCC failed with exit code {e.returncode}" + (f": {stderr}" if stderr else '')
+            if stdout and not stderr:
+                msg += f" (stdout: {stdout})"
+            # Raise a runtime error so upstream build stops
+            raise RuntimeError(msg)
         
         # Read and parse assembly
         try:

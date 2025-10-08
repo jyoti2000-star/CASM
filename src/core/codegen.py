@@ -6,6 +6,7 @@ Converts AST to x86-64 Windows assembly
 """
 
 from typing import List, Dict, Set
+import secrets
 import re
 from .ast_nodes import *
 from ..utils.formatter import formatter
@@ -24,6 +25,9 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.variable_info = {}  # Store complete variable information for C integration
         self.label_counter = 0
         self.used_functions = set()
+        # A per-run random salt to make labels and var names less predictable
+        # (used to generate var_<name>_salt and other labels)
+        self.naming_salt = secrets.token_hex(4)
     
     def generate(self, ast: ProgramNode) -> str:
         """Generate complete assembly program"""
@@ -90,14 +94,16 @@ class AssemblyCodeGenerator(ASTVisitor):
             lines.append("section .data")
             lines.extend(self.data_section)
             lines.append("")
-            print(f"[DEBUG] Added .data section with {len(self.data_section)} items")
+            from ..utils.colors import print_debug
+            print_debug(f"Added .data section with {len(self.data_section)} items")
         
         # BSS section (uninitialized data)
         if hasattr(self, 'bss_section') and self.bss_section:
             lines.append("section .bss")
             lines.extend(self.bss_section)
             lines.append("")
-            print(f"[DEBUG] Added .bss section with {len(self.bss_section)} items")
+            from ..utils.colors import print_debug
+            print_debug(f"Added .bss section with {len(self.bss_section)} items")
         
         # Text section
         lines.append("section .text")
@@ -151,7 +157,8 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_var_declaration(self, node: VarDeclarationNode):
         """Visit variable declaration with type support"""
-        label = f"var_{node.name}"
+        # Use randomized var label so it's harder to predict
+        label = f"var_{node.name}_{self.naming_salt}"
         self.variable_labels[node.name] = label
         
         # Store complete variable information for C integration
@@ -165,14 +172,15 @@ class AssemblyCodeGenerator(ASTVisitor):
         var_type = node.var_type
         var_size = node.size
         value = node.value
-        
-        print(f"[DEBUG] Processing variable: {node.name}, type: {var_type}, size: {var_size}, value: '{value}'")
+
+        from ..utils.colors import print_debug
+        print_debug(f"Processing variable: {node.name}, type: {var_type}, size: {var_size}, value: '{value}'")
         
         if var_type == "buffer" and var_size:
             # Buffers go in .bss section (uninitialized data)
             self.bss_section.append(f"    {label} resb {var_size}  ; buffer[{var_size}]")
             self.text_section.append(f"    ; Buffer: {node.name}[{var_size}] in .bss")
-            print(f"[DEBUG] Added buffer to bss_section: {label} resb {var_size}")
+            print_debug(f"Added buffer to bss_section: {label} resb {var_size}")
             
         elif var_type == "int":
             # Initialize to 0 in data section, then calculate value if it's an expression
@@ -232,7 +240,7 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def _generate_assignment_code(self, var_name: str, expression: str):
         """Generate assembly code for variable assignment with expression evaluation (supports parentheses and precedence)"""
-        var_label = self.variable_labels.get(var_name, f"var_{var_name}")
+        var_label = self._get_var_label(var_name)
 
         # Tokenize the expression
         def tokenize(expr):
@@ -339,7 +347,8 @@ class AssemblyCodeGenerator(ASTVisitor):
                     # Always load variable into register, never memory-to-memory
                     self.text_section.append(f"    mov {reg}, dword [rel {self.variable_labels[node]}]")
                 else:
-                    self.text_section.append(f"    mov {reg}, dword [rel var_{node}]")
+                    var_label = self._get_var_label(node)
+                    self.text_section.append(f"    mov {reg}, dword [rel {var_label}]")
                 return reg
 
         def eval_node_to_reg(node, reg):
@@ -363,9 +372,9 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_if(self, node: IfNode):
         """Visit if statement with proper nested if handling"""
-        if_id = self._generate_unique_id()
-        end_label = f"if_end_{if_id}"
-        else_label = f"else_{if_id}" if node.else_body else None
+        # Generate randomized labels for this if/else block
+        end_label = self._generate_label("if_end")
+        else_label = self._generate_label("else") if node.else_body else None
         
         self.text_section.append(f"    ; if {node.condition}")
         
@@ -393,9 +402,9 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_while(self, node: WhileNode):
         """Visit while loop"""
-        while_id = self._generate_unique_id()
-        start_label = f"while_start_{while_id}"
-        end_label = f"while_end_{while_id}"
+        # Generate randomized labels for while loop
+        start_label = self._generate_label("while_start")
+        end_label = self._generate_label("while_end")
         
         self.text_section.append(f"{start_label}:")
         self.text_section.append(f"    ; while {node.condition}")
@@ -413,11 +422,16 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_for(self, node: ForNode):
         """Visit for loop (fix: declare and update loop variable, avoid label redefinition)"""
-        for_loop_id = self._generate_unique_id()
-        start_label = f"for_start_{for_loop_id}"
-        end_label = f"for_end_{for_loop_id}"
-        counter_var = f"for_counter_{for_loop_id}"
-        loop_var = f"var_{node.variable}"
+        # Generate labels and counter variable with randomized salt
+        start_label = self._generate_label("for_start")
+        end_label = self._generate_label("for_end")
+        counter_var = self._generate_label("for_counter")
+
+        # Use existing variable label if declared, otherwise create a new var label
+        if node.variable in self.variable_labels:
+            loop_var = self.variable_labels[node.variable]
+        else:
+            loop_var = f"var_{node.variable}_{self.naming_salt}"
 
         self.text_section.append(f"    ; for {node.variable} in range({node.count})")
 
@@ -426,7 +440,8 @@ class AssemblyCodeGenerator(ASTVisitor):
             self.data_section.append(f"    {counter_var} dd 0")
         if loop_var not in self.variable_labels.values():
             self.data_section.append(f"    {loop_var} dd 0")
-        self.variable_labels[node.variable] = loop_var
+        # Ensure mapping for loop variable exists
+        self.variable_labels.setdefault(node.variable, loop_var)
 
         # Initialize counter and loop variable
         self.text_section.append(f"    mov dword [rel {counter_var}], 0")
@@ -442,7 +457,8 @@ class AssemblyCodeGenerator(ASTVisitor):
                 count_label = self.variable_labels[node.count]
                 self.text_section.append(f"    cmp eax, dword [rel {count_label}]")
             else:
-                self.text_section.append(f"    cmp eax, dword [rel var_{node.count}]")
+                count_label = self._get_var_label(node.count)
+                self.text_section.append(f"    cmp eax, dword [rel {count_label}]")
         self.text_section.append(f"    jge {end_label}")
 
 
@@ -531,7 +547,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Generate labels
         format_label = self._generate_label("fmt")
-        var_label = self.variable_labels.get(node.variable, f"var_{node.variable}")
+        var_label = self._get_var_label(node.variable)
         
         # Add format string to data section
         self.data_section.append(f'    {format_label} db "{format_str}", 0')
@@ -557,7 +573,9 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_c_code_block(self, node: CCodeBlockNode):
         """Visit C code block"""
-        print_info(f"Processing C code: '{node.c_code}'")
+        # Processing logs for embedded C are noisy; use debug-only output
+        from ..utils.colors import print_debug
+        print_debug(f"Processing C code: '{node.c_code}'")
         
         if not node.c_code.strip():
             # Empty C code block
@@ -587,8 +605,10 @@ class AssemblyCodeGenerator(ASTVisitor):
         except Exception as e:
             print_error(f"C compilation error: {e}")
             self.text_section.append(f"    ; C code error: {node.c_code}")
-        
-        print_success(f"C code collected: {node.c_code}")
+
+        # Debug-only message to indicate collection
+        from ..utils.colors import print_debug
+        print_debug(f"C code collected: {node.c_code}")
     
     def visit_asm_block(self, node: AsmBlockNode):
         """Visit assembly block"""
@@ -612,64 +632,67 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.text_section.append("    ; === End Assembly Block ===")
     
     def finalize_c_code(self):
-        """Compile all C code and replace placeholders with actual assembly"""
-        try:
-            from ..utils.c_processor import c_processor
-            
-            print_info(f"Finalizing C code: {len(c_processor.c_code_blocks)} blocks collected")
-            
-            # Compile all collected C code blocks
-            assembly_segments = c_processor.compile_all_c_code()
-            
-            if assembly_segments:
-                print_success(f"Compiled {len(assembly_segments)} C code blocks")
-                
-                # Add string constants to data section if available
-                if '_STRING_CONSTANTS' in assembly_segments:
-                    string_constants = assembly_segments['_STRING_CONSTANTS']
-                    if string_constants.strip():
-                        print_info("Adding C string constants to data section")
-                        # Add string constants to the beginning of data section
-                        string_lines = string_constants.split('\n')
-                        for line in reversed(string_lines):
-                            if line.strip():
-                                self.data_section.insert(0, f"    {line.strip()}")
-                    del assembly_segments['_STRING_CONSTANTS']
-                
-                # Replace placeholders with actual assembly
-                updated_sections = []
-                for line in self.text_section:
-                    if "{CASM_BLOCK_" in line and "} ; Placeholder for assembly" in line:
-                        # Extract marker from placeholder
-                        marker_match = re.search(r'\{(CASM_BLOCK_\d+)\}', line)
-                        if marker_match:
-                            marker = marker_match.group(1)
-                            if marker in assembly_segments:
-                                # Replace with actual assembly
-                                assembly_code = assembly_segments[marker]
-                                if assembly_code.strip():
-                                    updated_sections.append("    ; Generated assembly for " + marker)
-                                    for asm_line in assembly_code.split('\n'):
-                                        if asm_line.strip():
-                                            updated_sections.append(f"    {asm_line}")
-                                else:
-                                    updated_sections.append("    ; Empty assembly block")
-                            else:
-                                updated_sections.append(f"    ; Assembly not found for {marker}")
+        """Compile all C code and replace placeholders with actual assembly
+
+        Exceptions from the C compilation step are intentionally propagated so the
+        caller can abort the overall build when GCC fails. This avoids writing a
+        potentially broken assembly file when embedded C cannot be compiled.
+        """
+        from ..utils.c_processor import c_processor
+
+        print_info(f"Finalizing C code: {len(c_processor.c_code_blocks)} blocks collected")
+
+        # Compile all collected C code blocks (may raise RuntimeError on failure)
+        assembly_segments = c_processor.compile_all_c_code()
+
+        if not assembly_segments:
+            # No compiled C assembly segments. If there were blocks collected, this
+            # means compilation produced nothing; surface a warning and continue.
+            if c_processor.c_code_blocks:
+                print_warning("No C code blocks were compiled into assembly")
+            return
+
+        print_success(f"Compiled {len(assembly_segments)} C code blocks")
+
+        # Add string constants to data section if available
+        if '_STRING_CONSTANTS' in assembly_segments:
+            string_constants = assembly_segments['_STRING_CONSTANTS']
+            if string_constants.strip():
+                print_info("Adding C string constants to data section")
+                # Add string constants to the beginning of data section
+                string_lines = string_constants.split('\n')
+                for line in reversed(string_lines):
+                    if line.strip():
+                        self.data_section.insert(0, f"    {line.strip()}")
+            del assembly_segments['_STRING_CONSTANTS']
+
+        # Replace placeholders with actual assembly
+        updated_sections = []
+        for line in self.text_section:
+            if "{CASM_BLOCK_" in line and "} ; Placeholder for assembly" in line:
+                # Extract marker from placeholder
+                marker_match = re.search(r'\{(CASM_BLOCK_\d+)\}', line)
+                if marker_match:
+                    marker = marker_match.group(1)
+                    if marker in assembly_segments:
+                        # Replace with actual assembly
+                        assembly_code = assembly_segments[marker]
+                        if assembly_code.strip():
+                            updated_sections.append("    ; Generated assembly for " + marker)
+                            for asm_line in assembly_code.split('\n'):
+                                if asm_line.strip():
+                                    updated_sections.append(f"    {asm_line}")
                         else:
-                            updated_sections.append(line)
+                            updated_sections.append("    ; Empty assembly block")
                     else:
-                        updated_sections.append(line)
-                
-                self.text_section = updated_sections
-                print_success("C code assembly integration complete")
+                        updated_sections.append(f"    ; Assembly not found for {marker}")
+                else:
+                    updated_sections.append(line)
             else:
-                print_warning("No C code blocks to compile")
-                
-        except Exception as e:
-            print_error(f"C code finalization error: {e}")
-            import traceback
-            traceback.print_exc()
+                updated_sections.append(line)
+
+        self.text_section = updated_sections
+        print_success("C code assembly integration complete")
     
     def _fallback_c_processing(self, c_code: str):
         """Fallback processing for C code when GCC compilation fails"""
@@ -705,25 +728,59 @@ class AssemblyCodeGenerator(ASTVisitor):
         header = node.header_name
         print_info(f"Processing extern directive: {header}")
         
-        # Store header for C compilation
+        # If this extern is a C include (e.g. <math.h> or "mylib.h"), forward
+        # it to the C processor so it becomes a #include in the combined C file.
         try:
             from ..utils.c_processor import c_processor
-            c_processor.add_header(header)
+
+            # Normalize header string (strip surrounding whitespace)
+            raw = header.strip() if header is not None else ''
+
+            # If the parser flagged this as a C include, honor it.
+            is_c_include_flag = bool(getattr(node, 'is_c_include', False))
+            use_angle_flag = bool(getattr(node, 'use_angle', False))
+
+            # Heuristic: if the header string contains angle brackets or looks
+            # like an include (e.g. '< math .h>' or '<math.h>'), treat it as
+            # a C include even if the parser didn't set the flag.
+            if (is_c_include_flag) or ('<' in raw or '>' in raw):
+                # Remove angle brackets and extra spaces from header name
+                cleaned = raw.replace('<', '').replace('>', '').replace(' ', '')
+                # If parser suggested use_angle, prefer that; otherwise assume angle when original had <>
+                use_angle = use_angle_flag or ('<' in raw and '>' in raw)
+                c_processor.add_header(cleaned, use_angle=use_angle)
+                # Add a brief comment in assembly that the include was forwarded
+                self.text_section.append(f"    ; forwarded C include: {cleaned}")
+            else:
+                # Treat as assembler extern symbol and emit an extern directive
+                self.text_section.append(f"    extern {raw}")
         except ImportError:
             print_warning("C processor not available for header processing")
-        
-        # Add as comment in assembly
-        self.text_section.append(f"    ; extern {header}")
+            # Fallback: always emit as assembler extern
+            self.text_section.append(f"    extern {header}")
     
     def _generate_label(self, prefix: str) -> str:
         """Generate unique label"""
         self.label_counter += 1
-        return f"{prefix}_{self.label_counter}"
+        # Include naming salt so labels are randomized per-run
+        return f"{prefix}_{self.label_counter}_{self.naming_salt}"
     
     def _generate_unique_id(self) -> int:
         """Generate unique ID for complex constructs like if/while/for"""
         self.label_counter += 1
         return self.label_counter
+
+    def _get_var_label(self, name: str) -> str:
+        """Return the assembly label for a given CASM variable name.
+
+        If the variable was declared, return the canonical label. Otherwise
+        fall back to the predictable var_<name>_salt form so references remain
+        consistent with randomized naming.
+        """
+        if name in self.variable_labels:
+            return self.variable_labels[name]
+        # fallback predictable form with salt
+        return f"var_{name}_{self.naming_salt}"
     
     def _evaluate_condition_with_jump(self, condition: str):
         """Evaluate a condition and return the appropriate jump instruction to skip the block"""
@@ -746,7 +803,8 @@ class AssemblyCodeGenerator(ASTVisitor):
                     self.text_section.append(f"    mov eax, dword [rel {var_label}]")
                 else:
                     # Try to treat as variable name
-                    self.text_section.append(f"    mov eax, dword [rel var_{left}]")
+                    left_label = self._get_var_label(left)
+                    self.text_section.append(f"    mov eax, dword [rel {left_label}]")
                 
                 # Compare with right operand
                 if right.isdigit():
@@ -756,7 +814,8 @@ class AssemblyCodeGenerator(ASTVisitor):
                     self.text_section.append(f"    cmp eax, dword [rel {var_label}]")
                 else:
                     # Try to treat as variable name
-                    self.text_section.append(f"    cmp eax, dword [rel var_{right}]")
+                    right_label = self._get_var_label(right)
+                    self.text_section.append(f"    cmp eax, dword [rel {right_label}]")
                 
                 # Return the opposite jump to skip the if block when condition is false
                 if op == '<':
@@ -783,7 +842,8 @@ class AssemblyCodeGenerator(ASTVisitor):
             self.text_section.append(f"    cmp eax, 0")
         else:
             # Try to treat as variable name
-            self.text_section.append(f"    mov eax, dword [rel var_{condition}]")
+            cond_label = self._get_var_label(condition)
+            self.text_section.append(f"    mov eax, dword [rel {cond_label}]")
             self.text_section.append(f"    cmp eax, 0")
         
         # For simple variable/number checks, jump if zero (false)
@@ -811,7 +871,8 @@ class AssemblyCodeGenerator(ASTVisitor):
                     self.text_section.append(f"    mov eax, dword [rel {var_label}]")
                 else:
                     # Try to treat as variable name
-                    self.text_section.append(f"    mov eax, dword [rel var_{left}]")
+                    left_label = self._get_var_label(left)
+                    self.text_section.append(f"    mov eax, dword [rel {left_label}]")
                 
                 # Compare with right operand
                 if right.isdigit():
@@ -821,7 +882,8 @@ class AssemblyCodeGenerator(ASTVisitor):
                     self.text_section.append(f"    cmp eax, dword [rel {var_label}]")
                 else:
                     # Try to treat as variable name
-                    self.text_section.append(f"    cmp eax, dword [rel var_{right}]")
+                    right_label = self._get_var_label(right)
+                    self.text_section.append(f"    cmp eax, dword [rel {right_label}]")
                 
                 # The comparison sets flags, caller will use je/jne/jg/jl etc.
                 return
@@ -837,5 +899,6 @@ class AssemblyCodeGenerator(ASTVisitor):
             self.text_section.append(f"    cmp eax, 0")
         else:
             # Try to treat as variable name
-            self.text_section.append(f"    mov eax, dword [rel var_{condition}]")
+            cond_label = self._get_var_label(condition)
+            self.text_section.append(f"    mov eax, dword [rel {cond_label}]")
             self.text_section.append(f"    cmp eax, 0")

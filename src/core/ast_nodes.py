@@ -126,8 +126,16 @@ class AsmBlockNode(ASTNode):
 
 @dataclass
 class ExternDirectiveNode(ASTNode):
-    """External header directive"""
+    """External directive for assembler externs or C includes
+
+    header_name: the bare name (e.g. math.h or WriteConsoleA)
+    is_c_include: True when this should be forwarded to C (include),
+                  False when this is an assembler extern symbol
+    use_angle: when is_c_include is True, True for <> style, False for quoted includes
+    """
     header_name: str
+    is_c_include: bool = False
+    use_angle: bool = False
     
     def accept(self, visitor):
         return visitor.visit_extern_directive(self)

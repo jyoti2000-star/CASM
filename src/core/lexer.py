@@ -28,15 +28,11 @@ class CASMLexer:
             'endfor': TokenType.ENDFOR,
             'print': TokenType.PRINT,
             'scan': TokenType.SCAN,
-            '_c_': TokenType.C_CODE_BLOCK,  # C code block start marker
-            '_endc_': TokenType.C_CODE_END, # C code block end marker
-            '_asm_': TokenType.ASM_BLOCK,   # Assembly block start marker
-            '_endasm_': TokenType.ASM_END,  # Assembly block end marker
+            'var': TokenType.VAR,
             
             # Data types with @ prefix (handled separately)
             'int': TokenType.INT_TYPE,
             'str': TokenType.STR_TYPE,
-            'string': TokenType.STR_TYPE,  # Alternative string type name
             'bool': TokenType.BOOL_TYPE,
             'float': TokenType.FLOAT_TYPE,
             'buffer': TokenType.BUFFER_TYPE,
@@ -59,7 +55,7 @@ class CASMLexer:
             ('*', TokenType.MULTIPLY),
             ('/', TokenType.DIVIDE),
             ('%', TokenType.MODULO),
-            ('@', TokenType.AT_SYMBOL),
+            # removed '@' legacy operator
         ]
         
         # Punctuation
@@ -99,6 +95,18 @@ class CASMLexer:
     
     def _tokenize_line(self, line: str) -> List[Token]:
         """Tokenize a single line"""
+        # Heuristic: if a line looks like C (ends with ';', starts with '#',
+        # or uses C-style control constructs with parentheses), return a
+        # single C_INLINE token so the parser can collect contiguous C lines.
+        stripped_line = line.strip()
+        if stripped_line:
+            # C preprocessor or statement ending with semicolon
+            if stripped_line.startswith('#') or stripped_line.endswith(';'):
+                return [Token(TokenType.C_INLINE, stripped_line, self.current_line, 1, line)]
+            # Do not treat C-style 'for/if/while(...)' as C here; loops are
+            # CASM constructs and should be tokenized as such. C statements
+            # remain only those ending with ';' or starting with '#'.
+
         tokens = []
         i = 0
         
@@ -231,12 +239,7 @@ class CASMLexer:
         i = start
         result = ""
         
-        # Special case for %! - extract exactly two characters
-        if i + 1 < len(line) and line[i:i+2] == '%!':
-            result = '%!'
-            i += 2
-            self.current_column += 2
-            return result, i
+        # No legacy '%!' handling - legacy markers removed
         
         while i < len(line):
             char = line[i]

@@ -8,7 +8,7 @@ Intelligently organizes combined C and assembly code while preserving structure
 import re
 from typing import List, Dict, Tuple, Optional
 from .ast_nodes import *
-from ..utils.colors import print_info, print_success, print_warning
+from ..utils.colors import print_info, print_success, print_warning, print_debug
 
 class CASMPrettyPrinter:
     """Context-aware pretty printer for CASM assembly output"""
@@ -78,19 +78,35 @@ class CASMPrettyPrinter:
                 output.append(f"extern {func}")
         
         # Debug: force at least some extern declarations for testing
+        from ..utils.colors import print_debug
         if not existing_externs:
-            print(f"[DEBUG] No existing externs found, adding all required functions: {required_functions}")
+            print_debug(f"No existing externs found, adding all required functions: {required_functions}")
         else:
-            print(f"[DEBUG] Found existing externs: {existing_externs}")
+            print_debug(f"Found existing externs: {existing_externs}")
         
         output.append("")
         
         # Data section - organized
+        # Detect string declarations that were mistakenly placed in .bss and
+        # move them into the data section so strings are defined in .data.
+        misplaced_strings = []
+        if sections.get('bss'):
+            for line in sections['bss']:
+                stripped = line.strip()
+                if ' db ' in stripped and (stripped.startswith('str_') or stripped.startswith('LC')):
+                    misplaced_strings.append(f"    {stripped}")
+
         data_section = self._format_data_section(sections['data'])
+        # If we have misplaced strings, insert them after the 'section .data' header
+        if misplaced_strings:
+            insert_index = 1 if data_section and data_section[0].strip().startswith('section .data') else 0
+            for i, string_line in enumerate(misplaced_strings):
+                data_section.insert(insert_index + i, string_line)
+
         output.extend(data_section)
         output.append("")
-        
-        # BSS section - uninitialized data
+
+        # BSS section - uninitialized data (string lines removed by formatter)
         if sections.get('bss') and any(line.strip() for line in sections['bss']):
             output.extend(self._format_bss_section(sections['bss']))
             output.append("")
@@ -127,7 +143,7 @@ class CASMPrettyPrinter:
                     visit_statements(stmt.body)
         
         visit_statements(ast.statements)
-        print_info(f"Collected {len(self.collected_strings)} string literals")
+        print_debug(f"Collected {len(self.collected_strings)} string literals")
     
     def _collect_for_loop_counters(self, ast: ProgramNode):
         """Pre-scan AST to collect all for loop counter variables"""
@@ -153,7 +169,7 @@ class CASMPrettyPrinter:
                     visit_statements(stmt.body)
         
         visit_statements(ast.statements)
-        print_info(f"Pre-collected {len(self.extra_variables)} for loop counters")
+        print_debug(f"Pre-collected {len(self.extra_variables)} for loop counters")
     
     def _extract_metadata(self, assembly_code: str):
         """Extract metadata from the assembly code"""
@@ -165,7 +181,7 @@ class CASMPrettyPrinter:
                 self._extract_string_constant(line)
             
             # Extract C variable references
-            if 'extern' in line and 'var_' in line:
+            if 'extern' in line:
                 self._extract_variable_reference(line)
     
     def _extract_string_constant(self, line: str):
@@ -178,15 +194,23 @@ class CASMPrettyPrinter:
     
     def _extract_variable_reference(self, line: str):
         """Extract variable references from extern declarations"""
-        # Match: extern int var_number;
-        match = re.search(r'extern\s+(\w+)\s+(var_\w+)', line)
+        # Match: extern <type> <label>;
+        match = re.search(r'extern\s+(\w+)\s+(\w+)', line)
         if match:
             var_type, var_label = match.groups()
-            # Find original CASM variable name
+            # Find original CASM variable name by matching label values
             for casm_var, label_info in self.variable_map.items():
+                # label_info may be a dict or a string
                 if isinstance(label_info, dict) and label_info.get('label') == var_label:
+                    matched = casm_var
+                elif isinstance(label_info, str) and label_info == var_label:
+                    matched = casm_var
+                else:
+                    matched = None
+
+                if matched:
                     self.c_variables[var_label] = {
-                        'casm_name': casm_var,
+                        'casm_name': matched,
                         'type': var_type,
                         'label': var_label
                     }
@@ -250,6 +274,13 @@ class CASMPrettyPrinter:
                 current_section = 'text'
                 sections['text'].append(line)
             elif current_section in sections:
+                # If we're in the bss section but see a string/data declaration
+                # that looks like an initialized string (db), treat it as data
+                # so it will be emitted under section .data instead of .bss.
+                if current_section == 'bss':
+                    if ' db ' in stripped and (stripped.startswith('str_') or stripped.startswith('LC')):
+                        sections['data'].append(line)
+                        continue
                 sections[current_section].append(line)
             else:
                 # Default to header if no section is set
@@ -290,10 +321,11 @@ class CASMPrettyPrinter:
                 output.append(f"extern {func}")
         
         # Debug: force at least some extern declarations for testing
+        from ..utils.colors import print_debug
         if not existing_externs:
-            print(f"[DEBUG] No existing externs found, adding all required functions: {required_functions}")
+            print_debug(f"No existing externs found, adding all required functions: {required_functions}")
         else:
-            print(f"[DEBUG] Found existing externs: {existing_externs}")
+            print_debug(f"Found existing externs: {existing_externs}")
         
         output.append("")
         
@@ -439,14 +471,15 @@ class CASMPrettyPrinter:
     def _format_text_section_with_context(self, sections: Dict, ast: ProgramNode) -> List[str]:
         """Format text section with context-aware C code placement"""
         # Debug: Check what's in the text section
-        print(f"[DEBUG] Text section has {len(sections.get('text', []))} lines")
+        from ..utils.colors import print_debug
+        print_debug(f"Text section has {len(sections.get('text', []))} lines")
         if sections.get('text'):
-            print(f"[DEBUG] First few text lines: {sections['text'][:5]}")
-        
+            print_debug(f"First few text lines: {sections['text'][:5]}")
+
         # Check if we have C code placeholders
         text_content = sections.get('text', [])
         has_placeholders = any('CASM_BLOCK_' in line and 'Placeholder' in line for line in text_content)
-        print(f"[DEBUG] Has C placeholders: {has_placeholders}")
+        print_debug(f"Has C placeholders: {has_placeholders}")
         
         # Use the original text section but insert C code where needed
         if 'text' in sections and sections['text']:
@@ -469,12 +502,14 @@ class CASMPrettyPrinter:
                     formatted.append(line)
             
             # Remove duplicate labels from the formatted assembly
-            print("[DEBUG] About to remove duplicate labels")
+            from ..utils.colors import print_debug
+            print_debug("About to remove duplicate labels")
             cleaned_assembly = self._remove_duplicate_labels('\n'.join(formatted))
-            print("[DEBUG] Finished removing duplicate labels")
+            print_debug("Finished removing duplicate labels")
             return cleaned_assembly.split('\n')
         else:
-            print("[DEBUG] No text section found, falling back to AST processing")
+            from ..utils.colors import print_debug
+            print_debug("No text section found, falling back to AST processing")
             # Fallback to AST processing if no original text section
             formatted = []
             formatted.append("section .text")
@@ -521,7 +556,7 @@ class CASMPrettyPrinter:
         
         if isinstance(stmt, VarDeclarationNode):
             # Generate actual variable initialization assembly (remove verbose comments)
-            var_label = f"var_{stmt.name}"
+            var_label = self.variable_map.get(stmt.name, f"var_{stmt.name}")
             try:
                 # Try to parse as integer
                 value = int(stmt.value)
@@ -529,14 +564,14 @@ class CASMPrettyPrinter:
             except ValueError:
                 # Handle variable references or expressions
                 if stmt.value in self.variable_map:
-                    src_label = f"var_{stmt.value}"
+                    src_label = self.variable_map.get(stmt.value, f"var_{stmt.value}")
                     output.append(f"    mov eax, dword [rel {src_label}]")
                     output.append(f"    mov dword [rel {var_label}], eax")
                 # Skip complex expression comments
             
         elif isinstance(stmt, AssignmentNode):
             # Generate assignment assembly
-            var_label = f"var_{stmt.name}"
+            var_label = self.variable_map.get(stmt.name, f"var_{stmt.name}")
             expression = stmt.value.strip()
             
             # Handle simple arithmetic like "i + 1" or "i - 1"
@@ -552,13 +587,15 @@ class CASMPrettyPrinter:
                     elif left.isdigit():
                         output.append(f"    mov eax, {left}")
                     else:
-                        output.append(f"    mov eax, dword [rel var_{left}]")
+                        left_label = self.variable_map.get(left, f"var_{left}")
+                        output.append(f"    mov eax, dword [rel {left_label}]")
                     
                     # Add right operand
                     if right.isdigit():
                         output.append(f"    add eax, {right}")
                     else:
-                        output.append(f"    add eax, dword [rel var_{right}]")
+                        right_label = self.variable_map.get(right, f"var_{right}")
+                        output.append(f"    add eax, dword [rel {right_label}]")
                     
                     # Store result
                     output.append(f"    mov dword [rel {var_label}], eax")
@@ -568,7 +605,7 @@ class CASMPrettyPrinter:
             else:
                 # Variable assignment
                 if expression in self.variable_map:
-                    src_label = f"var_{expression}"
+                    src_label = self.variable_map.get(expression, f"var_{expression}")
                     output.append(f"    mov eax, dword [rel {src_label}]")
                     output.append(f"    mov dword [rel {var_label}], eax")
             
@@ -744,7 +781,7 @@ class CASMPrettyPrinter:
             # Generate consistent format label
             self.control_counter += 1
             format_label = f"fmt_scanf_{self.control_counter}"
-            var_label = f"var_{stmt.variable}"
+            var_label = self.variable_map.get(stmt.variable, f"var_{stmt.variable}")
             
             # Generate scanf call assembly (Windows x64 calling convention)
             output.append(f"    lea rcx, [rel {format_label}]")
@@ -923,7 +960,7 @@ class CASMPrettyPrinter:
                 
                 # Generate assembly for left operand
                 if left in self.variable_map:
-                    var_label = f"var_{left}"
+                    var_label = self.variable_map.get(left, f"var_{left}")
                     asm_lines.append(f"    mov eax, dword [rel {var_label}]")
                 elif left.isdigit():
                     asm_lines.append(f"    mov eax, {left}")
@@ -933,7 +970,7 @@ class CASMPrettyPrinter:
                 
                 # Generate assembly for right operand and comparison
                 if right in self.variable_map:
-                    var_label = f"var_{right}"
+                    var_label = self.variable_map.get(right, f"var_{right}")
                     asm_lines.append(f"    cmp eax, dword [rel {var_label}]")
                 elif right.isdigit():
                     asm_lines.append(f"    cmp eax, {right}")
@@ -945,7 +982,7 @@ class CASMPrettyPrinter:
         
         # Fallback for simple boolean conditions
         if condition in self.variable_map:
-            var_label = f"var_{condition}"
+            var_label = self.variable_map.get(condition, f"var_{condition}")
             asm_lines.append(f"    mov eax, dword [rel {var_label}]")
             asm_lines.append(f"    cmp eax, 0")
         elif condition.isdigit():
@@ -986,7 +1023,8 @@ class CASMPrettyPrinter:
             
             filtered_lines.append(line)
         
-        print_info(f"Removed {duplicate_count} duplicate labels")
+        from ..utils.colors import print_debug
+        print_debug(f"Removed {duplicate_count} duplicate labels")
         return '\n'.join(filtered_lines)
 
 # Global instance
