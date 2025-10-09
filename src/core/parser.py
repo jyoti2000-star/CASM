@@ -175,6 +175,19 @@ class CASMParser:
             elif var_type == "buffer":
                 value = ""
 
+        # Special-case: allow syntax like `var str name 128` to mean a sized
+        # string (size 128) rather than the literal string "128". If the
+        # declared type is a string/buffer and the collected value is a
+        # plain integer, treat it as the size and clear the initial value.
+        if size is None and var_type in ("str", "string", "buffer"):
+            # value may contain spaces; accept purely numeric values
+            try:
+                if value and value.isdigit():
+                    size = int(value)
+                    value = '""'
+            except Exception:
+                pass
+
         return VarDeclarationNode(name, value, var_type, size)
     
     def _parse_extern_directive(self) -> ExternDirectiveNode:

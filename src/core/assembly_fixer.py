@@ -84,6 +84,12 @@ class AssemblyFixer:
                 matches = re.findall(pattern, stripped)
                 for match in matches:
                     self.referenced_labels.add(match)
+
+            # Also detect data labels defined as 'LABEL db ...' or 'LABEL dd ...'
+            m = re.match(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s+(db|dq|dd|resb|times)\b', line)
+            if m:
+                label = m.group(1)
+                self.defined_labels.add(label)
     
     def _fix_data_section_line(self, line: str) -> str:
         """Fix issues in data section lines"""
@@ -106,9 +112,9 @@ class AssemblyFixer:
             line = line.replace('", 10, "", 0', '", 10, 0')
         
         # Fix .LC labels to be global
-        if stripped.startswith('.LC'):
-            # Convert .LC0 db "..." to LC0 db "..." (remove the dot)
-            line = line.replace('.LC', 'LC')
+            if stripped.startswith('.LC'):
+                # Convert .LC0 db "..." to CSTR0 db "..."
+                line = re.sub(r'\.LC(\d+)', r'CSTR\1', line)
         
         return line
     
@@ -127,19 +133,30 @@ class AssemblyFixer:
             line = line.replace('BYTE PTR', 'byte')
         
         # Fix .refptr references - convert to direct variable access
-        if '.refptr.var_' in line:
-            # Convert: mov rax, qword .refptr.var_number[rip]
-            # To: lea rax, [rel var_number]
-            if 'mov' in line and 'qword .refptr.var_' in line:
-                var_match = re.search(r'mov\s+(\w+),\s*qword\s+\.refptr\.(var_\w+)\[rip\]', line)
+        # Handle .refptr references for both old 'var_' prefix and new 'V<number>' labels
+        if '.refptr.' in line:
+            # Convert patterns like: mov rax, qword .refptr.var_name[rip] or .refptr.V1[rip]
+            # into: lea rax, [rel var_name]  or lea rax, [rel V1]
+            # Regex accepts either var_<name> or V<number>
+            if 'mov' in line and 'qword .refptr.' in line:
+                var_match = re.search(r"mov\s+(\w+),\s*qword\s+\.refptr\.((?:var_\w+)|(?:V\d+))\[rip\]", line)
                 if var_match:
                     reg = var_match.group(1)
                     var_name = var_match.group(2)
                     line = f"        lea {reg}, [rel {var_name}]"
+            else:
+                # Also handle other forms like 'lea rax, qword .refptr.V1[rip]' if present
+                var_match2 = re.search(r"(lea|mov)\s+(\w+),\s*(?:qword\s+)?\.refptr\.((?:var_\w+)|(?:V\d+))\[rip\]", line)
+                if var_match2:
+                    instr = var_match2.group(1)
+                    reg = var_match2.group(2)
+                    var_name = var_match2.group(3)
+                    # Normalize to lea reg, [rel VAR]
+                    line = f"        lea {reg}, [rel {var_name}]"
         
         # Fix references to .LC labels (remove the dot) - applies to all lines, including C code blocks
         if '.LC' in line:
-            line = re.sub(r'\.LC(\d+)', r'LC\1', line)
+              line = re.sub(r'\.LC(\d+)', r'CSTR\1', line)
         
         # Fix RIP-relative addressing format for NASM
         if '[rip]' in line:
@@ -169,10 +186,11 @@ class AssemblyFixer:
     
     def _fix_string_references(self, line: str) -> str:
         """Fix undefined string references"""
-        # Check for undefined string references and define them if needed
-        for i in range(10):  # Check str_0 through str_9
-            if f'str_{i}' in line and f'str_{i}' not in self.seen_strings:
-                self.seen_strings.add(f'str_{i}')
+        # Check for undefined string references (STR1..STRN)
+        for m in re.finditer(r'STR(\d+)', line):
+            lbl = m.group(0)
+            if lbl not in self.seen_strings:
+                self.seen_strings.add(lbl)
         
         return line
     
@@ -186,10 +204,10 @@ class AssemblyFixer:
         """Add missing string definitions to data section and fix inconsistent labeling"""
         missing_strings = self.referenced_labels - self.defined_labels
         
-        # Also check for inconsistent str_ numbering
-        str_refs = {label for label in self.referenced_labels if label.startswith('str_')}
-        str_defs = {label for label in self.defined_labels if label.startswith('str_')}
-        
+        # Also check for inconsistent STR numbering
+        str_refs = {label for label in self.referenced_labels if label.startswith('STR')}
+        str_defs = {label for label in self.defined_labels if label.startswith('STR')}
+
         # Check for missing LC constants
         lc_refs = {label for label in self.referenced_labels if label.startswith('LC')}
         lc_defs = {label for label in self.defined_labels if label.startswith('LC')}
@@ -236,10 +254,10 @@ class AssemblyFixer:
                     data_lines = []
                 in_data_section = False
 
-                # Add missing LC constants before text section
-                if missing_lc:
+                # Add missing LC constants and placeholders before text section
+                if missing_lc or missing_strings:
                     result_lines.append("")
-                    result_lines.append("    ; Missing LC constants")
+                    result_lines.append("    ; Missing LC constants / placeholders added by AssemblyFixer")
                     for lc_label in sorted(missing_lc):
                         if lc_label == 'LC0':
                             # Add the floating point constant for 2.0
@@ -247,6 +265,19 @@ class AssemblyFixer:
                             result_lines.append("        dq 2.0  ; 2.0 in double precision")
                         else:
                             result_lines.append(f"    {lc_label} db \"Missing constant {lc_label}\", 0")
+
+                    # Add placeholders for missing V# variables (e.g., V6, V8)
+                    missing_vars = sorted([lbl for lbl in missing_strings if re.match(r'^V\d+$', lbl)])
+                    for v in missing_vars:
+                        result_lines.append(f"    {v} dd 0")
+
+                    # Add extern declarations for missing __imp_* imports
+                    missing_imports = sorted([lbl for lbl in missing_strings if lbl.startswith('__imp_')])
+                    if missing_imports:
+                        result_lines.append("")
+                        result_lines.append("    ; Missing import symbols")
+                        for imp in missing_imports:
+                            result_lines.append(f"    extern {imp}")
 
                 result_lines.append(line)
                 continue
@@ -261,31 +292,25 @@ class AssemblyFixer:
     def _fix_data_section_strings(self, data_lines: List[str], referenced_strings: Set[str]) -> List[str]:
         """Fix string definitions to match references"""
         fixed_lines = []
-        existing_strings = []
-        
-        # Collect existing string definitions
+        existing_map = {}
+
+        # Collect existing string definitions (labels with db/dq/dd)
+        label_db_re = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s+db\s+(.*)")
+
         for line in data_lines:
-            stripped = line.strip()
-            if stripped.startswith('str_') and ' db ' in stripped:
-                # Extract label and content
-                parts = stripped.split(' db ', 1)
-                if len(parts) == 2:
-                    label = parts[0]
-                    content = parts[1]
-                    existing_strings.append((label, content))
-                else:
-                    fixed_lines.append(line)
+            m = label_db_re.match(line)
+            if m:
+                label = m.group(1)
+                content = m.group(2)
+                # Preserve original definition
+                existing_map[label] = content
+                fixed_lines.append(line)
             else:
                 fixed_lines.append(line)
-        
-        # Create new sequential string definitions for all referenced strings
-        for i, ref_str in enumerate(sorted(referenced_strings), 1):
-            if i <= len(existing_strings):
-                # Use existing content with new label
-                _, content = existing_strings[i-1]
-                fixed_lines.append(f'    {ref_str} db {content}')
-            else:
-                # Add placeholder for missing strings
+
+        # Append placeholder definitions only for referenced strings that are not defined
+        for ref_str in sorted(referenced_strings):
+            if ref_str not in existing_map:
                 fixed_lines.append(f'    {ref_str} db "Placeholder string", 0')
         
         return fixed_lines

@@ -20,9 +20,12 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.variable_info = {}  # Store complete variable information for C integration
         self.label_counter = 0
         self.used_functions = set()
-        # A per-run random salt to make labels and var names less predictable
-        # (used to generate var_<name>_salt and other labels)
-        self.naming_salt = secrets.token_hex(4)
+        # Deterministic counters for human-friendly labels
+        self.naming_salt = None
+        self.var_counter = 0
+        self.str_counter = 0
+        self.fmt_counter = 0
+        self.lc_counter = 0
     
     def generate(self, ast: ProgramNode) -> str:
         """Generate complete assembly program"""
@@ -130,7 +133,9 @@ class AssemblyCodeGenerator(ASTVisitor):
             # Get the compiled assembly segments for the pretty printer
             c_assembly_segments = getattr(c_processor, '_last_assembly_segments', {})
             
-            prettified_code = pretty_printer.prettify(assembly_code, ast, self.variable_labels, c_assembly_segments)
+            # Pass existing string label mapping so the pretty printer doesn't
+            # generate duplicate STR labels for the same literals.
+            prettified_code = pretty_printer.prettify(assembly_code, ast, self.variable_labels, c_assembly_segments, existing_string_labels=self.string_labels)
 
             # Dump prettified code to a temp file for debugging inspection
             try:
@@ -172,7 +177,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Collect all string db lines (deduplicated, preserve order)
         string_lines = []
         seen = set()
-        str_re = re.compile(r"^\s*(str_[\w\d_]+\s+db\s+.*)$")
+        str_re = re.compile(r"^\s*(STR[\w\d_]+\s+db\s+.*)$")
         for line in lines:
             m = str_re.match(line)
             if m:
@@ -212,10 +217,12 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_var_declaration(self, node: VarDeclarationNode):
         """Visit variable declaration with type support"""
-        # Use randomized var label so it's harder to predict
-        label = f"var_{node.name}_{self.naming_salt}"
+        # Use deterministic variable labels V1, V2, ... for readability and
+        # to match requested naming scheme.
+        self.var_counter += 1
+        label = f"V{self.var_counter}"
         self.variable_labels[node.name] = label
-        
+
         # Store complete variable information for C integration
         self.variable_info[node.name] = {
             'type': node.var_type,
@@ -269,6 +276,7 @@ class AssemblyCodeGenerator(ASTVisitor):
             
             # Add null terminator and escape sequences
             str_value = str_value.replace('\\n', '", 10, "').replace('\\t', '", 9, "')
+            # Strings get STR# labels
             self.data_section.append(f'    {label} db "{str_value}", 0  ; str {node.name}')
             self.text_section.append(f"    ; Variable: str {node.name} = {value}")
             
@@ -578,13 +586,18 @@ class AssemblyCodeGenerator(ASTVisitor):
             if message.startswith('"') and message.endswith('"'):
                 message = message[1:-1]  # Remove quotes
             
-            # Generate string label
-            string_label = self._generate_label("str")
-            self.string_labels[message] = string_label
-            
-            # Add string to data section with newline
-            escaped_message = message.replace('\\n', '\n').replace('\\t', '\t')
-            self.data_section.append(f'    {string_label} db "{escaped_message}", 10, 0')
+            # Reuse existing label for identical string literals to avoid
+            # duplicate STR labels being emitted multiple times.
+            if message in self.string_labels:
+                string_label = self.string_labels[message]
+            else:
+                # Generate string label
+                string_label = self._generate_label("str")
+                self.string_labels[message] = string_label
+
+                # Add string to data section with newline
+                escaped_message = message.replace('\\n', '\n').replace('\\t', '\t')
+                self.data_section.append(f'    {string_label} db "{escaped_message}", 10, 0')
             
             # Generate printf call (Windows x64 calling convention)
             self.text_section.append(f"    ; println \"{message}\"")
@@ -705,6 +718,26 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Compile all collected C code blocks (may raise RuntimeError on failure)
         assembly_segments = c_processor.compile_all_c_code()
 
+        # If extraction returned nothing, attempt a fallback: read the saved
+        # combined GCC assembly file (if present) and re-run extraction. This
+        # helps in cases where the in-memory segments were not set for some
+        # reason but the raw assembly was saved for debugging.
+        if not assembly_segments:
+            try:
+                out_dir = os.path.join(os.getcwd(), 'output')
+                asm_out = os.path.join(out_dir, 'combined_asm_from_cprocessor.s')
+                if os.path.exists(asm_out):
+                    with open(asm_out, 'r', encoding='utf-8') as _af:
+                        raw_asm = _af.read()
+                    print_info('Attempting fallback extraction from saved combined assembly')
+                    assembly_segments = c_processor._extract_assembly_segments(raw_asm)
+                    # Also extract string constants if present
+                    sc = c_processor._extract_string_constants(raw_asm)
+                    if sc:
+                        assembly_segments['_STRING_CONSTANTS'] = sc
+            except Exception as e:
+                print_warning(f'Fallback assembly extraction failed: {e}')
+
         if not assembly_segments:
             # No compiled C assembly segments. If there were blocks collected, this
             # means compilation produced nothing; surface a warning and continue.
@@ -723,6 +756,7 @@ class AssemblyCodeGenerator(ASTVisitor):
                 string_lines = string_constants.split('\n')
                 for line in reversed(string_lines):
                     if line.strip():
+                        # Strings coming from C processor use CSTR prefix already
                         self.data_section.insert(0, f"    {line.strip()}")
             del assembly_segments['_STRING_CONSTANTS']
 
@@ -830,9 +864,22 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def _generate_label(self, prefix: str) -> str:
         """Generate unique label"""
+        # Deterministic, human-friendly label generation
+        # Special-case common prefixes
+        if prefix.startswith("fmt") or prefix == "fmt_int" or prefix == "fmt_str" or prefix == "fmt":
+            self.fmt_counter += 1
+            return f"FMT{self.fmt_counter - 1 if self.fmt_counter>0 else 0}"
+        if prefix == "str" or prefix.startswith("str"):
+            # STR labels for string literals
+            self.str_counter += 1
+            return f"STR{self.str_counter}"
+        if prefix.startswith("LC") or prefix == "LC":
+            self.lc_counter += 1
+            return f"LC{self.lc_counter - 1}"
+
+        # Generic prefix: use prefix capitalized + counter
         self.label_counter += 1
-        # Include naming salt so labels are randomized per-run
-        return f"{prefix}_{self.label_counter}_{self.naming_salt}"
+        return f"{prefix.upper()}{self.label_counter}"
     
     def _generate_unique_id(self) -> int:
         """Generate unique ID for complex constructs like if/while/for"""
@@ -848,8 +895,12 @@ class AssemblyCodeGenerator(ASTVisitor):
         """
         if name in self.variable_labels:
             return self.variable_labels[name]
-        # fallback predictable form with salt
-        return f"var_{name}_{self.naming_salt}"
+        # Fallback: allocate a new deterministic variable label
+        self.var_counter += 1
+        label = f"V{self.var_counter}"
+        # Ensure mapping for future references
+        self.variable_labels[name] = label
+        return label
     
     def _evaluate_condition_with_jump(self, condition: str):
         """Evaluate a condition and return the appropriate jump instruction to skip the block"""

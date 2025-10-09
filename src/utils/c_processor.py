@@ -21,6 +21,7 @@ class CCodeProcessor:
         # use_angle=False -> #include "header"
         self.headers = []         # List[Tuple[str, bool]]
         self.c_code_blocks = []   # Collect all C code blocks with markers
+        self._raw_c_blocks = []   # Store raw C code for each block (parallel to c_code_blocks)
         self.assembly_segments = {} # Store extracted assembly segments by marker ID
         self.marker_counter = 0   # Counter for generating unique block markers
         
@@ -90,10 +91,11 @@ class CCodeProcessor:
                     var_value = parts[2]
                     # Try to determine type from value
                     var_type = self._infer_variable_type(var_value)
+                    # Use placeholder label; real mapping will be provided by codegen
                     self.casm_variables[var_name] = {
                         'type': var_type,
                         'value': var_value,
-                        'label': f'var_{var_name}'
+                        'label': var_name
                     }
                     print_info(f"Found CASM variable: {var_name} ({var_type}) = {var_value}")
     
@@ -216,11 +218,34 @@ class CCodeProcessor:
                         var_type = 'int'  # Default type
                         label = var_info
                     
-                    # Declare with both the CASM name and the label for compatibility
-                        f.write(f'extern {var_type} {label};\n')
-                        # Allow C code to use CASM variable names (both `name` and `var_name`)
-                        f.write(f'#define {var_name} {label}\n')
-                        f.write(f'#define var_{var_name} {label}\n')
+                    # If this CASM variable is a string/buffer, declare it as an
+                    # array of char (extern char NAME[]) so C will treat the
+                    # symbol as the data label itself. If we declare it as
+                    # 'char *' GCC will assume the symbol is a pointer value
+                    # stored in memory and will generate an extra indirection
+                    # (causing invalid pointer dereferences at runtime).
+                    c_decl = None
+                    vt = var_type.lower() if isinstance(var_type, str) else ''
+                    # If a size is known, declare as an array with that size so
+                    # `sizeof(name)` in C works. Otherwise declare as flexible
+                    # array `extern char name[];` which only provides the symbol
+                    # address but is an incomplete type.
+                    size = None
+                    if isinstance(self.casm_variables.get(var_name), dict):
+                        size = self.casm_variables[var_name].get('size')
+
+                    if 'char' in vt or vt in ('str', 'string', 'buffer'):
+                        if size:
+                            c_decl = f'extern char {label}[{size}];'
+                        else:
+                            c_decl = f'extern char {label}[];'
+                    else:
+                        c_decl = f'extern {var_type} {label};'
+
+                    f.write(c_decl + "\n")
+                    # Allow C code to use CASM variable names (both `name` and `var_name`)
+                    f.write(f'#define {var_name} {label}\n')
+                    f.write(f'#define var_{var_name} {label}\n')
                 
                 f.write('\n')
                 
@@ -358,13 +383,19 @@ class CCodeProcessor:
                             operands = ' '.join(instruction_parts[1:])
                             # Remove platform-specific syntax
                             operands = operands.replace('%', '').replace('$', '')
-                            
+
                             # Handle register names (remove % prefix if present)
                             operands = self._clean_intel_operands(operands)
-                            
+
+                            # Surround each instruction with NOP markers so the C
+                            # block is clearly delimited in the generated asm.
+                            cleaned_lines.append(f"    nop  ; start_c_instr {current_function if current_function else ''}")
                             cleaned_lines.append(f"    {instr} {operands}")
+                            cleaned_lines.append(f"    nop  ; end_c_instr {current_function if current_function else ''}")
                         else:
+                            cleaned_lines.append(f"    nop  ; start_c_instr {current_function if current_function else ''}")
                             cleaned_lines.append(f"    {instr}")
+                            cleaned_lines.append(f"    nop  ; end_c_instr {current_function if current_function else ''}")
                         continue
             
             # If it's a simple line that might be useful, keep it
@@ -664,7 +695,19 @@ class CCodeProcessor:
                     import re
                     cleaned_line = re.sub(r'\.L(\d+)', rf'.{block_id}_L\1', cleaned_line)
                 
-                cleaned_lines.append(cleaned_line)
+                # If this line is a label (.L...) or an assembler label ending with ':' keep as-is
+                s = cleaned_line.strip()
+                if s.startswith('.') and not s.startswith(f'.{block_id}_L'):
+                    # keep other dot directives (they've been largely filtered) as-is
+                    cleaned_lines.append(cleaned_line)
+                elif s.endswith(':') or s.startswith(f'.{block_id}_L'):
+                    # It's a label
+                    cleaned_lines.append(cleaned_line)
+                else:
+                    # Surround each instruction with NOP markers so it's easy to spot C-generated
+                    cleaned_lines.append(f"    nop  ; start_c_instr {block_id}")
+                    cleaned_lines.append(cleaned_line)
+                    cleaned_lines.append(f"    nop  ; end_c_instr {block_id}")
         
         return '\n'.join(cleaned_lines)
     
@@ -792,7 +835,21 @@ class CCodeProcessor:
             
             # Declare the assembler symbol as extern and add defines so C
             # code can reference either the CASM name or the var_ prefixed name.
-            header_lines.append(f'extern {c_type} {label};')
+            # For string/buffer-like CASM variables, declare as an array
+            # (extern char NAME[]) so GCC will treat the symbol as the data
+            # label and not as a pointer stored at that symbol.
+            # Prefer sized array declarations when we know the size so
+            # expressions like sizeof(name) are valid in C.
+            if c_type == 'char*' or c_type == 'char *' or var_type in ('str', 'string', 'buffer'):
+                size = None
+                if isinstance(var_info, dict):
+                    size = var_info.get('size')
+                if size:
+                    header_lines.append(f'extern char {label}[{size}];')
+                else:
+                    header_lines.append(f'extern char {label}[];')
+            else:
+                header_lines.append(f'extern {c_type} {label};')
             header_lines.append(f'#define {var_name} {label}')
             header_lines.append(f'#define var_{var_name} {label}')
         
@@ -812,6 +869,9 @@ class CCodeProcessor:
     asm volatile("{block_id}_END:");
 """
         self.c_code_blocks.append(marked_code)
+        # Keep raw code so we can decide later whether this block is a function
+        # definition (global) or a set of statements to put inside casm_main.
+        self._raw_c_blocks.append(code)
         
         return block_id
     
@@ -830,8 +890,38 @@ class CCodeProcessor:
         
         # Combine all C code into one file
         combined_c = self._generate_header()
+
+        # Decide which raw C blocks are full function definitions.
+        # Use the marked c_code_blocks (which include asm volatile labels)
+        # so that GCC will emit the CASM_BLOCK markers into the assembly.
+        global_functions = []
+        main_statements = []
+
+        func_def_re = re.compile(r'^[a-zA-Z_][\w\s\*]+\s+[a-zA-Z_]\w*\s*\([^\)]*\)\s*\{', re.M)
+
+        raw_blocks = getattr(self, '_raw_c_blocks', [])
+        marked_blocks = getattr(self, 'c_code_blocks', [])
+
+        # Iterate with indices so we can pair raw and marked versions
+        for idx, raw in enumerate(raw_blocks):
+            marked = marked_blocks[idx] if idx < len(marked_blocks) else raw
+            if func_def_re.search(raw):
+                # If it's a full function definition, emit the raw (function) text
+                # directly (we don't want to wrap function definitions in asm markers).
+                global_functions.append(raw)
+            else:
+                # Non-function statements: use the marked version so asm labels
+                # are present for extraction after GCC compilation.
+                main_statements.append(marked)
+
+        # Emit global functions first
+        for gf in global_functions:
+            combined_c += gf + "\n\n"
+
+        # Now emit casm_main containing non-function statements (marked)
         combined_c += "\nvoid casm_main() {\n"
-        combined_c += "".join(self.c_code_blocks)
+        for stmt in main_statements:
+            combined_c += stmt + "\n"
         combined_c += "}\n"
         
         print_info(f"Generated combined C code:\n{combined_c}")
@@ -842,6 +932,15 @@ class CCodeProcessor:
             f.write(combined_c)
         
         print_info(f"Combined C file written to: {c_file}")
+        # Also persist the combined C to the project's output/ for debugging
+        try:
+            import shutil
+            out_dir = os.path.join(os.getcwd(), 'output')
+            os.makedirs(out_dir, exist_ok=True)
+            shutil.copy(c_file, os.path.join(out_dir, 'combined_c_from_cprocessor.c'))
+            print_info(f"Saved combined C to: {os.path.join(out_dir, 'combined_c_from_cprocessor.c')}")
+        except Exception as e:
+            print_warning(f"Could not save combined C file for debugging: {e}")
         
         # Compile to assembly
         asm_file = os.path.join(self.temp_dir, "combined.s")
@@ -871,6 +970,16 @@ class CCodeProcessor:
                 assembly = f.read()
             print_info(f"Read {len(assembly)} characters from assembly file")
             print_info(f"Full assembly output:\n{assembly}")
+            # Persist the raw assembly output for debugging
+            try:
+                out_dir = os.path.join(os.getcwd(), 'output')
+                os.makedirs(out_dir, exist_ok=True)
+                asm_out = os.path.join(out_dir, 'combined_asm_from_cprocessor.s')
+                with open(asm_out, 'w') as af:
+                    af.write(assembly)
+                print_info(f"Saved combined assembly to: {asm_out}")
+            except Exception as e:
+                print_warning(f"Could not save combined assembly for debugging: {e}")
         except Exception as e:
             print_error(f"Error reading assembly file: {e}")
             return {}
@@ -1055,8 +1164,13 @@ class CCodeProcessor:
                     if result_parts:
                         string_content = ', '.join(result_parts)
                     
-                    # Create NASM-style string
-                    string_lines.append(f"    {current_label} db {string_content}")
+                    # Create NASM-style string using CSTR prefix instead of LC
+                    # Convert a label like .LC0 to CSTR0
+                    lbl = current_label.lstrip('.')
+                    if lbl.startswith('LC'):
+                        num = lbl[2:]
+                        lbl = f"CSTR{num}"
+                    string_lines.append(f"    {lbl} db {string_content}")
                     current_label = None
             
             # Handle floating point constants like .LC0
@@ -1064,7 +1178,7 @@ class CCodeProcessor:
                 # This is likely a floating point constant - collect all parts
                 if not hasattr(self, '_current_fp_constant'):
                     self._current_fp_constant = []
-                
+
                 # Convert GCC syntax to NASM syntax
                 if stripped.startswith('.long'):
                     # Extract the value and convert to dd
@@ -1078,10 +1192,15 @@ class CCodeProcessor:
                     if len(parts) >= 2:
                         value = parts[1]
                         self._current_fp_constant.append(f"        dq {value}")
-                
+
                 # Check if we have both parts of a double (two .long entries)
                 if len(self._current_fp_constant) >= 2 or stripped.startswith('.quad'):
-                    string_lines.append(f"    {current_label}:")
+                    # Convert .LC labels to CSTR labels
+                    lbl = current_label.lstrip('.')
+                    if lbl.startswith('LC'):
+                        num = lbl[2:]
+                        lbl = f"CSTR{num}"
+                    string_lines.append(f"    {lbl}:")
                     for part in self._current_fp_constant:
                         string_lines.append(part)
                     self._current_fp_constant = []
