@@ -16,12 +16,15 @@ from src.utils.colors import print_info, print_success, print_final_success, pri
 
 def print_help():
     """Print minimal usage information"""
-    print("python3 casm.py <command> <file> [options]")
+    print(f"casm {Colors.ORANGE}<command>{Colors.RESET} {Colors.RED}<file>{Colors.RESET} {Colors.BLUE}[options]{Colors.RESET}")
     print("")
     print("Commands:")
-    print("  compile <file.casm>  - Compile to executable")
-    print("  asm <file.casm>      - Generate assembly")
-    print("  help                 - Show this help")
+    print(f"  {Colors.ORANGE}compile{Colors.RESET} (or {Colors.ORANGE}c{Colors.RESET}) <file.asm>  - Compile to executable")
+    print(f"  {Colors.ORANGE}asm{Colors.RESET} <file.asm>      - Generate assembly")
+    print("")
+    print("Options:")
+    print(f"  {Colors.ORANGE}-d{Colors.RESET}                - Save combined C and assembly outputs")
+    print(f"  {Colors.ORANGE}help{Colors.RESET}                 - Show this help")
     print("")
     print("")
 def validate_file(file_path: str) -> bool:
@@ -54,6 +57,12 @@ def main():
         sys.exit(1)
     
     input_file = sys.argv[2]
+    # Parse optional flags (simple parser for now)
+    options = sys.argv[3:]
+    debug_save = False
+    for opt in options:
+        if opt == '-d' or opt == '--debug-save':
+            debug_save = True
     
     if not validate_file(input_file):
         sys.exit(1)
@@ -61,8 +70,13 @@ def main():
     # Execute command
     success = False
     
-    if command == 'compile':
+    if command in ('compile', 'c'):
         try:
+            # Allow short alias 'c' for compile (handled by caller); set C processor debug flag
+            from src.utils.c_processor import c_processor
+            # Only enable saving combined C/.s when -d specified
+            c_processor.save_debug = bool(debug_save)
+
             success = compiler.compile_to_executable(input_file, run_after=False)
         except Exception as e:
             print_error(str(e))

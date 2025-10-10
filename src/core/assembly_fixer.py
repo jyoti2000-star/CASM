@@ -45,13 +45,37 @@ class AssemblyFixer:
                 fixed_line = self._fix_data_section_line(line)
             else:
                 fixed_line = self._fix_text_section_line(line)
-            
+
             fixed_lines.append(fixed_line)
-        
+
         # Phase 3: Add missing string definitions
         fixed_lines = self._add_missing_strings(fixed_lines)
-        
+
         result = '\n'.join(fixed_lines)
+
+        # Final global pass: rewrite any remaining memory-to-memory operations
+        # that might have slipped through into safe register-mediated sequences.
+        # Handle patterns like: lea [ rel V11 ] , [ rel V9 ]
+        result = re.sub(r"\blea\s*\[\s*rel\s+(V\d+)\s*\]\s*,\s*\[\s*rel\s+(V\d+)\s*\]",
+            lambda m: f"    lea rax, [rel {m.group(2)}]\n    mov qword [ rel {m.group(1)} ], rax",
+            result)
+
+        # Handle mov with memory source: mov qword [ dst ] , [ rel V# ]
+        result = re.sub(r"\bmov\s*(?P<size>qword|dword|word|byte)?\s*\[\s*(?P<dst>[^\]]+)\s*\]\s*,\s*\[\s*rel\s+(?P<src>V\d+)\s*\]",
+            lambda m: f"    mov {'rax' if (m.group('size')=='qword') else 'eax'}, [ rel {m.group('src')} ]\n    mov { (m.group('size')+' ') if m.group('size') else '' }[ {m.group('dst')} ], {'rax' if (m.group('size')=='qword') else 'eax'}",
+            result)
+
+        # Fix cases where a 64-bit memory store is written from a 32-bit register
+        # (common generator mistake). Convert 'lea eax, [ rel V# ]' -> 'lea rax, [ rel V# ]'
+        # and 'mov qword [ rel V# ], eax' -> 'mov qword [ rel V# ], rax'
+        result = re.sub(r"\blea\s+eax\s*,\s*\[\s*rel\s+(V\d+)\s*\]",
+            lambda m: f"    lea rax, [rel {m.group(1)}]",
+            result)
+
+        result = re.sub(r"\bmov\s+qword\s*\[\s*rel\s+(V\d+)\s*\]\s*,\s*eax",
+            lambda m: f"    mov qword [ rel {m.group(1)} ], rax",
+            result)
+
         print_success("Assembly fixed for NASM compatibility")
         return result
     
@@ -131,6 +155,44 @@ class AssemblyFixer:
             line = line.replace('WORD PTR', 'word')
         if 'BYTE PTR' in line:
             line = line.replace('BYTE PTR', 'byte')
+
+        # Fix memory-to-memory operations which are invalid in x86.
+        # Example incorrect forms we sometimes emit:
+        #   lea [ rel V11 ] , [ rel V9 ]
+        #   mov qword [ rsp + 24 ] , [ rel V11 ]
+        # Convert them into a register-mediated sequence, e.g.:
+        #   lea rax, [rel V9]
+        #   mov qword [ rel V11 ], rax
+        m2m = re.match(r"\s*(?:(?P<size>qword|dword|word|byte)\s+)?(mov|lea)\s+(?P<dst>\[.*?\])\s*,\s*(?P<src>\[.*\])", line, re.I)
+        if m2m:
+            instr = m2m.group(2).lower()
+            size = (m2m.group('size') or '').lower()
+            dst = m2m.group('dst').strip()
+            src = m2m.group('src').strip()
+
+            # Choose appropriate temp register size
+            if size == 'qword':
+                temp_reg = 'rax'
+            else:
+                temp_reg = 'eax'
+
+            # For lea: compute address of src into temp_reg
+            if instr == 'lea':
+                # src is a memory operand like [ rel V9 ] - use it as-is in lea
+                new_lines = []
+                new_lines.append(f"        lea {temp_reg}, {src}")
+                # write temp_reg into dst (use qword for pointers)
+                size_prefix = 'qword ' if size == 'qword' or instr == 'lea' else (size + ' ' if size else '')
+                new_lines.append(f"        mov {size_prefix}{dst}, {temp_reg}")
+                return '\n'.join(new_lines)
+
+            # For mov: move src -> temp_reg, then temp_reg -> dst
+            if instr == 'mov':
+                new_lines = []
+                new_lines.append(f"        mov {temp_reg}, {src}")
+                size_prefix = (size + ' ') if size else ''
+                new_lines.append(f"        mov {size_prefix}{dst}, {temp_reg}")
+                return '\n'.join(new_lines)
         
         # Fix .refptr references - convert to direct variable access
         # Handle .refptr references for both old 'var_' prefix and new 'V<number>' labels

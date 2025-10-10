@@ -96,16 +96,31 @@ class CASMPrettyPrinter:
         # Also scan the assembly for direct call targets (e.g. "call opendir")
         # and add them as externs unless they are defined in the assembly
         # or filtered (V# labels).
-        call_targets = set(re.findall(r"\bcall\s+([A-Za-z_][A-Za-z0-9_]*)\b", assembly_code))
-        # Remove any symbols already defined in the assembly
+        raw_calls = re.findall(r"\bcall\s+([A-Za-z_][A-Za-z0-9_]*)\b", assembly_code)
+        call_targets = set()
+        # Filter out CPU registers and local labels (e.g. rax, rcx, .L1)
+        registers = {
+            'rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
+            'eax','ebx','ecx','edx','esi','edi','ebp','esp',
+            'r8','r9','r10','r11','r12','r13','r14','r15',
+            'r8d','r9d','r10d','r11d','r12d','r13d','r14d','r15d'
+        }
         defined = set(self.existing_labels)
-        for name in sorted(call_targets):
+        for name in raw_calls:
+            lname = name.lower()
+            if lname in registers:
+                continue
+            if re.match(r'^(?:\.?)l\d+$', lname, re.I):
+                continue
             if re.match(r'^V\d+$', name):
                 continue
             if name in seen_syms:
                 continue
             if name in defined:
                 continue
+            call_targets.add(name)
+
+        for name in sorted(call_targets):
             final_externs.append(f"extern {name}")
             seen_syms.add(name)
 
@@ -142,8 +157,25 @@ class CASMPrettyPrinter:
         # Text section with context-aware C code placement
         output.extend(self._format_text_section_with_context(sections, ast))
 
-        # Final normalization: un-indent then indent consistently and tidy spacing
+        # Final normalization: remove internal NOP markers added around
+        # C-generated instructions (these are noise for the user) then
+        # un-indent/indent consistently and tidy spacing.
         final = '\n'.join(output)
+
+        # Remove NOP markers that indicate start/end of C-generated
+        # instructions, e.g. lines like:
+        #     nop  ; start_c_instr CASM_BLOCK_0
+        #     nop  ; end_c_instr CASM_BLOCK_0
+        # These were useful internally but clutter the output.
+        filtered_lines = []
+        for ln in final.split('\n'):
+            s = ln.strip()
+            # match nop followed by a comment containing start_c_instr or end_c_instr
+            if re.match(r'^nop\s*;.*(?:start_c_instr|end_c_instr)\b', s):
+                continue
+            filtered_lines.append(ln)
+
+        final = '\n'.join(filtered_lines)
         final = self._normalize_indentation(final)
         return final
     

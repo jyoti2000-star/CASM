@@ -24,6 +24,9 @@ class CCodeProcessor:
         self._raw_c_blocks = []   # Store raw C code for each block (parallel to c_code_blocks)
         self.assembly_segments = {} # Store extracted assembly segments by marker ID
         self.marker_counter = 0   # Counter for generating unique block markers
+        # When True, persist combined C and assembly files to the project's
+        # output directory for debugging; otherwise don't persist.
+        self.save_debug = False
         
     def add_header(self, header_name: str, use_angle: bool = False):
         """Add header file for C compilation.
@@ -200,12 +203,25 @@ class CCodeProcessor:
                 f.write('#include <stdlib.h>\n')
                 f.write('#include <string.h>\n')
                 
-                # Add extern headers
-                for header in self.headers:
-                    if header.endswith('.h'):
-                        f.write(f'#include "{header}"\n')
+                # Add extern headers. self.headers stores entries as tuples
+                # (header_name, use_angle) where use_angle=True emits
+                # #include <header_name> and use_angle=False emits
+                # #include "header_name". Handle legacy string entries
+                # defensively as well.
+                for header_entry in self.headers:
+                    if isinstance(header_entry, tuple) and len(header_entry) >= 2:
+                        header_name, use_angle = header_entry[0], bool(header_entry[1])
                     else:
-                        f.write(f'#include <{header}>\n')
+                        # Legacy single-string entry: try to infer behavior
+                        header_name = str(header_entry)
+                        use_angle = header_name.startswith('<') and header_name.endswith('>')
+                        # Strip any angle brackets if present
+                        header_name = header_name.replace('<', '').replace('>', '').strip()
+
+                    if use_angle:
+                        f.write(f'#include <{header_name}>\n')
+                    else:
+                        f.write(f'#include "{header_name}"\n')
                 
                 f.write('\n')
                 
@@ -783,27 +799,59 @@ class CCodeProcessor:
                 has_includes = True
                 break
         
-        # Only add standard headers if no includes are present in C blocks
-        if not has_includes:
-            header_lines.extend([
-                '#include <stdio.h>',
-                '#include <stdlib.h>',
-                '#include <string.h>',
-            ])
-        
-        # Add extern headers (from extern directives). Headers are stored as
-        # (header_name, use_angle) tuples.
-        for header_entry in self.headers:
-            if isinstance(header_entry, tuple):
-                header, use_angle = header_entry
-            else:
-                header, use_angle = header_entry, False
+        # Normalize and deduplicate headers. Build a canonical list of
+        # (header_name, use_angle) entries. We also avoid adding standard
+        # headers twice if they appear in self.headers.
+        normalized = []
+        seen = set()
 
-            if use_angle:
-                header_lines.append(f'#include <{header}>')
+        # Process self.headers entries into normalized form
+        for header_entry in self.headers:
+            if isinstance(header_entry, tuple) and len(header_entry) >= 2:
+                header_name, use_angle = header_entry[0], bool(header_entry[1])
             else:
-                header_lines.append(f'#include "{header}"')
-        
+                raw = str(header_entry).strip()
+                use_angle = raw.startswith('<') and raw.endswith('>')
+                header_name = raw.replace('<', '').replace('>', '').strip()
+
+            key = header_name.lower()
+            if key in seen:
+                # If we've already seen this header, prefer angle form if any
+                # existing entry was non-angle and this one requests angle.
+                for i, (hn, ua) in enumerate(normalized):
+                    if hn.lower() == key and (not ua and use_angle):
+                        normalized[i] = (header_name, True)
+                continue
+
+            seen.add(key)
+            normalized.append((header_name, bool(use_angle)))
+
+        # Only add standard headers if no includes are present in the C blocks
+        std_headers = []
+        if not has_includes:
+            std_headers = ['stdio.h', 'stdlib.h', 'string.h']
+
+        # Emit standard headers first, but only if they weren't supplied already
+        for std in std_headers:
+            if std.lower() not in seen:
+                header_lines.append(f'#include <{std}>')
+                seen.add(std.lower())
+
+        # Emit normalized extern headers in the order they were added.
+        # Heuristic: prefer angle-bracket includes for typical system headers
+        # (simple names that end with .h and don't contain path separators).
+        for header_name, use_angle in normalized:
+            # Normalize header name for decision
+            hn = header_name.strip()
+            is_simple_h = bool(re.match(r'^[A-Za-z0-9_\-]+\.h$', hn))
+
+            effective_angle = bool(use_angle) or is_simple_h
+
+            if effective_angle:
+                header_lines.append(f'#include <{hn}>')
+            else:
+                header_lines.append(f'#include "{hn}"')
+
         header_lines.append('')
         
         # Add CASM variable declarations as externals
@@ -937,8 +985,15 @@ class CCodeProcessor:
             import shutil
             out_dir = os.path.join(os.getcwd(), 'output')
             os.makedirs(out_dir, exist_ok=True)
-            shutil.copy(c_file, os.path.join(out_dir, 'combined_c_from_cprocessor.c'))
-            print_info(f"Saved combined C to: {os.path.join(out_dir, 'combined_c_from_cprocessor.c')}")
+            # Only save when explicitly requested
+            if getattr(self, 'save_debug', False):
+                # Use a randomized filename to avoid collisions and leaking
+                # predictable filenames. Use uuid4 hex.
+                import uuid
+                rand = uuid.uuid4().hex[:8]
+                dst_c = os.path.join(out_dir, f'combined_c_from_cprocessor_{rand}.c')
+                shutil.copy(c_file, dst_c)
+                print_info(f"Saved combined C to: {dst_c}")
         except Exception as e:
             print_warning(f"Could not save combined C file for debugging: {e}")
         
@@ -974,10 +1029,13 @@ class CCodeProcessor:
             try:
                 out_dir = os.path.join(os.getcwd(), 'output')
                 os.makedirs(out_dir, exist_ok=True)
-                asm_out = os.path.join(out_dir, 'combined_asm_from_cprocessor.s')
-                with open(asm_out, 'w') as af:
-                    af.write(assembly)
-                print_info(f"Saved combined assembly to: {asm_out}")
+                if getattr(self, 'save_debug', False):
+                    import uuid
+                    rand = uuid.uuid4().hex[:8]
+                    asm_out = os.path.join(out_dir, f'combined_asm_from_cprocessor_{rand}.s')
+                    with open(asm_out, 'w') as af:
+                        af.write(assembly)
+                    print_info(f"Saved combined assembly to: {asm_out}")
             except Exception as e:
                 print_warning(f"Could not save combined assembly for debugging: {e}")
         except Exception as e:

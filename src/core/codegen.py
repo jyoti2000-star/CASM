@@ -245,13 +245,36 @@ class AssemblyCodeGenerator(ASTVisitor):
             print_debug(f"Added buffer to bss_section: {label} resb {var_size}")
             
         elif var_type == "int":
-            # Initialize to 0 in data section, then calculate value if it's an expression
-            self.data_section.append(f"    {label} dd 0  ; int {node.name}")
-            self.text_section.append(f"    ; Variable: int {node.name} = {value}")
-            
-            # Handle initialization expression
-            if value and value.strip() and value.strip() != "0":
-                self._generate_assignment_code(node.name, value.strip())
+            # If value is a simple integer literal (decimal, hex, negative),
+            # emit it directly in the data section. Otherwise initialize to
+            # zero and generate runtime assignment code for expressions.
+            raw_value = (value or "").strip()
+            # Normalize a common lexer artifact where negative numbers are
+            # tokenized as '-' and '1' separately, resulting in values like
+            # '- 1' or '- 0x1'. Collapse these into a single token '-1' or
+            # '-0x1' so int(..., 0) recognizes hex and decimal negatives.
+            import re as _re
+            m = _re.match(r'^([+-])\s*(0x[0-9a-fA-F]+|\d+)$', raw_value)
+            if m:
+                raw_value = m.group(1) + m.group(2)
+            emitted = False
+            if raw_value and raw_value != "0":
+                try:
+                    # int(..., 0) accepts 0x... hex and decimal, and negatives
+                    _ = int(raw_value, 0)
+                    self.data_section.append(f"    {label} dd {raw_value}  ; int {node.name}")
+                    self.text_section.append(f"    ; Variable: int {node.name} = {value}")
+                    emitted = True
+                except Exception:
+                    # Not a simple literal; fall back to default and emit assignment code
+                    pass
+
+            if not emitted:
+                self.data_section.append(f"    {label} dd 0  ; int {node.name}")
+                self.text_section.append(f"    ; Variable: int {node.name} = {value}")
+                # Handle initialization expression (only when non-empty and not literal zero)
+                if raw_value and raw_value != "0":
+                    self._generate_assignment_code(node.name, raw_value)
             
         elif var_type == "bool":
             bool_value = 1 if value.lower() in ['true', '1', 'yes'] else 0
@@ -633,7 +656,29 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_assembly(self, node: AssemblyNode):
         """Visit raw assembly line"""
-        self.text_section.append(f"    {node.code}")
+        # Attempt to map CASM variable names to their V# labels inside raw
+        # assembly lines so emitted assembly references the data labels.
+        line = node.code
+        import re as _re
+
+        var_names = list(self.variable_labels.keys())
+        if var_names:
+            # Replace bracketed occurrences first: [name] -> [ rel V# ]
+            line = _re.sub(r"\[\s*(" + "|".join(_re.escape(n) for n in var_names) + r")\s*\]",
+                           lambda m: f"[ rel {self.variable_labels.get(m.group(1))} ]",
+                           line)
+
+            # Replace standalone variable tokens with a plain memory operand
+            # like '[ rel V# ]' so register-sized instructions (mov rcx, [..])
+            # don't get an invalid forced 32-bit operand.
+            pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in var_names) + r")\b")
+            line = pattern.sub(lambda m: f"[ rel {self.variable_labels.get(m.group(1))} ]", line)
+
+        # Ensure proper indentation
+        if not line.startswith('    ') and not line.endswith(':'):
+            line = f"    {line}"
+
+        self.text_section.append(line)
     
     def visit_comment(self, node: CommentNode):
         """Visit comment"""
@@ -695,13 +740,59 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Split assembly code into lines and add each line
         asm_lines = node.asm_code.strip().split('\n')
         self.text_section.append("    ; === Raw Assembly Block ===")
+
+        # Helper: replace CASM variable names with their assembly labels.
+        # - If a variable appears inside square brackets (memory operand),
+        #   replace the name with 'rel <LABEL>' so it becomes '[rel V#]'.
+        # - If a variable appears as a standalone operand, replace it with
+        #   'dword [rel <LABEL>]' which mirrors how other codegen emits
+        #   memory loads for integer variables.
+        import re as _re
+
+        # Pre-build a regex pattern for variable names if any exist
+        var_names = list(self.variable_labels.keys())
+        var_pattern = None
+        if var_names:
+            var_pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in var_names) + r")\b")
+
+        from ..utils.colors import print_debug
         for line in asm_lines:
-            line = line.strip()
-            if line:
-                # Add proper indentation if not already present
-                if not line.startswith('    ') and not line.endswith(':'):
-                    line = f"    {line}"
-                self.text_section.append(line)
+            raw = line.strip()
+            if not raw:
+                continue
+
+            # First, replace occurrences inside square brackets: [name] -> [ rel V# ]
+            if var_names:
+                def _bracket_replace(match):
+                    name = match.group(1)
+                    label = self.variable_labels.get(name)
+                    if label:
+                        return f"[ rel {label} ]"
+                    return match.group(0)
+
+                # Replace patterns like [name] or [ name ]
+                raw = _re.sub(r"\[\s*(" + "|".join(_re.escape(n) for n in var_names) + r")\s*\]", _bracket_replace, raw)
+
+                # Now replace standalone usages (not inside brackets) with a plain
+                # memory operand '[ rel LABEL ]' to avoid forcing a 32-bit size.
+                def _standalone_replace(m):
+                    name = m.group(1)
+                    label = self.variable_labels.get(name)
+                    if not label:
+                        return name
+                    return f"[ rel {label} ]"
+
+                raw = var_pattern.sub(_standalone_replace, raw)
+
+            # Debug: show before/after for this asm line
+            print_debug(f"ASM raw before/after: '{line.strip()}' => '{raw}'")
+
+            # Add proper indentation if not already present and not a label
+            if not raw.startswith('    ') and not raw.endswith(':'):
+                raw = f"    {raw}"
+
+            self.text_section.append(raw)
+
         self.text_section.append("    ; === End Assembly Block ===")
     
     def finalize_c_code(self):

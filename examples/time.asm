@@ -18,6 +18,7 @@ time_t now;
 struct tm *t;
 now = time(NULL);
 timestamp = (int) now;
+
 if timestamp != -1
     t = localtime(&now);
     op_ok = (t != NULL);
