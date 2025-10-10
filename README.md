@@ -161,7 +161,7 @@ print n
 ; C will be detected implicitly (lines ending with ';')
 printf("Starting C block;\n");
 int i = 0;
-: compute factorial in C and store into CASM variable `fact`
+; compute factorial in C and store into CASM variable `fact`
 int tmp = 1;
 for (i = 1; i <= n; i++) tmp *= i;
 var_fact = tmp;
