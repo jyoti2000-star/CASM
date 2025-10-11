@@ -11,7 +11,7 @@ var str reg_path_usb_storage "SYSTEM\CurrentControlSet\Services\USBSTOR"
 var int hKey 0
 var str reg_value_name "Start"
 var int reg_value_data 4
-var int REG_DWORD 4
+var equ REG_DWORD 4
 
 
 hIn  = (int)GetStdHandle(STD_INPUT_HANDLE);

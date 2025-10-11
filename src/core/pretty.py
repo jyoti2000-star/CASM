@@ -43,7 +43,40 @@ class CASMPrettyPrinter:
         
         lines = assembly_code.split('\n')
         sections = self._parse_assembly_sections(assembly_code)
-        
+        # Collect scattered variable declarations (V# ...) from any section
+        # and group them together under .equ/.data/.bss for cleaner output.
+        equ_defs = []
+        grouped_data_defs = []
+        grouped_bss_defs = []
+
+        var_def_re = re.compile(r"^\s*(V\d+)\s+(equ|db|dd|dq|dw|resb|resw|resd|resq)\b(.*)$", re.IGNORECASE)
+
+        def _collect_and_remove_var_defs(section_name):
+            if section_name not in sections:
+                return
+            new_lines = []
+            for line in sections[section_name]:
+                m = var_def_re.match(line.strip())
+                if m:
+                    label = m.group(1)
+                    directive = m.group(2).lower()
+                    rest = m.group(3) or ''
+                    cleaned = f"    {label} {directive}{rest}"
+                    if directive == 'equ':
+                        equ_defs.append(cleaned)
+                    elif directive.startswith('res'):
+                        grouped_bss_defs.append(cleaned)
+                    else:
+                        grouped_data_defs.append(cleaned)
+                    # skip adding to new_lines (effectively removing it)
+                else:
+                    new_lines.append(line)
+            sections[section_name] = new_lines
+
+        # Scan header, data, bss and text to find stray variable defs
+        for sec in ['header', 'data', 'bss', 'text']:
+            _collect_and_remove_var_defs(sec)
+
         output = []
         
         # Header (preserve original header lines, including original comments)
@@ -129,6 +162,9 @@ class CASMPrettyPrinter:
             output.extend(final_externs)
             output.append("")
 
+        # NOTE: equ_defs will be inserted into the data section below so
+        # assembler-time constants appear alongside other data definitions.
+
         # Data section - organized
         # Detect string declarations that were mistakenly placed in .bss and
         # move them into the data section so strings are defined in .data.
@@ -136,10 +172,28 @@ class CASMPrettyPrinter:
         if sections.get('bss'):
             for line in sections['bss']:
                 stripped = line.strip()
-                if ' db ' in stripped and (stripped.startswith('str_') or stripped.startswith('LC')):
+                if ' db ' in stripped and (stripped.startswith('STR') or stripped.startswith('LC')):
                     misplaced_strings.append(f"    {stripped}")
 
         data_section = self._format_data_section(sections['data'])
+        # Ensure grouped data defs appear at the top of the .data section
+        if grouped_data_defs:
+            # Ensure the section header exists
+            if not data_section or not data_section[0].strip().startswith('section .data'):
+                data_section.insert(0, 'section .data')
+            insert_index = 1
+            for i, dline in enumerate(grouped_data_defs):
+                data_section.insert(insert_index + i, dline)
+
+        # Insert equ defs into data section as well (so they appear grouped)
+        if equ_defs:
+            if not data_section or not data_section[0].strip().startswith('section .data'):
+                data_section.insert(0, 'section .data')
+            # Insert equs after header but before other grouped data defs
+            eq_insert_idx = 1
+            for j, eqline in enumerate(equ_defs):
+                data_section.insert(eq_insert_idx + j, eqline)
+
         # If we have misplaced strings, insert them after the 'section .data' header
         if misplaced_strings:
             insert_index = 1 if data_section and data_section[0].strip().startswith('section .data') else 0
@@ -150,8 +204,17 @@ class CASMPrettyPrinter:
         output.append("")
 
         # BSS section - uninitialized data (string lines removed by formatter)
-        if sections.get('bss') and any(line.strip() for line in sections['bss']):
-            output.extend(self._format_bss_section(sections['bss']))
+        if grouped_bss_defs or (sections.get('bss') and any(line.strip() for line in sections['bss'])):
+            # Start with formatted existing bss
+            bss_formatted = self._format_bss_section(sections['bss']) if sections.get('bss') else ['section .bss']
+            # Ensure header present
+            if not any(l.strip().startswith('section .bss') for l in bss_formatted):
+                bss_formatted.insert(0, 'section .bss')
+            # Insert grouped bss defs right after header
+            for i, bline in enumerate(grouped_bss_defs):
+                bss_formatted.insert(1 + i, bline)
+
+            output.extend(bss_formatted)
             output.append("")
         
         # Text section with context-aware C code placement

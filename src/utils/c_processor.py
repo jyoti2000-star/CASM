@@ -854,44 +854,45 @@ class CCodeProcessor:
 
         header_lines.append('')
         
-        # Add CASM variable declarations as externals
+        # Add CASM variable declarations as externals, but skip assembler-level
+        # symbols that were declared with assembler directives (db, dd, dq, dw,
+        # res*, equ). Those are meant to be emitted verbatim in the assembly and
+        # should not be re-declared as C externs which can cause redefinition
+        # conflicts with system headers (e.g. HKEY_LOCAL_MACHINE).
+        asm_directives = {'db', 'dd', 'dq', 'dw', 'resb', 'resw', 'resd', 'resq', 'equ'}
         for var_name, var_info in self.casm_variables.items():
             if isinstance(var_info, dict):
-                var_type = var_info['type']
-                label = var_info['label']
+                var_type = var_info.get('type')
+                label = var_info.get('label')
                 size = var_info.get('size', None)
-                
-                # Convert CASM types to C types
-                if var_type == 'str' or var_type == 'string':
-                    c_type = 'char*'
-                elif var_type == 'buffer':
-                    c_type = 'char*'  # Buffers are char arrays
-                elif var_type == 'bool':
-                    c_type = 'int'  # bool maps to int in C
-                elif var_type == 'float':
-                    c_type = 'double'  # Use double for float compatibility
-                elif var_type == 'int':
-                    if size is not None:
-                        c_type = 'int*'  # Arrays are pointers in C
-                    else:
-                        c_type = 'int'
-                else:
-                    c_type = 'int'  # Default fallback
             else:
-                c_type = 'int'  # Default type
+                var_type = 'int'
                 label = var_info
-            
-            # Declare the assembler symbol as extern and add defines so C
-            # code can reference either the CASM name or the var_ prefixed name.
-            # For string/buffer-like CASM variables, declare as an array
-            # (extern char NAME[]) so GCC will treat the symbol as the data
-            # label and not as a pointer stored at that symbol.
-            # Prefer sized array declarations when we know the size so
-            # expressions like sizeof(name) are valid in C.
-            if c_type == 'char*' or c_type == 'char *' or var_type in ('str', 'string', 'buffer'):
                 size = None
-                if isinstance(var_info, dict):
-                    size = var_info.get('size')
+
+            if var_type in asm_directives:
+                # Skip creating C externs/defines for assembler-level symbols
+                print_info(f"Skipping C extern for assembler-level symbol: {var_name} ({var_type})")
+                continue
+
+            # Convert CASM types to C types
+            if var_type == 'str' or var_type == 'string':
+                c_type = 'char*'
+            elif var_type == 'buffer':
+                c_type = 'char*'  # Buffers are char arrays
+            elif var_type == 'bool':
+                c_type = 'int'  # bool maps to int in C
+            elif var_type == 'float':
+                c_type = 'double'  # Use double for float compatibility
+            elif var_type == 'int':
+                if size is not None:
+                    c_type = 'int*'  # Arrays are pointers in C
+                else:
+                    c_type = 'int'
+            else:
+                c_type = 'int'  # Default fallback
+
+            if c_type == 'char*' or c_type == 'char *' or var_type in ('str', 'string', 'buffer'):
                 if size:
                     header_lines.append(f'extern char {label}[{size}];')
                 else:

@@ -110,8 +110,9 @@ class CASMParser:
         self._consume(TokenType.VAR, "Expected 'var' for variable declaration")
 
         # Next should be a type token
+        # Allow assembler directive tokens (ASM_DIRECTIVE) in addition to builtin types
         if not self._check_types([TokenType.INT_TYPE, TokenType.STR_TYPE, TokenType.BOOL_TYPE,
-                                 TokenType.FLOAT_TYPE, TokenType.BUFFER_TYPE]):
+                                 TokenType.FLOAT_TYPE, TokenType.BUFFER_TYPE, TokenType.ASM_DIRECTIVE]):
             raise ParseError("Expected type after 'var'", self._peek())
 
         type_token = self._advance()
@@ -377,8 +378,8 @@ class CASMParser:
         # Parse variable name (could be identifier or type name)
         if self._check(TokenType.IDENTIFIER):
             var_token = self._advance()
-        elif self._check_types([TokenType.BUFFER_TYPE, TokenType.INT_TYPE, TokenType.STR_TYPE, 
-                               TokenType.BOOL_TYPE, TokenType.FLOAT_TYPE]):
+        elif self._check_types([TokenType.BUFFER_TYPE, TokenType.INT_TYPE, TokenType.STR_TYPE,
+                               TokenType.BOOL_TYPE, TokenType.FLOAT_TYPE, TokenType.ASM_DIRECTIVE]):
             var_token = self._advance()
         else:
             raise ParseError("Expected variable name", self._peek())

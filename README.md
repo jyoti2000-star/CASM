@@ -42,6 +42,21 @@ Compile to a Windows executable (requires toolchain):
 python3 casm.py compile examples/main.asm
 ```
 
+Install and run globally
+
+You can install a small wrapper script that lets you run CASM as a regular command (`casm`) on your system. The repository includes `install.sh` which installs a convenient wrapper into `/usr/local/bin` (or a platform-appropriate location).
+
+On macOS / Linux:
+
+```bash
+./install.sh           # installs wrapper into /usr/local/bin by default (may prompt for sudo)
+# then run using the global wrapper:
+casm c examples/badusb.asm   # 'c' is a short alias for 'compile'
+casm asm examples/badusb.asm # generate assembly only
+```
+
+If `install.sh` reports that the destination is not on your PATH, add the printed directory to your PATH (example shown by the installer).
+
 ## Language reference (current syntax)
 
 This section describes the syntax the current parser and lexer accept.
@@ -70,10 +85,37 @@ var int array[4] 1,2,3,4
 ```
 
 Notes:
+
 - `var <type> <name> [size] [= value]` — `size` is optional and used for arrays/buffers.
 - `buffer` declarations generate `.bss` (uninitialized) entries using `resb`.
 - `str` and initialized variables go to `.data` using `db`, `dd`, etc.
 - If no value is provided, sensible defaults are used (0 for ints, `""` for strings, etc.).
+
+Supported low-level types and assembler directive mapping
+
+CASM's `var` declarations are intentionally flexible and can map directly to low-level assembler storage directives. This makes it easy to declare exact-sized storage or constants when you need precise control.
+
+Common mappings and examples:
+
+- Equates / constants:
+
+  - `equ` (constant/equate) — use `var equ NAME = 4` or `var const NAME = 4` to emit an assembler `NAME equ 4` (read-only constant).
+
+- Initialized storage (placed in `.data`):
+
+  - `db` / byte-sized values: `var byte b = 0x1` -> `b db 0x1`
+  - `dw` / word (2 bytes): `var word w = 0x1234` -> `w dw 0x1234`
+  - `dd` / dword (4 bytes): `var int v = 5` or `var dword v = 5` -> `v dd 5`
+  - `dq` / quad (8 bytes): `var qword x = 0` -> `x dq 0`
+
+- Uninitialized / reserve in `.bss` (buffers):
+  - `resb`, `resw`, `resd`, `resq` — use `var buffer buf[128]` or `var resb buf 128` to reserve raw bytes without initializing them.
+
+Notes:
+
+- The `var` front-end accepts common, human-friendly type names (`int`, `byte`, `qword`, `buffer`, `str`, etc.) and maps them to the appropriate assembler directive (`dd`, `db`, `dq`, `resb`, ...).
+- Use `str` or `db` style declarations for textual data so they land in `.data` with a terminating zero when appropriate.
+- If you need a raw equate or explicit directive, prefer `var equ` / `var const` or the corresponding explicit type (`var db`, `var dd`, `var dq`, `var resb`) — the compiler will emit the equivalent assembler directive.
 
 ### Assignments
 
@@ -126,6 +168,7 @@ endfor
 ### Embedded C (implicit blocks)
 
 The lexer detects C-style lines automatically. A line is considered C if it:
+
 - starts with `#` (preprocessor directive), or
 - ends with a semicolon `;` (C statement), or
 - is part of a contiguous sequence of such lines.

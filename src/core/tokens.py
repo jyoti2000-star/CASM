@@ -25,6 +25,8 @@ class TokenType(Enum):
     BOOL_TYPE = "BOOL_TYPE"
     FLOAT_TYPE = "FLOAT_TYPE"
     BUFFER_TYPE = "BUFFER_TYPE"
+    # Assembler/data directives allowed as var types (db, dd, dq, dw, res*, equ)
+    ASM_DIRECTIVE = "ASM_DIRECTIVE"
     
     # Essential I/O
     PRINT = "PRINT"           # print statement

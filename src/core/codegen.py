@@ -26,6 +26,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.str_counter = 0
         self.fmt_counter = 0
         self.lc_counter = 0
+        self.equ_defs = []
     
     def generate(self, ast: ProgramNode) -> str:
         """Generate complete assembly program"""
@@ -48,7 +49,14 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Visit the AST
         ast.accept(self)
-        
+        # Now that we've visited the AST, pass full variable information to
+        # the C processor so it can generate correct externs/defines.
+        try:
+            from ..utils.c_processor import c_processor
+            c_processor.set_casm_variables(self.variable_info)
+        except ImportError:
+            pass
+
         # Finalize C code compilation and replace placeholders
         self.finalize_c_code()
         
@@ -77,6 +85,12 @@ class AssemblyCodeGenerator(ASTVisitor):
         if external_functions:
             for func in sorted(external_functions):
                 lines.append(f"extern {func}")
+            lines.append("")
+
+        # Emit assembler-time equ definitions (constants) before sections
+        if getattr(self, 'equ_defs', None):
+            for eq in self.equ_defs:
+                lines.append(eq)
             lines.append("")
         
         # Add C function declarations if any
@@ -217,27 +231,73 @@ class AssemblyCodeGenerator(ASTVisitor):
     
     def visit_var_declaration(self, node: VarDeclarationNode):
         """Visit variable declaration with type support"""
-        # Use deterministic variable labels V1, V2, ... for readability and
-        # to match requested naming scheme.
-        self.var_counter += 1
-        label = f"V{self.var_counter}"
-        self.variable_labels[node.name] = label
-
-        # Store complete variable information for C integration
-        self.variable_info[node.name] = {
-            'type': node.var_type,
-            'size': node.size,
-            'label': label,
-            'value': node.value
-        }
-        
+        # Extract variable metadata
         var_type = node.var_type
         var_size = node.size
         value = node.value
 
+        # Determine label: always use deterministic V# labels for all CASM
+        # variables (including assembler-level directives and equ). This keeps
+        # emitted assembly consistent and avoids introducing user-provided
+        # symbol names that could conflict with system headers.
+        self.var_counter += 1
+        label = f"V{self.var_counter}"
+        self.variable_labels[node.name] = label
+
+        # Store variable metadata
+        self.variable_info[node.name] = {
+            'type': var_type,
+            'size': var_size,
+            'label': label,
+            'value': value
+        }
+
         from ..utils.colors import print_debug
         print_debug(f"Processing variable: {node.name}, type: {var_type}, size: {var_size}, value: '{value}'")
-        
+
+        # Handle assembler-time constants (equ) early
+        if var_type == 'equ':
+            raw_value = (value or '').strip()
+            if raw_value == '':
+                raw_value = '0'
+            # Emit equ using the V# label
+            self.equ_defs.append(f"{label} equ {raw_value}  ; equ {node.name}")
+            self.text_section.append(f"    ; Equ: {node.name} = {raw_value} (label: {label})")
+            return
+
+        # Support direct assembler directives as var types (db, dd, dq, dw, res*)
+        asm_directives = {'db', 'dd', 'dq', 'dw', 'resb', 'resw', 'resd', 'resq', 'equ'}
+        if var_type in asm_directives:
+            raw_value = (value or '').strip()
+            # Reserves (res*) go into BSS
+            if var_type.startswith('res'):
+                count = var_size or 1
+                try:
+                    count_num = int(count)
+                except Exception:
+                    count_num = 1
+                self.bss_section.append(f"    {label} {var_type} {count_num}  ; {var_type} {node.name}")
+                self.text_section.append(f"    ; Reserved: {node.name} as {var_type} {count_num} (label: {label})")
+                return
+
+            # Data directives
+            if var_size:
+                if raw_value:
+                    values = [v.strip() for v in raw_value.split(',')]
+                    values_str = ', '.join(values)
+                    self.data_section.append(f"    {label} {var_type} {values_str}  ; {var_type} {node.name}[{var_size}] (label: {label})")
+                else:
+                    self.data_section.append(f"    {label} times {var_size} {var_type} 0  ; {var_type} {node.name}[{var_size}] (label: {label})")
+                self.text_section.append(f"    ; Array: {var_type} {node.name}[{var_size}] (label: {label})")
+                return
+
+            if raw_value:
+                self.data_section.append(f"    {label} {var_type} {raw_value}  ; {var_type} {node.name} (label: {label})")
+            else:
+                self.data_section.append(f"    {label} {var_type} 0  ; {var_type} {node.name} (label: {label})")
+            self.text_section.append(f"    ; Variable ({var_type}): {node.name} = {value} (label: {label})")
+            return
+
         if var_type == "buffer" and var_size:
             # Buffers go in .bss section (uninitialized data)
             self.bss_section.append(f"    {label} resb {var_size}  ; buffer[{var_size}]")
@@ -302,7 +362,6 @@ class AssemblyCodeGenerator(ASTVisitor):
             # Strings get STR# labels
             self.data_section.append(f'    {label} db "{str_value}", 0  ; str {node.name}')
             self.text_section.append(f"    ; Variable: str {node.name} = {value}")
-            
         elif var_type == "int" and var_size:
             # Integer array
             if value and value.strip():
@@ -314,7 +373,7 @@ class AssemblyCodeGenerator(ASTVisitor):
                 # Initialize with zeros
                 self.data_section.append(f"    {label} times {var_size} dd 0  ; int {node.name}[{var_size}]")
             self.text_section.append(f"    ; Array: int {node.name}[{var_size}]")
-            
+
         else:
             # Fallback to old behavior
             try:
@@ -323,6 +382,9 @@ class AssemblyCodeGenerator(ASTVisitor):
             except ValueError:
                 self.data_section.append(f"    {label} dd 0  ; {value}")
             self.text_section.append(f"    ; Variable: {node.name} = {value}")
+
+        # Note: equ handling is performed earlier to avoid emitting a data
+        # directive for the symbol; nothing to do here.
     
     def _generate_assignment_code(self, var_name: str, expression: str):
         """Generate assembly code for variable assignment with expression evaluation (supports parentheses and precedence)"""
@@ -431,10 +493,18 @@ class AssemblyCodeGenerator(ASTVisitor):
                     self.text_section.append(f"    mov {reg}, {node}")
                 elif node in self.variable_labels:
                     # Always load variable into register, never memory-to-memory
-                    self.text_section.append(f"    mov {reg}, dword [rel {self.variable_labels[node]}]")
+                    var_info = self.variable_info.get(node, {})
+                    if var_info.get('type') == 'equ':
+                        # equ is an assembler-time constant; reference directly
+                        operand = self._format_var_operand(node, as_memory=False)
+                        self.text_section.append(f"    mov {reg}, {operand}")
+                    else:
+                        operand = self._format_var_operand(node, as_memory=True)
+                        self.text_section.append(f"    mov {reg}, dword {operand}")
                 else:
                     var_label = self._get_var_label(node)
-                    self.text_section.append(f"    mov {reg}, dword [rel {var_label}]")
+                    operand = self._format_var_operand(node, as_memory=True)
+                    self.text_section.append(f"    mov {reg}, dword {operand}")
                 return reg
 
         def eval_node_to_reg(node, reg):
@@ -449,6 +519,9 @@ class AssemblyCodeGenerator(ASTVisitor):
         if result_reg not in valid_regs:
             self.text_section.append(f"    mov eax, {result_reg}")
             result_reg = "eax"
+        # Store result back to variable (assignment target)
+        # Note: assigning to an 'equ' is invalid; we still emit a store and
+        # let the assembler/linker surface an error if attempted.
         self.text_section.append(f"    mov dword [rel {var_label}], {result_reg}")
     
     def visit_assignment(self, node: AssignmentNode):
@@ -582,7 +655,13 @@ class AssemblyCodeGenerator(ASTVisitor):
                 
                 # Generate printf call for integer
                 self.text_section.append(f"    ; println {message} (int)")
-                self.text_section.append(f"    mov edx, dword [rel {var_label}]")
+                # Load integer value (respect equ)
+                operand = self._format_var_operand(message, as_memory=True)
+                if self.variable_info.get(message, {}).get('type') == 'equ':
+                    # equ constant: operand is label, use direct mov
+                    self.text_section.append(f"    mov edx, {operand}")
+                else:
+                    self.text_section.append(f"    mov edx, dword {operand}")
                 self.text_section.append(f"    lea rcx, [rel {format_label}]")
                 self.text_section.append("    call printf")
             elif var_type in ['str', 'string']:
@@ -592,7 +671,13 @@ class AssemblyCodeGenerator(ASTVisitor):
                 
                 # Generate printf call for string
                 self.text_section.append(f"    ; println {message} (string)")
-                self.text_section.append(f"    lea rdx, [rel {var_label}]")
+                # For strings, we need the address of the string.
+                operand = self._format_var_operand(message, as_memory=False)
+                if self.variable_info.get(message, {}).get('type') == 'equ':
+                    # equ string: label holds the address/data directly
+                    self.text_section.append(f"    lea rdx, [{operand}]")
+                else:
+                    self.text_section.append(f"    lea rdx, [rel {operand}]")
                 self.text_section.append(f"    lea rcx, [rel {format_label}]")
                 self.text_section.append("    call printf")
             else:
@@ -601,7 +686,11 @@ class AssemblyCodeGenerator(ASTVisitor):
                 self.data_section.append(f'    {format_label} db "%d", 10, 0')
                 
                 self.text_section.append(f"    ; println {message}")
-                self.text_section.append(f"    mov edx, dword [rel {var_label}]")
+                operand = self._format_var_operand(message, as_memory=True)
+                if self.variable_info.get(message, {}).get('type') == 'equ':
+                    self.text_section.append(f"    mov edx, {operand}")
+                else:
+                    self.text_section.append(f"    mov edx, dword {operand}")
                 self.text_section.append(f"    lea rcx, [rel {format_label}]")
                 self.text_section.append("    call printf")
         else:
@@ -651,7 +740,14 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Generate scanf call (Windows x64 calling convention)
         self.text_section.append(f"    ; scanf \"{format_str}\" -> {node.variable}")
         self.text_section.append(f"    lea rcx, [rel {format_label}]")
-        self.text_section.append(f"    lea rdx, [rel {var_label}]")
+        # Use _format_var_operand to respect 'equ' variables
+        if self.variable_info.get(node.variable, {}).get('type') == 'equ':
+            operand = self._format_var_operand(node.variable, as_memory=False)
+            # Need the address of the symbol
+            self.text_section.append(f"    lea rdx, [{operand}]")
+        else:
+            operand = self._format_var_operand(node.variable, as_memory=False)
+            self.text_section.append(f"    lea rdx, [rel {operand}]")
         self.text_section.append("    call scanf")
     
     def visit_assembly(self, node: AssemblyNode):
@@ -663,16 +759,33 @@ class AssemblyCodeGenerator(ASTVisitor):
 
         var_names = list(self.variable_labels.keys())
         if var_names:
-            # Replace bracketed occurrences first: [name] -> [ rel V# ]
+            # Replace bracketed occurrences first: [name] -> [ rel V# ] or direct symbol for equ
+            def _bracket_replace(m):
+                name = m.group(1)
+                label = self.variable_labels.get(name)
+                if not label:
+                    return m.group(0)
+                if self.variable_info.get(name, {}).get('type') == 'equ':
+                    return f"[{label}]"
+                return f"[ rel {label} ]"
+
             line = _re.sub(r"\[\s*(" + "|".join(_re.escape(n) for n in var_names) + r")\s*\]",
-                           lambda m: f"[ rel {self.variable_labels.get(m.group(1))} ]",
+                           _bracket_replace,
                            line)
 
             # Replace standalone variable tokens with a plain memory operand
-            # like '[ rel V# ]' so register-sized instructions (mov rcx, [..])
-            # don't get an invalid forced 32-bit operand.
+            # like '[ rel V# ]' or the bare symbol for equ variables.
             pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in var_names) + r")\b")
-            line = pattern.sub(lambda m: f"[ rel {self.variable_labels.get(m.group(1))} ]", line)
+            def _standalone_replace(m):
+                name = m.group(1)
+                label = self.variable_labels.get(name)
+                if not label:
+                    return name
+                if self.variable_info.get(name, {}).get('type') == 'equ':
+                    return label
+                return f"[ rel {label} ]"
+
+            line = pattern.sub(_standalone_replace, line)
 
         # Ensure proper indentation
         if not line.startswith('    ') and not line.endswith(':'):
@@ -761,25 +874,29 @@ class AssemblyCodeGenerator(ASTVisitor):
             if not raw:
                 continue
 
-            # First, replace occurrences inside square brackets: [name] -> [ rel V# ]
+            # First, replace occurrences inside square brackets: [name] -> [ rel V# ] or [label] if equ
             if var_names:
                 def _bracket_replace(match):
                     name = match.group(1)
                     label = self.variable_labels.get(name)
-                    if label:
-                        return f"[ rel {label} ]"
-                    return match.group(0)
+                    if not label:
+                        return match.group(0)
+                    if self.variable_info.get(name, {}).get('type') == 'equ':
+                        return f"[{label}]"
+                    return f"[ rel {label} ]"
 
                 # Replace patterns like [name] or [ name ]
                 raw = _re.sub(r"\[\s*(" + "|".join(_re.escape(n) for n in var_names) + r")\s*\]", _bracket_replace, raw)
 
                 # Now replace standalone usages (not inside brackets) with a plain
-                # memory operand '[ rel LABEL ]' to avoid forcing a 32-bit size.
+                # memory operand '[ rel LABEL ]' or bare label for equ vars.
                 def _standalone_replace(m):
                     name = m.group(1)
                     label = self.variable_labels.get(name)
                     if not label:
                         return name
+                    if self.variable_info.get(name, {}).get('type') == 'equ':
+                        return label
                     return f"[ rel {label} ]"
 
                 raw = var_pattern.sub(_standalone_replace, raw)
@@ -992,6 +1109,21 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Ensure mapping for future references
         self.variable_labels[name] = label
         return label
+
+    def _format_var_operand(self, var_name: str, as_memory: bool = True) -> str:
+        """Return the correct assembly operand for a CASM variable.
+
+        - If the variable is declared as 'equ', return the label directly (no [rel]).
+        - Otherwise return a memory operand '[ rel LABEL ]' when as_memory=True,
+          or the plain label when as_memory=False.
+        """
+        label = self._get_var_label(var_name)
+        info = self.variable_info.get(var_name, {})
+        if info.get('type') == 'equ':
+            # Assembler-time constant: reference directly
+            return label
+        # Default: memory operand
+        return f"[ rel {label} ]" if as_memory else label
     
     def _evaluate_condition_with_jump(self, condition: str):
         """Evaluate a condition and return the appropriate jump instruction to skip the block"""
@@ -999,35 +1131,52 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Handle comparisons like "variable > value", "variable == value", etc.
         comparison_ops = ['>=', '<=', '==', '!=', '>', '<']
-        
+        # Helper: detect register names so we don't treat them as CASM variables
+        regs = {"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+                "eax","ebx","ecx","edx","esi","edi","ax","bx",
+                "cx","dx","al","bl","cl","dl","r8","r9","r10",
+                "r11","r12","r13","r14","r15"}
+
         for op in comparison_ops:
             if op in condition:
                 left, right = condition.split(op, 1)
                 left = left.strip()
                 right = right.strip()
-                
-                # Load left operand into eax
+
+                # Load left operand into appropriate register or use it directly
+                left_is_reg = left.lower() in regs
+                right_is_reg = right.lower() in regs
+
                 if left.isdigit():
                     self.text_section.append(f"    mov eax, {left}")
-                elif left in self.variable_labels:
-                    var_label = self.variable_labels[left]
-                    self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+                    left_operand_for_cmp = 'eax'
+                elif left_is_reg:
+                    # Use the register directly
+                    left_operand_for_cmp = left
                 else:
-                    # Try to treat as variable name
-                    left_label = self._get_var_label(left)
-                    self.text_section.append(f"    mov eax, dword [rel {left_label}]")
-                
-                # Compare with right operand
+                    # Use format helper so 'equ' variables become bare symbols
+                    left_operand = self._format_var_operand(left, as_memory=True)
+                    if self.variable_info.get(left, {}).get('type') == 'equ':
+                        left_operand_for_cmp = left_operand
+                    else:
+                        # Load into eax for comparison if memory operand
+                        self.text_section.append(f"    mov eax, dword {left_operand}")
+                        left_operand_for_cmp = 'eax'
+
+                # Compare with right operand. Use direct cmp when possible to
+                # avoid unnecessary loads and to support register comparisons.
                 if right.isdigit():
-                    self.text_section.append(f"    cmp eax, {right}")
-                elif right in self.variable_labels:
-                    var_label = self.variable_labels[right]
-                    self.text_section.append(f"    cmp eax, dword [rel {var_label}]")
+                    self.text_section.append(f"    cmp {left_operand_for_cmp}, {right}")
+                elif right_is_reg:
+                    self.text_section.append(f"    cmp {left_operand_for_cmp}, {right}")
                 else:
-                    # Try to treat as variable name
-                    right_label = self._get_var_label(right)
-                    self.text_section.append(f"    cmp eax, dword [rel {right_label}]")
-                
+                    right_operand = self._format_var_operand(right, as_memory=True)
+                    if self.variable_info.get(right, {}).get('type') == 'equ':
+                        self.text_section.append(f"    cmp {left_operand_for_cmp}, {right_operand}")
+                    else:
+                        # Compare register/memory with memory; ensure right is memory
+                        self.text_section.append(f"    cmp {left_operand_for_cmp}, dword {right_operand}")
+
                 # Return the opposite jump to skip the if block when condition is false
                 if op == '<':
                     return 'jge'    # Jump if greater or equal (opposite of <)
@@ -1044,8 +1193,11 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Handle simple variable checks (non-zero)
         if condition in self.variable_labels:
-            var_label = self.variable_labels[condition]
-            self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+            operand = self._format_var_operand(condition, as_memory=True)
+            if self.variable_info.get(condition, {}).get('type') == 'equ':
+                self.text_section.append(f"    mov eax, {operand}")
+            else:
+                self.text_section.append(f"    mov eax, dword {operand}")
             self.text_section.append(f"    cmp eax, 0")
         elif condition.isdigit():
             # Direct number comparison
@@ -1068,41 +1220,55 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Handle comparisons like "variable > value", "variable == value", etc.
         comparison_ops = ['>=', '<=', '==', '!=', '>', '<']
         
+        # Helper: register set (same as in jump helper)
+        regs = {"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+                "eax","ebx","ecx","edx","esi","edi","ax","bx",
+                "cx","dx","al","bl","cl","dl","r8","r9","r10",
+                "r11","r12","r13","r14","r15"}
+
         for op in comparison_ops:
             if op in condition:
                 left, right = condition.split(op, 1)
                 left = left.strip()
                 right = right.strip()
-                
-                # Load left operand into eax
+
+                # Load left operand into appropriate register or use it directly
+                left_is_reg = left.lower() in regs
+                right_is_reg = right.lower() in regs
+
                 if left.isdigit():
                     self.text_section.append(f"    mov eax, {left}")
-                elif left in self.variable_labels:
-                    var_label = self.variable_labels[left]
-                    self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+                    left_operand_for_cmp = 'eax'
+                elif left_is_reg:
+                    left_operand_for_cmp = left
                 else:
-                    # Try to treat as variable name
-                    left_label = self._get_var_label(left)
-                    self.text_section.append(f"    mov eax, dword [rel {left_label}]")
-                
+                    left_operand = self._format_var_operand(left, as_memory=True)
+                    if self.variable_info.get(left, {}).get('type') == 'equ':
+                        left_operand_for_cmp = left_operand
+                    else:
+                        self.text_section.append(f"    mov eax, dword {left_operand}")
+                        left_operand_for_cmp = 'eax'
+
                 # Compare with right operand
-                if right.isdigit():
-                    self.text_section.append(f"    cmp eax, {right}")
-                elif right in self.variable_labels:
-                    var_label = self.variable_labels[right]
-                    self.text_section.append(f"    cmp eax, dword [rel {var_label}]")
+                if right.isdigit() or right_is_reg:
+                    self.text_section.append(f"    cmp {left_operand_for_cmp}, {right}")
                 else:
-                    # Try to treat as variable name
-                    right_label = self._get_var_label(right)
-                    self.text_section.append(f"    cmp eax, dword [rel {right_label}]")
-                
+                    right_operand = self._format_var_operand(right, as_memory=True)
+                    if self.variable_info.get(right, {}).get('type') == 'equ':
+                        self.text_section.append(f"    cmp {left_operand_for_cmp}, {right_operand}")
+                    else:
+                        self.text_section.append(f"    cmp {left_operand_for_cmp}, dword {right_operand}")
+
                 # The comparison sets flags, caller will use je/jne/jg/jl etc.
                 return
         
         # Handle simple variable checks (non-zero)
         if condition in self.variable_labels:
-            var_label = self.variable_labels[condition]
-            self.text_section.append(f"    mov eax, dword [rel {var_label}]")
+            operand = self._format_var_operand(condition, as_memory=True)
+            if self.variable_info.get(condition, {}).get('type') == 'equ':
+                self.text_section.append(f"    mov eax, {operand}")
+            else:
+                self.text_section.append(f"    mov eax, dword {operand}")
             self.text_section.append(f"    cmp eax, 0")
         elif condition.isdigit():
             # Direct number comparison
