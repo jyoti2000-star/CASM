@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import shutil
 import re
+import platform
 from typing import Optional
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from .utils.c_processor import c_processor
 from .utils.formatter import formatter
 from .utils.colors import print_info, print_success, print_warning, print_error, print_system
 from .utils.syntax import check_syntax, format_errors
+from .utils.term import print_stage, print_error as term_error, print_info as term_info
 
 class CASMProcessor:
     """Core CASM language processor"""
@@ -81,8 +83,22 @@ class CASMCompiler:
     def __init__(self):
         self.processor = CASMProcessor()
         self.temp_dir = None
+        self._quiet_mode = False
+        self._last_error = None
+        self._last_info = None
+        # detect host once
+        self.host = self._detect_host()
+
+    def _detect_host(self) -> str:
+        """Return a normalized host id: 'linux', 'darwin', or 'windows'."""
+        p = platform.system().lower()
+        if 'darwin' in p:
+            return 'darwin'
+        if 'windows' in p:
+            return 'windows'
+        return 'linux'
     
-    def compile_to_assembly(self, input_file: str, output_file: str = None) -> bool:
+    def compile_to_assembly(self, input_file: str, output_file: str = None, quiet: bool = False) -> bool:
         """Compile CASM to assembly file"""
         try:
             # The higher-level CLI now controls visible messages; avoid duplicate system prints
@@ -107,14 +123,15 @@ class CASMCompiler:
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(final_assembly)
 
-            print_success(f"Assembly generated: {output_file}")
+            if not quiet:
+                print_success(f"Assembly generated: {output_file}")
             return True
 
         except Exception as e:
-            print(f"[ERROR] Assembly generation failed: {e}")
+            term_error(f"Assembly generation failed: {e}")
             return False
     
-    def compile_to_executable(self, input_file: str, output_executable: str = None, run_after: bool = False) -> bool:
+    def compile_to_executable(self, input_file: str, output_executable: str = None, run_after: bool = False, quiet: bool = False) -> bool:
         """Compile CASM to executable"""
         try:
             # Check dependencies first
@@ -133,7 +150,12 @@ class CASMCompiler:
             # Create temporary directory
             self.temp_dir = tempfile.mkdtemp(prefix='casm_')
             
-            print(f"[1/4] Processing {input_file}...")
+            if not quiet:
+                # set quiet mode for internal emits
+                self._quiet_mode = bool(quiet)
+                self._last_error = None
+                self._last_info = None
+                print_stage(1, 4, f"Processing {input_file}...")
             # Process CASM file
             assembly_code = self.processor.process_file(input_file)
 
@@ -205,51 +227,78 @@ class CASMCompiler:
             with open(asm_file, 'w', encoding='utf-8') as f:
                 f.write(asm_prelude + assembly_code)
             
-            print("[2/4] Assembling with NASM...")
+            if not quiet:
+                print_stage(2, 4, "Assembling with NASM...")
             # Assemble with NASM
             obj_file = os.path.join(self.temp_dir, 'output.o')
-            if not self._run_nasm(asm_file, obj_file):
+            if not self._run_nasm(asm_file, obj_file, quiet=quiet):
                 return False
             
-            print("[3/4] Linking...")
+            if not quiet:
+                print_stage(3, 4, "Linking...")
             # Link executable (include driver object and any extra libs)
             exe_file = f"{output_executable}.exe"
             extra_objs = [driver_obj] if driver_obj else None
-            if not self._run_linker(obj_file, exe_file, extra_objs=extra_objs, extra_libs=extra_libs):
+            if not self._run_linker(obj_file, exe_file, extra_objs=extra_objs, extra_libs=extra_libs, quiet=quiet):
                 return False
             
-            print(f"[SUCCESS] Executable created: {exe_file}")
+            if not quiet:
+                term_info(f"Executable created: {exe_file}")
             
             if run_after:
-                print("[4/4] Running executable...")
+                if not quiet:
+                    print_stage(4, 4, "Running executable...")
                 return self._run_executable(exe_file)
             
             return True
             
         except Exception as e:
-            print(f"[ERROR] Compilation failed: {e}")
+            # Capture error for outer display when quiet
+            if self._quiet_mode:
+                self._last_error = str(e)
+            else:
+                term_error(f"Compilation failed: {e}")
             return False
         
         finally:
             # Cleanup
             if self.temp_dir and os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
+            # reset quiet mode
+            self._quiet_mode = False
     
     def _check_build_dependencies(self) -> bool:
         """Check if required build tools are available"""
-        required = ['nasm', 'x86_64-w64-mingw32-gcc']
+        # Choose default toolchain depending on host. For Windows host prefer
+        # MinGW cross/gcc; for Linux/macOS prefer system gcc/clang.
+        if self.host == 'windows':
+            required = ['nasm', 'x86_64-w64-mingw32-gcc']
+        else:
+            # On Linux prefer gcc; on macOS prefer clang but gcc shim is often ok
+            required = ['nasm', shutil.which('gcc') and 'gcc' or 'clang']
         missing = []
         
         for tool in required:
+            # some entries may be None if we used shutil.which during selection
+            if not tool:
+                continue
             if not shutil.which(tool):
                 missing.append(tool)
         
         if missing:
-            print(f"[ERROR] Missing build tools: {', '.join(missing)}")
-            print("[INFO] Install with: brew install nasm mingw-w64")
+            term_error(f"Missing build tools: {', '.join(missing)}")
+            term_info("Install with: brew install nasm mingw-w64")
             return False
         
         return True
+
+    def _nasm_format_for_host(self) -> str:
+        """Return NASM output format appropriate for the host."""
+        if self.host == 'darwin':
+            return 'macho64'
+        if self.host == 'windows':
+            return 'win64'
+        return 'elf64'
 
     def _collect_external_symbols(self, assembly_code: str):
         """Find referenced external symbols (V#, __imp_*) in assembly."""
@@ -317,6 +366,9 @@ class CASMCompiler:
                     libs.add('m')
                 elif 'pthread.h' in name:
                     libs.add('pthread')
+                elif 'sdl2/SDL.h' in name or 'SDL2/SDL.h'.lower() in name:
+                    # Map SDL2 headers to SDL2 linking
+                    libs.add('SDL2')
                 elif 'wininet' in name or 'windows.h' in name:
                     libs.add('user32')
                 # Add additional header-to-lib heuristics here as needed
@@ -386,44 +438,185 @@ class CASMCompiler:
             cmd = ['x86_64-w64-mingw32-gcc', '-c', '-O0', '-masm=intel', driver_c, '-o', driver_o]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                print(f"[ERROR] Failed to compile automatic driver: {result.stderr}")
+                term_error(f"Failed to compile automatic driver: {result.stderr}")
                 return None
 
             return driver_o
         except Exception as e:
-            print(f"[ERROR] Exception creating driver: {e}")
+            term_error(f"Exception creating driver: {e}")
             return None
     
-    def _run_nasm(self, asm_file: str, obj_file: str) -> bool:
+    def _run_nasm(self, asm_file: str, obj_file: str, quiet: bool = False) -> bool:
         """Run NASM assembler"""
-        cmd = ['nasm', '-f', 'win64', asm_file, '-o', obj_file]
-        
+        fmt = self._nasm_format_for_host()
+        cmd = ['nasm', '-f', fmt, asm_file, '-o', obj_file]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"[ERROR] NASM failed:")
-            print(result.stderr)
+            if quiet or getattr(self, '_quiet_mode', False):
+                # capture single-line error for outer display
+                self._last_error = result.stderr.strip() or 'NASM failed'
+            else:
+                term_error("NASM failed:")
+                term_info(result.stderr)
             return False
-        
+
         return True
     
-    def _run_linker(self, obj_file: str, exe_file: str, extra_objs: Optional[list] = None, extra_libs: Optional[list] = None) -> bool:
+    def _run_linker(self, obj_file: str, exe_file: str, extra_objs: Optional[list] = None, extra_libs: Optional[list] = None, quiet: bool = False) -> bool:
         """Run linker, optionally adding extra object files and libraries."""
-        cmd = ['x86_64-w64-mingw32-gcc']
+        # Choose linker based on host
+        if self.host == 'windows':
+            linker = 'x86_64-w64-mingw32-gcc'
+        else:
+            # Prefer system gcc/clang
+            linker = shutil.which('gcc') or shutil.which('clang') or 'gcc'
+
+        cmd = [linker]
         cmd.append(obj_file)
         if extra_objs:
             for eo in extra_objs:
                 if eo:
                     cmd.append(eo)
 
-        cmd.extend(['-o', exe_file, '-mconsole', '-lkernel32', '-lmsvcrt'])
+        # Default linking flags depend on host
+        if self.host == 'windows':
+            cmd.extend(['-o', exe_file, '-mconsole', '-lkernel32', '-lmsvcrt'])
+        else:
+            # Linux and macOS: produce a native executable
+            cmd.extend(['-o', exe_file])
+            # On Linux ensure no PIE for simple execs if desired
+            if self.host == 'linux':
+                cmd.append('-no-pie')
+
         if extra_libs:
             for lib in extra_libs:
                 cmd.append(f'-l{lib}')
 
+        # Gather extra linker flags from C processor (e.g., SDL2 pkg-config)
+        try:
+            pkg_link_flags = []
+            # If user provided ldflags via CLI, prefer those
+            if getattr(c_processor, 'user_ldflags', None):
+                # user_ldflags may be string or list
+                if isinstance(c_processor.user_ldflags, str):
+                    import shlex
+                    pkg_link_flags = shlex.split(c_processor.user_ldflags)
+                else:
+                    pkg_link_flags = list(c_processor.user_ldflags)
+            elif hasattr(c_processor, '_gather_pkg_link_flags_for_headers'):
+                pkg_link_flags = c_processor._gather_pkg_link_flags_for_headers()
+
+            # If pkg-config returned flags, try to validate that any -L paths
+            # actually contain MinGW-compatible import libraries (libSDL2.dll.a or libSDL2.a).
+            def _libs_present_in_dir(d: str):
+                """Return:
+                - 'dll_a' if libSDL2.dll.a present (preferred MinGW import lib)
+                - 'static_a' if libSDL2.a present (likely host static lib — may be incompatible)
+                - False if none found
+                """
+                import os
+                dll_a = os.path.join(d, 'libSDL2.dll.a')
+                static_a = os.path.join(d, 'libSDL2.a')
+                if os.path.exists(dll_a):
+                    return 'dll_a'
+                if os.path.exists(static_a):
+                    return 'static_a'
+                return False
+
+            valid_flags = []
+            if pkg_link_flags:
+                # Collect -L dirs and other flags
+                L_dirs = [f[2:] for f in pkg_link_flags if f.startswith('-L')]
+                has_libSDL2 = any(f == '-lSDL2' or f == ' -lSDL2' for f in pkg_link_flags) or ('SDL2' in (extra_libs or []))
+
+                usable = False
+                found_static_only = False
+                for d in L_dirs:
+                    res = _libs_present_in_dir(d)
+                    if res == 'dll_a':
+                        usable = True
+                        break
+                    if res == 'static_a':
+                        found_static_only = True
+
+                # If no usable import libs found in pkg-config dirs, check environment override
+                if not usable and has_libSDL2:
+                    env_dir = os.environ.get('CASM_MINGW_LIB_DIR')
+                    if env_dir:
+                        res = _libs_present_in_dir(env_dir)
+                        if res == 'dll_a':
+                            if quiet or getattr(self, '_quiet_mode', False):
+                                self._last_info = f"Using CASM_MINGW_LIB_DIR for MinGW SDL2 libs: {env_dir}"
+                            else:
+                                term_info(f"Using CASM_MINGW_LIB_DIR for MinGW SDL2 libs: {env_dir}")
+                            cmd.extend([f'-L{env_dir}', '-lSDL2'])
+                            usable = True
+                        elif res == 'static_a':
+                            # Found a host static lib — don't accept it for mingw
+                            if quiet or getattr(self, '_quiet_mode', False):
+                                self._last_error = f"CASM_MINGW_LIB_DIR contains libSDL2.a which is likely a host static library and not a MinGW import library: {env_dir}"
+                                self._last_info = "You still need a MinGW import library (libSDL2.dll.a)."
+                            else:
+                                term_error(f"CASM_MINGW_LIB_DIR contains libSDL2.a which is likely a host static library and not a MinGW import library: {env_dir}")
+                                term_info("You still need a MinGW import library (libSDL2.dll.a).")
+
+                if usable:
+                    # If usable pkg flags exist, append all pkg flags
+                    cmd.extend(pkg_link_flags)
+                    if quiet or getattr(self, '_quiet_mode', False):
+                        self._last_info = f"Appending pkg-config linker flags: {' '.join(pkg_link_flags)}"
+                    else:
+                        term_info(f"Appending pkg-config linker flags: {' '.join(pkg_link_flags)}")
+                else:
+                    # We have pkg flags but they point to host libs which are not
+                    # MinGW-compatible. Provide a clear, actionable error.
+                    if has_libSDL2:
+                        # Emit one concise message (minimal) and one short suggestion
+                        if found_static_only:
+                            err = "SDL2 pkg-config points to a host static library (libSDL2.a); MinGW needs libSDL2.dll.a"
+                        else:
+                            err = "SDL2 pkg-config did not provide MinGW import libraries (libSDL2.dll.a)"
+
+                        suggestion = "Provide MinGW SDL2 import libs and set CASM_MINGW_LIB_DIR to that lib directory"
+                        if quiet or getattr(self, '_quiet_mode', False):
+                            self._last_error = err
+                            self._last_info = suggestion
+                        else:
+                            term_error(err)
+                            term_info(suggestion)
+                        return False
+                    else:
+                        # No SDL2 requested or no -lSDL2 present; just append whatever pkg gave
+                        cmd.extend(pkg_link_flags)
+                        term_info(f"Appending pkg-config linker flags: {' '.join(pkg_link_flags)}")
+            # If no pkg flags but extra_libs contains SDL2, try CASM_MINGW_LIB_DIR
+            else:
+                if extra_libs and 'SDL2' in extra_libs:
+                    env_dir = os.environ.get('CASM_MINGW_LIB_DIR')
+                    if env_dir and _libs_present_in_dir(env_dir):
+                        cmd.extend([f'-L{env_dir}', '-lSDL2'])
+                        if quiet or getattr(self, '_quiet_mode', False):
+                            self._last_info = f"Using CASM_MINGW_LIB_DIR for SDL2: {env_dir}"
+                        else:
+                            term_info(f"Using CASM_MINGW_LIB_DIR for SDL2: {env_dir}")
+                    else:
+                        if quiet or getattr(self, '_quiet_mode', False):
+                            self._last_error = "Linking requires SDL2 import libraries for MinGW but none were found."
+                            self._last_info = "Set CASM_MINGW_LIB_DIR to a directory containing libSDL2.dll.a and try again."
+                        else:
+                            term_error("Linking requires SDL2 import libraries for MinGW but none were found.")
+                            term_info("Set the CASM_MINGW_LIB_DIR environment variable to a directory containing libSDL2.dll.a and try again.")
+                        return False
+        except Exception as e:
+            term_info(f"Could not gather pkg-config linker flags: {e}")
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"[ERROR] Linking failed:")
-            print(result.stderr)
+            if quiet or getattr(self, '_quiet_mode', False):
+                self._last_error = result.stderr.strip() or 'Linker failed'
+            else:
+                term_error("Linking failed:")
+                term_info(result.stderr)
             return False
 
         return True
@@ -433,22 +626,22 @@ class CASMCompiler:
         wine_cmd = shutil.which('wine') or shutil.which('wine64')
         
         if wine_cmd:
-            print("-" * 40)
+            term_info("-" * 40)
             try:
                 result = subprocess.run([wine_cmd, exe_file], capture_output=False)
-                print("-" * 40)
-                print(f"[INFO] Program exited with code: {result.returncode}")
+                term_info("-" * 40)
+                term_info(f"Program exited with code: {result.returncode}")
                 return result.returncode == 0
             except KeyboardInterrupt:
-                print("\n[INFO] Program interrupted by user")
+                term_info("\nProgram interrupted by user")
                 return True
             except Exception as e:
-                print(f"[ERROR] Failed to run executable: {e}")
+                term_error(f"Failed to run executable: {e}")
                 return False
         else:
-            print("[WARNING] Wine not found, cannot run Windows executable")
-            print(f"[INFO] Executable saved as: {exe_file}")
-            print("[INFO] Install Wine to run: brew install --cask wine-stable")
+            term_info("Wine not found, cannot run Windows executable")
+            term_info(f"Executable saved as: {exe_file}")
+            term_info("Install Wine to run: brew install --cask wine-stable")
             return True
 
 # Global instances

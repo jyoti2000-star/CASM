@@ -26,7 +26,20 @@ class CCodeProcessor:
         self.marker_counter = 0   # Counter for generating unique block markers
         # When True, persist combined C and assembly files to the project's
         # output directory for debugging; otherwise don't persist.
+        # Default to False so casual runs are not noisy; top-level CLI can
+        # enable this via --debug-save when the user requests full logs.
         self.save_debug = False
+        # Optional user-provided flags (set by top-level CLI). If provided,
+        # these override or supplement auto-detected pkg-config flags.
+        # user_cflags: list of compiler flags (e.g. ['-I/opt/include', '-DDEBUG'])
+        # user_ldflags: list of linker flags (e.g. ['-L/mingw/lib', '-lSDL2'])
+        self.user_cflags = None
+        self.user_ldflags = None
+        # Store the last compile command output (stdout+stderr) so callers can
+        # present a concise preview while allowing full logs to be saved.
+        self._last_compile_output = ''
+        # Short status message for the last compile attempt (single-line)
+        self._last_status = ''
         
     def add_header(self, header_name: str, use_angle: bool = False):
         """Add header file for C compilation.
@@ -34,14 +47,25 @@ class CCodeProcessor:
         header_name: bare header (e.g. math.h or mylib.h or windows.h)
         use_angle: when True emit #include <header_name>, otherwise #include "header_name"
         """
+        # Normalize header name: accept inputs like '<SDL2/SDL.h>' or 'SDL2/SDL.h'
+        raw = header_name.strip()
+        # If the caller provided angle brackets around the header, prefer that
+        if raw.startswith('<') and raw.endswith('>'):
+            raw = raw[1:-1].strip()
+            use_angle = True
+        # If caller provided quoted include like "mylib.h", strip quotes and respect use_angle flag
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1].strip()
+            # leave use_angle as provided (likely False)
+
         # Avoid duplicates by header name
         for (h, ua) in self.headers:
-            if h == header_name:
+            if h == raw:
                 # already present; keep existing use_angle value
                 return
 
-        self.headers.append((header_name, use_angle))
-        print_info(f"Added header: {header_name} (use_angle={use_angle})")
+        self.headers.append((raw, use_angle))
+        print_info(f"Added header: {raw} (use_angle={use_angle})")
         
     def set_casm_variables(self, variables: dict):
         """Set CASM variables for C code access"""
@@ -212,12 +236,12 @@ class CCodeProcessor:
                     if isinstance(header_entry, tuple) and len(header_entry) >= 2:
                         header_name, use_angle = header_entry[0], bool(header_entry[1])
                     else:
-                        # Legacy single-string entry: try to infer behavior
-                        header_name = str(header_entry)
+                        # Legacy single-string entry: try to infer behavior and strip brackets
+                        header_name = str(header_entry).strip()
                         use_angle = header_name.startswith('<') and header_name.endswith('>')
-                        # Strip any angle brackets if present
-                        header_name = header_name.replace('<', '').replace('>', '').strip()
+                        header_name = header_name.replace('<', '').replace('>', '').replace('"', '').replace("'", '').strip()
 
+                    # Emit include using angle brackets when requested, otherwise use quotes
                     if use_angle:
                         f.write(f'#include <{header_name}>\n')
                     else:
@@ -270,64 +294,49 @@ class CCodeProcessor:
                 f.write(f'    {c_code}\n')
                 f.write('}\n')
             
-            # Debug: print the generated C file content
-            with open(c_file, 'r') as f:
-                c_content = f.read()
-            print_info(f"Generated C file content:\n{c_content}")
+            # Debug: optionally print the generated C file content
+            if self.save_debug:
+                with open(c_file, 'r') as f:
+                    c_content = f.read()
+                print_info(f"Generated C file content:\n{c_content}")
             
             # Compile with x86_64-w64-mingw32-gcc using Intel syntax
             asm_file = os.path.join(self.temp_dir, 'temp.s')
             
-            # Try the specific compiler you mentioned
-            cmd = ['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel', c_file, '-o', asm_file]
-            
-            try:
-                print_info(f"Running command: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.temp_dir)
-                
-                if result.returncode == 0:
-                    # Read generated assembly
-                    with open(asm_file, 'r') as f:
-                        assembly = f.read()
-                    
-                    print_info(f"Generated {len(assembly)} characters of assembly")
-                    # Embed the raw GCC assembly output directly
-                    embedded_assembly = f"; === RAW GCC ASSEMBLY OUTPUT ===\n; {' '.join(cmd)}\n"
-                    embedded_assembly += assembly
-                    embedded_assembly += "; === END GCC ASSEMBLY OUTPUT ==="
-                    
-                    print_success(f"C code compiled with x86_64-w64-mingw32-gcc (Intel syntax) - raw output embedded")
-                    return embedded_assembly
-                else:
-                    print_error(f"GCC compilation failed: {result.stderr}")
-                    
-            except FileNotFoundError:
-                print_warning("x86_64-w64-mingw32-gcc not found, trying fallback compilers")
-            
-            # Fallback to other compilers
-            fallback_compilers = [
-                ['gcc', '-S', '-O0', '-masm=intel'],
-                ['clang', '-S', '-O0', '-x86-asm-syntax=intel']
+            # Try a sequence of compilers that are likely to use system include paths
+            compilers_to_try = [
+                (['gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
+                (['clang', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
+                (['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file])
             ]
-            
-            for compiler_cmd in fallback_compilers:
+
+            for cmd in compilers_to_try:
                 try:
-                    full_cmd = compiler_cmd + [c_file, '-o', asm_file]
-                    result = subprocess.run(full_cmd, capture_output=True, text=True)
-                    
+                    # Run the compiler and capture stdout/stderr for callers
+                    result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.temp_dir)
+                    combined = (result.stdout or '') + '\n' + (result.stderr or '')
+                    self._last_compile_output = combined.strip()
+
                     if result.returncode == 0:
+                        # Read generated assembly
                         with open(asm_file, 'r') as f:
                             assembly = f.read()
-                        
-                        # Embed raw assembly output directly
-                        embedded_assembly = f"; === RAW {compiler_cmd[0].upper()} ASSEMBLY OUTPUT ===\n; {' '.join(full_cmd)}\n"
+
+                        embedded_assembly = f"; === RAW {os.path.basename(cmd[0]).upper()} ASSEMBLY OUTPUT ===\n; {' '.join(cmd)}\n"
                         embedded_assembly += assembly
-                        embedded_assembly += f"; === END {compiler_cmd[0].upper()} ASSEMBLY OUTPUT ==="
-                        
-                        print_success(f"C code compiled with {compiler_cmd[0]} (Intel syntax) - raw output embedded")
+                        embedded_assembly += f"; === END {os.path.basename(cmd[0]).upper()} ASSEMBLY OUTPUT ==="
+
+                        if self.save_debug:
+                            print_success(f"C code compiled with {os.path.basename(cmd[0])} (Intel syntax) - raw output embedded")
                         return embedded_assembly
-                        
+                    else:
+                        # Only emit a concise single-line error unless save_debug
+                        if self.save_debug:
+                            print_error(f"Compiler {cmd[0]} failed: {result.stderr}")
+                        else:
+                            print_error(f"Compiler {cmd[0]} failed: see combined_c output; use --debug-save for full logs")
                 except FileNotFoundError:
+                    print_warning(f"Compiler {cmd[0]} not found, trying next")
                     continue
             
             # If no compiler worked, fall back to simple processing
@@ -845,7 +854,11 @@ class CCodeProcessor:
             hn = header_name.strip()
             is_simple_h = bool(re.match(r'^[A-Za-z0-9_\-]+\.h$', hn))
 
-            effective_angle = bool(use_angle) or is_simple_h
+            # Prefer angle includes when explicitly requested, when the
+            # header is a simple system header (e.g. stdio.h), or when it
+            # contains a path component (e.g. SDL2/SDL.h) which conventionally
+            # uses angle brackets.
+            effective_angle = bool(use_angle) or is_simple_h or ('/' in hn)
 
             if effective_angle:
                 header_lines.append(f'#include <{hn}>')
@@ -941,8 +954,15 @@ class CCodeProcessor:
         combined_c = self._generate_header()
 
         # Decide which raw C blocks are full function definitions.
-        # Use the marked c_code_blocks (which include asm volatile labels)
-        # so that GCC will emit the CASM_BLOCK markers into the assembly.
+        # Some function definitions may be split across multiple collected
+        # raw blocks (header in one block, body lines in following blocks).
+        # Merge consecutive raw blocks into a single function text when the
+        # initial block looks like a function header (contains '{' or matches
+        # function-def regex), tracking brace depth until the function closes.
+        # For non-function statements we also need to merge consecutive
+        # raw blocks that together form a single C statement (e.g. multi-line
+        # calls split across lines). This prevents producing stray fragments
+        # like a lone ");" inside casm_main.
         global_functions = []
         main_statements = []
 
@@ -950,21 +970,92 @@ class CCodeProcessor:
 
         raw_blocks = getattr(self, '_raw_c_blocks', [])
         marked_blocks = getattr(self, 'c_code_blocks', [])
+        # marked_blocks contains the original marked blocks (with CASM_BLOCK_N
+        # labels). When we merge multiple raw blocks into one statement we
+        # must preserve the marker ID from the first block so the assembler
+        # extraction step can match the expected marker names (otherwise
+        # codegen will not find the assembly for the original markers).
 
-        # Iterate with indices so we can pair raw and marked versions
-        for idx, raw in enumerate(raw_blocks):
-            marked = marked_blocks[idx] if idx < len(marked_blocks) else raw
-            if func_def_re.search(raw):
-                # If it's a full function definition, emit the raw (function) text
-                # directly (we don't want to wrap function definitions in asm markers).
-                global_functions.append(raw)
+        i = 0
+        n = len(raw_blocks)
+        while i < n:
+            raw = raw_blocks[i]
+
+            # If this block starts a function definition (regex or a '{' present)
+            if func_def_re.search(raw) or '{' in raw:
+                # Merge subsequent blocks until braces are balanced
+                combined_raw = raw
+                brace_depth = raw.count('{') - raw.count('}')
+                j = i + 1
+                while brace_depth > 0 and j < n:
+                    next_raw = raw_blocks[j]
+                    combined_raw += '\n' + next_raw
+                    brace_depth += next_raw.count('{') - next_raw.count('}')
+                    j += 1
+
+                # Append the full function text as a global function
+                global_functions.append(combined_raw)
+                # Advance i to the next unprocessed block
+                i = j
             else:
-                # Non-function statements: use the marked version so asm labels
-                # are present for extraction after GCC compilation.
-                main_statements.append(marked)
+                # Merge consecutive non-function raw blocks into a single
+                # statement until we reach one that looks like it ends with
+                # a semicolon. This handles multi-line expressions such as
+                # function calls split across lines (e.g. SDL_CreateWindow(...);
+                combined_parts = [raw]
+                j = i + 1
+                # Continue merging until we see a terminating semicolon at
+                # the end of the accumulated text or we run out of blocks or
+                # the next block starts a function definition.
+                while j < n and not combined_parts[-1].strip().endswith(';') and not func_def_re.search(raw_blocks[j]) and '{' not in raw_blocks[j]:
+                    combined_parts.append(raw_blocks[j])
+                    j += 1
 
-        # Emit global functions first
+                combined_raw = '\n'.join(combined_parts)
+
+                # Collect original markers in this merged range so we can
+                # alias them back to a primary marker after compilation.
+                original_markers = []
+                for k in range(i, j):
+                    if k < len(marked_blocks):
+                        import re as _re
+                        mm = _re.search(r'(CASM_BLOCK_\d+)_START', marked_blocks[k])
+                        if mm:
+                            original_markers.append(mm.group(1))
+
+                # Choose primary marker: prefer first original marker when available
+                if original_markers:
+                    primary = original_markers[0]
+                else:
+                    primary = f"CASM_BLOCK_{self.marker_counter}"
+                    self.marker_counter += 1
+
+                # Record aliases so we can map extracted assembly back to
+                # original markers later on.
+                if not hasattr(self, '_marker_aliases'):
+                    self._marker_aliases = {}
+                for om in original_markers:
+                    self._marker_aliases[om] = primary
+
+                marked = '    asm volatile("%s_START:");\n%s\n    asm volatile("%s_END:");' % (primary, combined_raw, primary)
+                main_statements.append(marked)
+                i = j
+
+        # Some entries in global_functions might not actually be proper
+        # function definitions (heuristic misclassification). Ensure we only
+        # emit real functions as globals; other blocks should be treated as
+        # main statements so runtime calls end up inside casm_main().
+        verified_globals = []
         for gf in global_functions:
+            # Check if gf begins with a function definition (after optional whitespace)
+            if func_def_re.search(gf):
+                verified_globals.append(gf)
+            else:
+                # Treat as main statement (wrap as marked if necessary)
+                main_statements.append(gf)
+
+        # Emit verified global function definitions first
+        for gf in verified_globals:
             combined_c += gf + "\n\n"
 
         # Now emit casm_main containing non-function statements (marked)
@@ -975,12 +1066,104 @@ class CCodeProcessor:
         
         print_info(f"Generated combined C code:\n{combined_c}")
         
+        # Post-process combined C: move any top-level runtime statements that
+        # call functions (invalid as initializers) into casm_main. This lets
+        # users write natural C-style initialization lines in the CASM file
+        # while ensuring the combined C remains valid C.
+        combined_lines = combined_c.split('\n')
+        # Find the index of 'void casm_main() {' so we can separate header/global
+        try:
+            main_idx = next(i for i, l in enumerate(combined_lines) if l.strip().startswith('void casm_main('))
+        except StopIteration:
+            main_idx = None
+
+        moved_to_main = []
+        if main_idx is not None:
+            header_lines = combined_lines[:main_idx]
+            main_lines = combined_lines[main_idx:]
+
+            # First detect function ranges in header_lines so we won't touch
+            # lines that are inside function bodies.
+            func_ranges = []  # list of (start_idx, end_idx) inclusive in header_lines
+            idx = 0
+            while idx < len(header_lines):
+                line = header_lines[idx]
+                if func_def_re.search(line):
+                    # scan forward until matching braces balanced
+                    depth = line.count('{') - line.count('}')
+                    j = idx + 1
+                    while depth > 0 and j < len(header_lines):
+                        depth += header_lines[j].count('{') - header_lines[j].count('}')
+                        j += 1
+                    func_ranges.append((idx, j - 1))
+                    idx = j
+                else:
+                    idx += 1
+
+            def inside_func(i):
+                for a, b in func_ranges:
+                    if a <= i <= b:
+                        return True
+                return False
+
+            new_header = []
+            # For each line in header_lines (but only those outside functions),
+            # detect problematic initializers or top-level statements and move
+            # them to casm_main.
+            decl_re = re.compile(r'^\s*([A-Za-z_][\w\s\*]+)\s+(\w+)\s*=\s*(.+);\s*$')
+            stmt_re = re.compile(r'^\s*[^/\s].*;\s*$')
+
+            for i, line in enumerate(header_lines):
+                if inside_func(i):
+                    # Preserve function lines intact
+                    new_header.append(line)
+                    continue
+
+                m = decl_re.match(line)
+                if m:
+                    decl_type, name, init = m.groups()
+                    # If initializer likely contains a function call or a runtime
+                    # symbol, move the initializer into casm_main.
+                    if '(' in init or any(tok in init for tok in ['GetModuleHandle', 'CreateWindowEx', 'RegisterClass', 'ShowWindow', 'GetMessage', 'TranslateMessage', 'DispatchMessage']):
+                        new_header.append(f"{decl_type} {name};")
+                        moved_to_main.append(f"    {name} = {init};")
+                        continue
+
+                # Top-level statement (not a preprocessor/extern/type) -> move
+                if stmt_re.match(line):
+                    stripped = line.strip()
+                    if not stripped.startswith('#') and not any(stripped.startswith(k) for k in ('extern', 'typedef', 'struct', 'enum')):
+                        # Never move bare 'return' lines - they belong in functions
+                        if stripped.startswith('return'):
+                            new_header.append(line)
+                        else:
+                            moved_to_main.append(f"    {stripped}")
+                        continue
+
+                new_header.append(line)
+
+            # Insert moved statements at the start of casm_main body (after the '{')
+            if moved_to_main:
+                # Find the opening brace line index in main_lines
+                for mi, ml in enumerate(main_lines):
+                    if '{' in ml:
+                        insert_at = mi + 1
+                        break
+                else:
+                    insert_at = 1
+
+                main_lines = main_lines[:insert_at] + moved_to_main + main_lines[insert_at:]
+
+            # Rebuild combined_c
+            combined_c = '\n'.join(new_header + main_lines)
+
         # Write to temporary file
         c_file = os.path.join(self.temp_dir, "combined.c")
         with open(c_file, 'w') as f:
             f.write(combined_c)
-        
-        print_info(f"Combined C file written to: {c_file}")
+
+        if self.save_debug:
+            print_info(f"Combined C file written to: {c_file}")
         # Also persist the combined C to the project's output/ for debugging
         try:
             import shutil
@@ -1000,32 +1183,92 @@ class CCodeProcessor:
         
         # Compile to assembly
         asm_file = os.path.join(self.temp_dir, "combined.s")
-        cmd = [
-            "x86_64-w64-mingw32-gcc", "-S", "-O0", "-masm=intel",
-            c_file, "-o", asm_file
-        ]
-        
-        print_info(f"Running command: {' '.join(cmd)}")
-        
+
+        # Gather extra flags (e.g., SDL include flags) when headers request them
+        extra_flags = []
         try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print_success("GCC compilation successful")
-        except subprocess.CalledProcessError as e:
-            # Build an informative message and raise so the caller can print it once
-            stderr = e.stderr.strip() if e.stderr else ''
-            stdout = e.stdout.strip() if e.stdout else ''
-            msg = f"GCC failed with exit code {e.returncode}" + (f": {stderr}" if stderr else '')
-            if stdout and not stderr:
-                msg += f" (stdout: {stdout})"
-            # Raise a runtime error so upstream build stops
-            raise RuntimeError(msg)
+            # If the user provided explicit CFLAGS, use them first
+            if getattr(self, 'user_cflags', None):
+                if isinstance(self.user_cflags, str):
+                    import shlex
+                    extra_flags = shlex.split(self.user_cflags)
+                else:
+                    extra_flags = list(self.user_cflags)
+                if self.save_debug:
+                    print_info(f"Using user-provided CFLAGS: {' '.join(extra_flags)}")
+            else:
+                pkg_flags = self._gather_pkg_flags_for_headers()
+                if pkg_flags:
+                    extra_flags.extend(pkg_flags)
+                    if self.save_debug:
+                        print_info(f"Using extra compiler flags from pkg-config/sdl2-config: {' '.join(pkg_flags)}")
+        except Exception as e:
+            print_warning(f"Could not gather pkg-config flags: {e}")
+
+        # Try a sequence of compilers that are likely to use system include paths
+        compilers_to_try = [
+            (['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
+            (['gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
+            (['clang', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file])
+        ]
+
+        compiled = False
+        # If we're running on a non-x86_64 host (e.g. Apple Silicon), ensure
+        # the x86_64-w64-mingw32 cross-compiler is available; otherwise the
+        # host compiler will produce ARM/x86 mismatched assembly which is
+        # not usable for a Windows x86-64 target. Provide an actionable
+        # error message to the user instead of silently embedding wrong asm.
+        try:
+            import platform, shutil
+            host_arch = platform.machine().lower()
+            cross_present = bool(shutil.which('x86_64-w64-mingw32-gcc'))
+            if host_arch not in ('x86_64', 'amd64') and not cross_present:
+                raise RuntimeError(
+                    "Cross-compiler x86_64-w64-mingw32-gcc not found on non-x86_64 host. "
+                    "Install it (e.g. `brew install mingw-w64`) and ensure it is in PATH, "
+                    "also install pkg-config and SDL2 (e.g. `brew install pkg-config sdl2`) so headers/libs are found.")
+        except Exception as e:
+            # If we raised above, re-raise so the caller sees a clear message
+            if isinstance(e, RuntimeError):
+                raise
+            # Otherwise continue; platform detection may not be available
+            pass
+        for cmd in compilers_to_try:
+            try:
+                # Run compiler and capture output; store for later preview/logging
+                result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.temp_dir)
+                combined_out = (result.stdout or '') + '\n' + (result.stderr or '')
+                self._last_compile_output = combined_out.strip()
+
+                if result.returncode == 0:
+                    if self.save_debug:
+                        print_success(f"C compilation successful with {cmd[0]}")
+                    self._last_status = f"Compiled with {cmd[0]}"
+                    compiled = True
+                    break
+                else:
+                    # Save concise status and full output for later inspection
+                    self._last_status = f"Compiler {cmd[0]} failed"
+                    # Only emit detailed error messages when debugging
+                    if self.save_debug:
+                        print_error(f"Compiler {cmd[0]} failed: {result.stderr}")
+                    continue
+            except FileNotFoundError:
+                print_warning(f"Compiler {cmd[0]} not found, trying next")
+                continue
+
+        if not compiled:
+            if self.save_debug:
+                print_warning("No suitable C compiler succeeded")
+            raise RuntimeError("GCC failed to compile combined C file with available compilers")
         
         # Read and parse assembly
         try:
             with open(asm_file, 'r') as f:
                 assembly = f.read()
-            print_info(f"Read {len(assembly)} characters from assembly file")
-            print_info(f"Full assembly output:\n{assembly}")
+            if self.save_debug:
+                print_info(f"Read {len(assembly)} characters from assembly file")
+                print_info(f"Full assembly output:\n{assembly}")
             # Persist the raw assembly output for debugging
             try:
                 out_dir = os.path.join(os.getcwd(), 'output')
@@ -1052,6 +1295,15 @@ class CCodeProcessor:
         if string_constants:
             print_info(f"Extracted {len(string_constants)} string constants")
             segments['_STRING_CONSTANTS'] = string_constants
+
+        # If we created aliases during merging, map original markers to the
+        # primary extracted segment so the consumer (codegen) can look up
+        # the assembly by the original CASM block names.
+        if hasattr(self, '_marker_aliases') and self._marker_aliases:
+            for orig, primary in list(self._marker_aliases.items()):
+                if primary in segments and orig not in segments:
+                    segments[orig] = segments[primary]
+                    print_info(f"Aliased segment: {orig} -> {primary}")
         
         # Store for pretty printer access
         self._last_assembly_segments = segments.copy()
@@ -1271,6 +1523,133 @@ class CCodeProcessor:
                 continue
         
         return '\n'.join(string_lines)
+
+    def _gather_pkg_flags_for_headers(self) -> List[str]:
+        """Try to gather compiler flags for headers (SDL2) via pkg-config or sdl2-config.
+
+        Returns a list of flags (e.g. ['-I/opt/homebrew/include']) to prepend to the compiler.
+        """
+        flags: List[str] = []
+
+        # If the user explicitly provided CFLAGS via the CLI, prefer those
+        # and return them directly. Use this to allow explicit override of
+        # auto-detection (pkg-config / sdl2-config).
+        if getattr(self, 'user_cflags', None):
+            try:
+                # If it's a string, split on whitespace; if it's already a list
+                # assume it's ready to use.
+                if isinstance(self.user_cflags, str):
+                    import shlex
+                    return shlex.split(self.user_cflags)
+                return list(self.user_cflags)
+            except Exception:
+                # Fall back to auto-detection if parsing fails
+                pass
+
+        # Collect header names we asked for
+        header_names = [h for (h, _) in self.headers]
+
+        # Determine if SDL2 is requested
+        want_sdl = any('sdl2' in h.lower() or h.lower().endswith('sdl.h') for h in header_names)
+        if not want_sdl:
+            return flags
+
+        import shutil
+        # Try pkg-config first
+        try:
+            if shutil.which('pkg-config'):
+                result = subprocess.run(['pkg-config', '--cflags', 'sdl2'], capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    cflags = result.stdout.strip().split()
+                    flags.extend(cflags)
+                    # If headers use 'SDL2/...' but pkg-config returned -I.../SDL2,
+                    # also add the parent include path so '#include <SDL2/SDL.h>'
+                    # resolves correctly when the include is written with the 'SDL2/' prefix.
+                    if any('/SDL2' in f for f in cflags) and any('SDL2/' in h for h in header_names):
+                        for f in cflags:
+                            if f.startswith('-I'):
+                                inc_path = f[2:]
+                                if inc_path.endswith('/SDL2'):
+                                    parent_dir = inc_path[:-len('/SDL2')]
+                                    if parent_dir:
+                                        parent_flag = '-I' + parent_dir
+                                        if parent_flag not in flags:
+                                            flags.append(parent_flag)
+                    return flags
+        except Exception:
+            pass
+
+        # Fall back to sdl2-config
+        try:
+            if shutil.which('sdl2-config'):
+                res = subprocess.run(['sdl2-config', '--cflags'], capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout.strip():
+                    cflags = res.stdout.strip().split()
+                    flags.extend(cflags)
+                    if any('/SDL2' in f for f in cflags) and any('SDL2/' in h for h in header_names):
+                        for f in cflags:
+                            if f.startswith('-I'):
+                                inc_path = f[2:]
+                                if inc_path.endswith('/SDL2'):
+                                    parent_dir = inc_path[:-len('/SDL2')]
+                                    if parent_dir:
+                                        parent_flag = '-I' + parent_dir
+                                        if parent_flag not in flags:
+                                            flags.append(parent_flag)
+                    return flags
+        except Exception:
+            pass
+
+        return flags
+
+    def _gather_pkg_link_flags_for_headers(self) -> List[str]:
+        """Gather linker flags for headers (SDL2) via pkg-config or sdl2-config.
+
+        Returns a list of linker flags (e.g. ['-L/path', '-lSDL2']) to append to the linker.
+        """
+        flags: List[str] = []
+
+        # If user provided explicit ldflags, use those first
+        if getattr(self, 'user_ldflags', None):
+            try:
+                if isinstance(self.user_ldflags, str):
+                    import shlex
+                    return shlex.split(self.user_ldflags)
+                return list(self.user_ldflags)
+            except Exception:
+                pass
+
+        # Collect header names we asked for
+        header_names = [h for (h, _) in self.headers]
+
+        want_sdl = any('sdl2' in h.lower() or h.lower().endswith('sdl.h') for h in header_names)
+        if not want_sdl:
+            return flags
+
+        import shutil, subprocess
+        # Try pkg-config first for linker flags
+        try:
+            if shutil.which('pkg-config'):
+                result = subprocess.run(['pkg-config', '--libs', 'sdl2'], capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    libs = result.stdout.strip().split()
+                    flags.extend(libs)
+                    return flags
+        except Exception:
+            pass
+
+        # Fall back to sdl2-config --libs
+        try:
+            if shutil.which('sdl2-config'):
+                res = subprocess.run(['sdl2-config', '--libs'], capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout.strip():
+                    libs = res.stdout.strip().split()
+                    flags.extend(libs)
+                    return flags
+        except Exception:
+            pass
+
+        return flags
     
     def cleanup(self):
         """Clean up temporary files"""

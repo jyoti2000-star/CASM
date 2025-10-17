@@ -10,6 +10,11 @@ class CASMLexer:
         self.current_line = 1
         self.current_column = 1
         self.current_line_text = ""
+        # When True, we are inside a multi-line C statement that started
+        # with a '(' and hasn't yet seen the matching ')'. In that case,
+        # subsequent lines should be treated as C_INLINE until the block
+        # closes so the parser can collect full C statements.
+        self._in_c_paren_block = False
         
         # Essential keywords only
         self.keywords = {
@@ -104,8 +109,26 @@ class CASMLexer:
         # single C_INLINE token so the parser can collect contiguous C lines.
         stripped_line = line.strip()
         if stripped_line:
+            # If we are currently inside a C parenthesis block, treat every
+            # line as C_INLINE until the closing parenthesis is found.
+            if self._in_c_paren_block:
+                # If this line contains the closing ')', end the block after
+                # emitting the C_INLINE token.
+                if ')' in stripped_line:
+                    self._in_c_paren_block = False
+                return [Token(TokenType.C_INLINE, stripped_line, self.current_line, 1, line)]
+
             # C preprocessor or statement ending with semicolon
-            if stripped_line.startswith('#') or stripped_line.endswith(';'):
+            # Also treat lines that contain a '{' (likely a C function header)
+            # as C_INLINE so multi-line function definitions are collected.
+            if (stripped_line.startswith('#') or stripped_line.endswith(';')
+                or '{' in stripped_line or '}' in stripped_line
+                or '(' in stripped_line or ')' in stripped_line):
+                # If this line opens a parenthesis block that doesn't close
+                # on the same line, set the flag so following lines are
+                # considered C_INLINE as well.
+                if '(' in stripped_line and ')' not in stripped_line:
+                    self._in_c_paren_block = True
                 return [Token(TokenType.C_INLINE, stripped_line, self.current_line, 1, line)]
             # Do not treat C-style 'for/if/while(...)' as C here; loops are
             # CASM constructs and should be tokenized as such. C statements

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from typing import List, Dict, Set
+import os
 import secrets
 import re
 from .ast_nodes import *
@@ -27,6 +28,22 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.fmt_counter = 0
         self.lc_counter = 0
         self.equ_defs = []
+        # Control whether the generator emits an automatic function epilogue
+        # Default: enabled. Set environment variable CASM_AUTO_EPILOGUE=0 to disable.
+        # Per workspace/request, default to not appending an automatic
+        # epilogue so users can add it manually. If an env var is set and
+        # truthy, it can still be enabled (for backward compatibility).
+        try:
+            # Default to '0' (disabled). If CASM_AUTO_EPILOGUE is set to a
+            # truthy value, treat epilogue as enabled.
+            self.auto_epilogue = str(os.getenv('CASM_AUTO_EPILOGUE', '0')).strip() not in ('0', 'false', 'no')
+        except Exception:
+            self.auto_epilogue = False
+        # Control automatic prologue emission (push/mov/sub). Default: disabled
+        try:
+            self.auto_prologue = str(os.getenv('CASM_AUTO_PROLOGUE', '0')).strip() not in ('0', 'false', 'no')
+        except Exception:
+            self.auto_prologue = False
     
     def generate(self, ast: ProgramNode) -> str:
         """Generate complete assembly program"""
@@ -118,22 +135,31 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Text section
         lines.append("section .text")
-        lines.append("global main")
-        lines.append("")
-        lines.append("main:")
-        lines.append("    push rbp")
-        lines.append("    mov rbp, rsp")
-        lines.append("    sub rsp, 32  ; Shadow space for Windows x64")
-        lines.append("")
+        # Optionally emit a standard `main` label and function prologue.
+        if getattr(self, 'auto_prologue', False):
+            lines.append("global main")
+            lines.append("")
+            lines.append("main:")
+            lines.append("    push rbp")
+            lines.append("    mov rbp, rsp")
+            lines.append("    sub rsp, 32  ; Shadow space for Windows x64")
+            lines.append("")
+        else:
+            # Keep a blank line for readability when not emitting the prologue
+            lines.append("")
         
         lines.extend(self.text_section)
         
-        lines.append("")
-        lines.append("    ; Exit program")
-        lines.append("    mov rax, 0")
-        lines.append("    add rsp, 32")
-        lines.append("    pop rbp")
-        lines.append("    ret")
+        # Optionally append a default program epilogue. Some users prefer to
+        # control the epilogue manually (for embedded snippets or custom
+        # calling conventions). Honor the auto_epilogue flag.
+        if getattr(self, 'auto_epilogue', True):
+            lines.append("")
+            lines.append("    ; Exit program")
+            lines.append("    mov rax, 0")
+            lines.append("    add rsp, 32")
+            lines.append("    pop rbp")
+            lines.append("    ret")
         
         # Format the assembly
         assembly_code = '\n'.join(lines)
@@ -995,8 +1021,37 @@ class AssemblyCodeGenerator(ASTVisitor):
                                     updated_sections.append(f"    {asm_line}")
                         else:
                             updated_sections.append("    ; Empty assembly block")
+                            # If we could not find the header (loop completed without break),
+                            # fall back to inserting at the placeholder location so we
+                            # don't leave an empty block.
+                            else_found = False
+                            for i in range(len(updated_sections)-1, -1, -1):
+                                if updated_sections[i] == header:
+                                    else_found = True
+                                    break
+                            if not else_found:
+                                # Insert assembly lines directly at this point
+                                for asm_line in assembly_code.split('\n'):
+                                    if asm_line.strip():
+                                        updated_sections.append(f"    {asm_line}")
                     else:
-                        updated_sections.append(f"    ; Assembly not found for {marker}")
+                        # Fallback: if we extracted exactly one assembly segment
+                        # and the requested marker is missing (common when
+                        # marker numbering shifted during merging), use the
+                        # single available segment as a best-effort replacement.
+                        fallback_keys = [k for k in assembly_segments.keys() if k != '_STRING_CONSTANTS']
+                        if len(fallback_keys) == 1:
+                            fk = fallback_keys[0]
+                            print_warning(f"Marker {marker} not found; using fallback segment {fk}")
+                            assembly_code = assembly_segments[fk]
+                            if assembly_code.strip():
+                                for asm_line in assembly_code.split('\n'):
+                                    if asm_line.strip():
+                                        updated_sections.append(f"    {asm_line}")
+                            else:
+                                updated_sections.append("    ; Empty assembly block (fallback)")
+                        else:
+                            updated_sections.append(f"    ; Assembly not found for {marker}")
                 else:
                     updated_sections.append(line)
             else:

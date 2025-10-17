@@ -30,16 +30,50 @@ Note: running compiled Windows executables locally requires Wine; building works
 
 ## Quick usage
 
-Generate assembly from a CASM source file:
+The CLI now uses a single-entry invocation. Run `casm.py <file>` and you'll be presented with an interactive selector to choose which artifact to produce (executable, assembly, flat binary, or object file).
+
+Interactive mode (recommended for local use):
 
 ```bash
-python3 casm.py asm examples/main.asm
+python3 casm.py examples/main.asm
+# then select one of: Compile to Executable | Generate Assembly | Compile to Binary | Compile to Object File
 ```
 
-Compile to a Windows executable (requires toolchain):
+Non-interactive flags (useful for scripts / CI):
+
+- `--cflags "<flags>"` — pass extra C compilation flags (overrides auto-detected pkg-config flags).
+- `--ldflags "<flags>"` — pass extra linker flags.
+  -- `-d` | `--debug-save` — save intermediate C and assembly artifacts for debugging.
+- `-t` | `--type` <asm|exe|bin|obj> — non-interactive selection (useful for scripts/CI)
+
+Examples:
+
+Generate assembly and write it to `output/`:
 
 ```bash
-python3 casm.py compile examples/main.asm
+python3 casm.py examples/main.asm
+# select "Generate Assembly"
+```
+
+Non-interactive example (produce assembly without the interactive prompt):
+
+```bash
+python3 casm.py examples/main.asm -t asm
+```
+
+Compile to a Windows executable (non-interactive, passing custom linker flags):
+
+```bash
+python3 casm.py examples/main.asm --ldflags "-L/some/mingw/libs -lSDL2"
+# select "Compile to Executable" in the interactive prompt
+```
+
+Produce a flat binary (bin) and save intermediate files for debugging:
+
+```bash
+python3 casm.py examples/main.asm -d --cflags "-I/some/include" \
+  --ldflags "-L/some/lib -lSDL2"
+# select "Compile to Binary"
 ```
 
 Install and run globally
