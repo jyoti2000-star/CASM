@@ -598,11 +598,21 @@ class CCodeProcessor:
                 else:
                     asm_lines.append("    ; printf call - no format string found")
             else:
-                # Generic function call
-                asm_lines.extend([
-                    f"    ; TODO: Set up arguments for {func_name}",
-                    f"    call {func_name}"
-                ])
+                # Generic function call - emit unified call directive so the
+                # asm_transpiler can arrange arguments and platform specifics.
+                # Try to parse simple comma-separated args
+                args = self._parse_printf_args(args_part) if args_part else []
+                args_str = ' '.join(a for a in args if a)
+                if args_str:
+                    asm_lines.extend([
+                        f"    ; {line}",
+                        f"UCALL {func_name} {args_str}"
+                    ])
+                else:
+                    asm_lines.extend([
+                        f"    ; {line}",
+                        f"UCALL {func_name}"
+                    ])
             
             return asm_lines
         

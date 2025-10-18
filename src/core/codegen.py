@@ -88,6 +88,16 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Build final assembly
         lines = []
+
+        # Emit any top-level bracketed assembler directives collected from
+        # the source (e.g. [BITS 16], [ORG 0x7C00]). These are emitted verbatim
+        # at the top of the file so users can include boot directives or mode
+        # toggles without the generator hardcoding them.
+        directives = getattr(self, 'top_directives', []) or []
+        for d in directives:
+            lines.append(d)
+        if directives:
+            lines.append("")
         
         # Add external function declarations
         external_functions = set()
@@ -117,32 +127,37 @@ class AssemblyCodeGenerator(ASTVisitor):
                 lines.append(f"extern {var_info['c_name']}")
             lines.append("")
         
-        # Data section
+        # Data section - emit canonical NASM section header (.data)
+        # The asm_transpiler will translate these into platform-specific
+        # segment names (e.g. __DATA,__data) when necessary. Emitting the
+        # canonical names here prevents duplicate or mixed headers later
+        # in the pretty/fixer pipeline.
         if self.data_section:
-            lines.append("section .data")
+            lines.append('section .data')
             lines.extend(self.data_section)
             lines.append("")
             from ..utils.colors import print_debug
             print_debug(f"Added .data section with {len(self.data_section)} items")
         
-        # BSS section (uninitialized data)
+        # BSS section (uninitialized data) - emit canonical NASM header
         if hasattr(self, 'bss_section') and self.bss_section:
-            lines.append("section .bss")
+            lines.append('section .bss')
             lines.extend(self.bss_section)
             lines.append("")
             from ..utils.colors import print_debug
             print_debug(f"Added .bss section with {len(self.bss_section)} items")
         
-        # Text section
-        lines.append("section .text")
-        # Optionally emit a standard `main` label and function prologue.
+        # Text section - canonical NASM header
+        lines.append('section .text')
+        # Optionally emit a standard `main` symbol using unified assembly UFUNC.
+        # Emit a GLOBAL directive and a UFUNC so the asm_transpiler will
+        # generate the correct prologue/epilogue per-target.
         if getattr(self, 'auto_prologue', False):
             lines.append("global main")
             lines.append("")
-            lines.append("main:")
-            lines.append("    push rbp")
-            lines.append("    mov rbp, rsp")
-            lines.append("    sub rsp, 32  ; Shadow space for Windows x64")
+            # Use unified assembly directive - let the transpiler emit actual
+            # function label and prologue for the target platform.
+            lines.append("UFUNC main")
             lines.append("")
         else:
             # Keep a blank line for readability when not emitting the prologue
@@ -150,16 +165,13 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         lines.extend(self.text_section)
         
-        # Optionally append a default program epilogue. Some users prefer to
-        # control the epilogue manually (for embedded snippets or custom
-        # calling conventions). Honor the auto_epilogue flag.
+        # Optionally append a default program epilogue. Emit a unified
+        # assembly exit directive so the transpiler performs the correct
+        # target-specific termination sequence.
         if getattr(self, 'auto_epilogue', True):
             lines.append("")
-            lines.append("    ; Exit program")
-            lines.append("    mov rax, 0")
-            lines.append("    add rsp, 32")
-            lines.append("    pop rbp")
-            lines.append("    ret")
+            lines.append("    ; Exit program (unified directive)")
+            lines.append("UEXIT 0")
         
         # Format the assembly
         assembly_code = '\n'.join(lines)
@@ -281,14 +293,19 @@ class AssemblyCodeGenerator(ASTVisitor):
         from ..utils.colors import print_debug
         print_debug(f"Processing variable: {node.name}, type: {var_type}, size: {var_size}, value: '{value}'")
 
-        # Handle assembler-time constants (equ) early
+        # Handle assembler-time constants (equ) early -> emit unified constant
         if var_type == 'equ':
             raw_value = (value or '').strip()
             if raw_value == '':
                 raw_value = '0'
-            # Emit equ using the V# label
-            self.equ_defs.append(f"{label} equ {raw_value}  ; equ {node.name}")
-            self.text_section.append(f"    ; Equ: {node.name} = {raw_value} (label: {label})")
+            # Use the original symbolic name for equates so they are readable
+            self.variable_labels[node.name] = node.name
+            self.variable_info[node.name] = {
+                'type': 'equ', 'size': var_size, 'label': node.name, 'value': raw_value
+            }
+            # Emit unified constant directive (transpiler will convert to equ)
+            self.text_section.append(f"UCONST {node.name} {raw_value}  ; equ {node.name}")
+            self.text_section.append(f"    ; Equ: {node.name} = {raw_value}")
             return
 
         # Support direct assembler directives as var types (db, dd, dq, dw, res*)
@@ -302,33 +319,36 @@ class AssemblyCodeGenerator(ASTVisitor):
                     count_num = int(count)
                 except Exception:
                     count_num = 1
-                self.bss_section.append(f"    {label} {var_type} {count_num}  ; {var_type} {node.name}")
+                # Emit unified bytes reservation
+                self.text_section.append(f"UBYTES {label} {count_num}  ; {var_type} {node.name}")
                 self.text_section.append(f"    ; Reserved: {node.name} as {var_type} {count_num} (label: {label})")
                 return
 
             # Data directives
             if var_size:
+                # Emit unified array directive
                 if raw_value:
                     values = [v.strip() for v in raw_value.split(',')]
-                    values_str = ', '.join(values)
-                    self.data_section.append(f"    {label} {var_type} {values_str}  ; {var_type} {node.name}[{var_size}] (label: {label})")
+                    values_str = ','.join(values)
+                    self.text_section.append(f"UARRAY {label} {var_type} {values_str}  ; {var_type} {node.name}[{var_size}] (label: {label})")
                 else:
-                    self.data_section.append(f"    {label} times {var_size} {var_type} 0  ; {var_type} {node.name}[{var_size}] (label: {label})")
+                    # repeat initializer
+                    self.text_section.append(f"UARRAY {label} {var_type} times {var_size} 0  ; {var_type} {node.name}[{var_size}] (label: {label})")
                 self.text_section.append(f"    ; Array: {var_type} {node.name}[{var_size}] (label: {label})")
                 return
 
             if raw_value:
-                self.data_section.append(f"    {label} {var_type} {raw_value}  ; {var_type} {node.name} (label: {label})")
+                self.text_section.append(f"UARRAY {label} {var_type} {raw_value}  ; {var_type} {node.name} (label: {label})")
             else:
-                self.data_section.append(f"    {label} {var_type} 0  ; {var_type} {node.name} (label: {label})")
+                self.text_section.append(f"UARRAY {label} {var_type} 0  ; {var_type} {node.name} (label: {label})")
             self.text_section.append(f"    ; Variable ({var_type}): {node.name} = {value} (label: {label})")
             return
 
         if var_type == "buffer" and var_size:
-            # Buffers go in .bss section (uninitialized data)
-            self.bss_section.append(f"    {label} resb {var_size}  ; buffer[{var_size}]")
+            # Buffers -> unified bytes reservation
+            self.text_section.append(f"UBYTES {label} {var_size}  ; buffer[{var_size}]")
             self.text_section.append(f"    ; Buffer: {node.name}[{var_size}] in .bss")
-            print_debug(f"Added buffer to bss_section: {label} resb {var_size}")
+            print_debug(f"Added buffer as UBYTES: {label} {var_size}")
             
         elif var_type == "int":
             # If value is a simple integer literal (decimal, hex, negative),
@@ -382,12 +402,11 @@ class AssemblyCodeGenerator(ASTVisitor):
             str_value = value.strip()
             if str_value.startswith('"') and str_value.endswith('"'):
                 str_value = str_value[1:-1]
-            
-            # Add null terminator and escape sequences
-            str_value = str_value.replace('\\n', '", 10, "').replace('\\t', '", 9, "')
-            # Strings get STR# labels
-            self.data_section.append(f'    {label} db "{str_value}", 0  ; str {node.name}')
-            self.text_section.append(f"    ; Variable: str {node.name} = {value}")
+
+            # Emit unified string directive (transpiler will place into .data)
+            # Keep the variable label mapping so other code can reference it
+            self.text_section.append(f'USTR {label} "{str_value}"  ; str {node.name}')
+            self.text_section.append(f"    ; Variable: str {node.name} = {value} (label: {label})")
         elif var_type == "int" and var_size:
             # Integer array
             if value and value.strip():
@@ -663,84 +682,66 @@ class AssemblyCodeGenerator(ASTVisitor):
     def visit_println(self, node: PrintlnNode):
         """Visit println statement"""
         self.used_functions.add("printf")
-        
+
         # Clean the message
         message = node.message.strip()
-        
-        # Check if this is a variable reference
+
+        # If the message refers to a declared variable, emit formatted prints
         if message in self.variable_labels:
-            # This is a variable - print its value
             var_label = self.variable_labels[message]
             var_info = self.variable_info.get(message, {})
             var_type = var_info.get('type', 'int')
-            
+
             if var_type in ['int', 'bool']:
-                # Generate format string for integer
-                format_label = self._generate_label("fmt_int")
-                self.data_section.append(f'    {format_label} db "%d", 10, 0')
-                
-                # Generate printf call for integer
-                self.text_section.append(f"    ; println {message} (int)")
-                # Load integer value (respect equ)
+                # Load integer into rdx (transpiler will place args appropriately)
                 operand = self._format_var_operand(message, as_memory=True)
                 if self.variable_info.get(message, {}).get('type') == 'equ':
-                    # equ constant: operand is label, use direct mov
-                    self.text_section.append(f"    mov edx, {operand}")
+                    self.text_section.append(f"    mov rdx, {operand}")
                 else:
-                    self.text_section.append(f"    mov edx, dword {operand}")
-                self.text_section.append(f"    lea rcx, [rel {format_label}]")
-                self.text_section.append("    call printf")
+                    self.text_section.append(f"    mov rdx, dword {operand}")
+                self.text_section.append(f"    ; print int {message}")
+                # Use unified formatted print
+                self.text_section.append(f"UPRINTF \"%d\", rdx")
+
             elif var_type in ['str', 'string']:
-                # For strings, we need to check if it's a buffer or a string constant
-                format_label = self._generate_label("fmt_str")
-                self.data_section.append(f'    {format_label} db "%s", 10, 0')
-                
-                # Generate printf call for string
-                self.text_section.append(f"    ; println {message} (string)")
-                # For strings, we need the address of the string.
+                # Address of the string into rdx
                 operand = self._format_var_operand(message, as_memory=False)
                 if self.variable_info.get(message, {}).get('type') == 'equ':
-                    # equ string: label holds the address/data directly
                     self.text_section.append(f"    lea rdx, [{operand}]")
                 else:
                     self.text_section.append(f"    lea rdx, [rel {operand}]")
-                self.text_section.append(f"    lea rcx, [rel {format_label}]")
-                self.text_section.append("    call printf")
+                self.text_section.append(f"    ; print string {message}")
+                self.text_section.append(f"UPRINTF \"%s\", rdx")
+
             else:
-                # Fallback for other types
-                format_label = self._generate_label("fmt_int")
-                self.data_section.append(f'    {format_label} db "%d", 10, 0')
-                
-                self.text_section.append(f"    ; println {message}")
+                # Generic fallback prints as integer
                 operand = self._format_var_operand(message, as_memory=True)
                 if self.variable_info.get(message, {}).get('type') == 'equ':
-                    self.text_section.append(f"    mov edx, {operand}")
+                    self.text_section.append(f"    mov rdx, {operand}")
                 else:
-                    self.text_section.append(f"    mov edx, dword {operand}")
-                self.text_section.append(f"    lea rcx, [rel {format_label}]")
-                self.text_section.append("    call printf")
-        else:
-            # This is a string literal
-            if message.startswith('"') and message.endswith('"'):
-                message = message[1:-1]  # Remove quotes
-            
-            # Reuse existing label for identical string literals to avoid
-            # duplicate STR labels being emitted multiple times.
-            if message in self.string_labels:
-                string_label = self.string_labels[message]
-            else:
-                # Generate string label
-                string_label = self._generate_label("str")
-                self.string_labels[message] = string_label
+                    self.text_section.append(f"    mov rdx, dword {operand}")
+                self.text_section.append(f"    ; print (fallback) {message}")
+                self.text_section.append(f"UPRINTF \"%d\", rdx")
 
-                # Add string to data section with newline
-                escaped_message = message.replace('\\n', '\n').replace('\\t', '\t')
+        else:
+            # String literal
+            if message.startswith('"') and message.endswith('"'):
+                literal = message[1:-1]
+            else:
+                literal = message
+
+            if literal in self.string_labels:
+                string_label = self.string_labels[literal]
+            else:
+                string_label = self._generate_label("str")
+                self.string_labels[literal] = string_label
+                escaped_message = literal.replace('\\n', '\\n').replace('\\t', '\\t')
+                # Use data_section so pretty printer will place it correctly
                 self.data_section.append(f'    {string_label} db "{escaped_message}", 10, 0')
-            
-            # Generate printf call (Windows x64 calling convention)
-            self.text_section.append(f"    ; println \"{message}\"")
-            self.text_section.append(f"    lea rcx, [rel {string_label}]")
-            self.text_section.append("    call printf")
+
+            self.text_section.append(f"    ; print \"{literal}\"")
+            # Emit unified print directive which the transpiler maps to puts/printf
+            self.text_section.append(f"UPRINT {string_label}")
     
     def visit_scanf(self, node: ScanfNode):
         """Visit scanf statement"""
@@ -757,13 +758,13 @@ class AssemblyCodeGenerator(ASTVisitor):
         
         # Add format string to data section
         self.data_section.append(f'    {format_label} db "{format_str}", 0')
-        
+
         # Ensure variable exists
         if node.variable not in self.variable_labels:
             self.data_section.append(f"    {var_label} dd 0")
             self.variable_labels[node.variable] = var_label
-        
-        # Generate scanf call (Windows x64 calling convention)
+
+        # Generate scanf call (unified directive - transpiler handles arg setup)
         self.text_section.append(f"    ; scanf \"{format_str}\" -> {node.variable}")
         self.text_section.append(f"    lea rcx, [rel {format_label}]")
         # Use _format_var_operand to respect 'equ' variables
@@ -774,7 +775,9 @@ class AssemblyCodeGenerator(ASTVisitor):
         else:
             operand = self._format_var_operand(node.variable, as_memory=False)
             self.text_section.append(f"    lea rdx, [rel {operand}]")
-        self.text_section.append("    call scanf")
+
+        # Emit unified call for scanf so transpiler handles argument registers
+        self.text_section.append("UCALL scanf rcx rdx")
     
     def visit_assembly(self, node: AssemblyNode):
         """Visit raw assembly line"""
@@ -813,7 +816,81 @@ class AssemblyCodeGenerator(ASTVisitor):
 
             line = pattern.sub(_standalone_replace, line)
 
-        # Ensure proper indentation
+        # Detect top-level label definitions (e.g. 'foo:') and convert them
+        # into unified assembly UFUNC directives so the asm_transpiler can
+        # handle prologue/epilogue generation. Only convert simple labels
+        # without spaces or special characters.
+        label_match = _re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*$", line)
+        if label_match:
+            label = label_match.group(1)
+            # Emit UFUNC directive instead of raw label
+            self.text_section.append(f"UFUNC {label}")
+            return
+
+        # Ensure proper indentation for normal assembly lines
+        # Normalize some common high-level directives that users may write
+        # without the leading 'U' so we emit the canonical unified form.
+        # This prevents emitting raw target-specific instructions (e.g. 'ret')
+        # alongside unified directives which the transpiler also expands.
+        stripped_lower = line.strip().lower()
+
+        # func <name>
+        m = _re.match(r"^func\s+(\w+)\s*$", stripped_lower, re.I)
+        if m:
+            name = m.group(1)
+            self.text_section.append(f"UFUNC {name}")
+            return
+
+        # endfunc
+        if _re.match(r"^endfunc\s*$", stripped_lower, re.I):
+            self.text_section.append("UENDFUNC")
+            return
+
+        # ret [value]
+        m = _re.match(r"^ret(?:\s+(.+))?", line.strip(), re.I)
+        if m:
+            val = m.group(1)
+            if val:
+                self.text_section.append(f"URET {val}")
+            else:
+                self.text_section.append("URET")
+            return
+
+        # call <func> [args...]
+        m = _re.match(r"^call\s+(\w+)(?:\s+(.+))?", line.strip(), re.I)
+        if m:
+            func = m.group(1)
+            args = m.group(2) or ""
+            args = args.strip()
+            if args:
+                self.text_section.append(f"UCALL {func} {args}")
+            else:
+                self.text_section.append(f"UCALL {func}")
+            return
+
+        # print "..." or print <var>
+        m = _re.match(r'^print\s+"(.*)"', line.strip(), re.I)
+        if m:
+            literal = m.group(1)
+            # Reuse string labels if possible
+            if literal in self.string_labels:
+                string_label = self.string_labels[literal]
+            else:
+                string_label = self._generate_label("str")
+                self.string_labels[literal] = string_label
+                escaped_message = literal.replace('\\n', '\\n').replace('\\t', '\\t')
+                self.data_section.append(f'    {string_label} db "{escaped_message}", 10, 0')
+            self.text_section.append(f"UPRINT {string_label}")
+            return
+
+        # exit <code>
+        m = _re.match(r"^exit\s+(\d+)", line.strip(), re.I)
+        if m:
+            code = m.group(1)
+            self.text_section.append(f"UEXIT {code}")
+            return
+
+        # Ensure proper indentation for normal assembly lines
         if not line.startswith('    ') and not line.endswith(':'):
             line = f"    {line}"
 
@@ -952,17 +1029,15 @@ class AssemblyCodeGenerator(ASTVisitor):
         # Compile all collected C code blocks (may raise RuntimeError on failure)
         assembly_segments = c_processor.compile_all_c_code()
 
-        # If extraction returned nothing, attempt a fallback: read the saved
-        # combined GCC assembly file (if present) and re-run extraction. This
-        # helps in cases where the in-memory segments were not set for some
-        # reason but the raw assembly was saved for debugging.
+        # Fallback: if no segments were returned, try reading a saved combined
+        # assembly file that the C processor may have emitted for debugging.
         if not assembly_segments:
             try:
                 out_dir = os.path.join(os.getcwd(), 'output')
                 asm_out = os.path.join(out_dir, 'combined_asm_from_cprocessor.s')
                 if os.path.exists(asm_out):
-                    with open(asm_out, 'r', encoding='utf-8') as _af:
-                        raw_asm = _af.read()
+                    with open(asm_out, 'r', encoding='utf-8') as _f:
+                        raw_asm = _f.read()
                     print_info('Attempting fallback extraction from saved combined assembly')
                     assembly_segments = c_processor._extract_assembly_segments(raw_asm)
                     # Also extract string constants if present
@@ -972,12 +1047,8 @@ class AssemblyCodeGenerator(ASTVisitor):
             except Exception as e:
                 print_warning(f'Fallback assembly extraction failed: {e}')
 
-        if not assembly_segments:
-            # No compiled C assembly segments. If there were blocks collected, this
-            # means compilation produced nothing; surface a warning and continue.
-            if c_processor.c_code_blocks:
-                print_warning("No C code blocks were compiled into assembly")
-            return
+        if not assembly_segments and c_processor.c_code_blocks:
+            print_warning("No C code blocks were compiled into assembly")
 
         print_success(f"Compiled {len(assembly_segments)} C code blocks")
 
@@ -990,12 +1061,12 @@ class AssemblyCodeGenerator(ASTVisitor):
                 string_lines = string_constants.split('\n')
                 for line in reversed(string_lines):
                     if line.strip():
-                        # Strings coming from C processor use CSTR prefix already
                         self.data_section.insert(0, f"    {line.strip()}")
             del assembly_segments['_STRING_CONSTANTS']
 
         # Replace placeholders with actual assembly
         updated_sections = []
+        import re
         for line in self.text_section:
             if "{CASM_BLOCK_" in line and "} ; Placeholder for assembly" in line:
                 # Extract marker from placeholder
@@ -1006,39 +1077,13 @@ class AssemblyCodeGenerator(ASTVisitor):
                         # Replace with actual assembly
                         assembly_code = assembly_segments[marker]
                         if assembly_code.strip():
-                            # Remove the previously emitted C-block header/comments/NOPs
-                            header = f"    ; C code block: {marker}"
-                            # search backwards for the header and trim anything from it onward
-                            for i in range(len(updated_sections)-1, -1, -1):
-                                if updated_sections[i] == header:
-                                    # remove header and anything after it
-                                    del updated_sections[i:]
-                                    break
-
-                            # Insert only the cleaned assembly instructions (no generated comment)
                             for asm_line in assembly_code.split('\n'):
                                 if asm_line.strip():
                                     updated_sections.append(f"    {asm_line}")
                         else:
                             updated_sections.append("    ; Empty assembly block")
-                            # If we could not find the header (loop completed without break),
-                            # fall back to inserting at the placeholder location so we
-                            # don't leave an empty block.
-                            else_found = False
-                            for i in range(len(updated_sections)-1, -1, -1):
-                                if updated_sections[i] == header:
-                                    else_found = True
-                                    break
-                            if not else_found:
-                                # Insert assembly lines directly at this point
-                                for asm_line in assembly_code.split('\n'):
-                                    if asm_line.strip():
-                                        updated_sections.append(f"    {asm_line}")
                     else:
-                        # Fallback: if we extracted exactly one assembly segment
-                        # and the requested marker is missing (common when
-                        # marker numbering shifted during merging), use the
-                        # single available segment as a best-effort replacement.
+                        # Fallback: if exactly one segment is available, use it
                         fallback_keys = [k for k in assembly_segments.keys() if k != '_STRING_CONSTANTS']
                         if len(fallback_keys) == 1:
                             fk = fallback_keys[0]

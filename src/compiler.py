@@ -18,6 +18,7 @@ from .utils.formatter import formatter
 from .utils.colors import print_info, print_success, print_warning, print_error, print_system
 from .utils.syntax import check_syntax, format_errors
 from .utils.term import print_stage, print_error as term_error, print_info as term_info
+from .utils.asm_transpiler import transpile_text
 
 class CASMProcessor:
     """Core CASM language processor"""
@@ -60,6 +61,41 @@ class CASMProcessor:
             print_info(f"Parsed AST with {len(ast.statements)} statements")
             
             # Generate assembly
+            # Extract top-level bracketed assembler directives (e.g. [BITS 16])
+            try:
+                directives = []
+                for line in raw_content.splitlines():
+                    s = line.strip()
+                    if s.startswith('[') and s.endswith(']'):
+                        directives.append(s)
+                # Attach to codegen so it can emit these at the top of the file
+                setattr(self.codegen, 'top_directives', directives)
+            except Exception:
+                setattr(self.codegen, 'top_directives', [])
+
+            # Provide target hints to the code generator so it can emit
+            # platform-appropriate section headers and conventions when
+            # generating unified assembly. Default to host detection.
+            try:
+                host = platform.system().lower()
+                if 'darwin' in host:
+                    tgt = 'macos'
+                elif 'windows' in host:
+                    tgt = 'windows'
+                else:
+                    tgt = 'linux'
+                setattr(self.codegen, 'target_platform', tgt)
+                arch = platform.machine().lower()
+                if 'aarch64' in arch or 'arm' in arch:
+                    setattr(self.codegen, 'target_arch', 'arm64')
+                elif 'riscv' in arch:
+                    setattr(self.codegen, 'target_arch', 'riscv64')
+                else:
+                    setattr(self.codegen, 'target_arch', 'x86_64')
+            except Exception:
+                setattr(self.codegen, 'target_platform', None)
+                setattr(self.codegen, 'target_arch', None)
+
             assembly_code = self.codegen.generate(ast)
             line_count = len(assembly_code.split(chr(10)))
             print_success(f"Generated {line_count} lines of optimized assembly")
@@ -88,6 +124,28 @@ class CASMCompiler:
         self._last_info = None
         # detect host once
         self.host = self._detect_host()
+        # detect arch once
+        self.arch = self._detect_arch()
+
+    def _detect_arch(self) -> str:
+        """Return normalized architecture id: 'x86_64', 'arm64', or 'riscv64'."""
+        m = platform.machine().lower()
+        if 'aarch64' in m or 'arm' in m:
+            return 'arm64'
+        if 'riscv' in m:
+            return 'riscv64'
+        if 'x86_64' in m or 'amd64' in m:
+            return 'x86_64'
+        # default
+        return 'x86_64'
+
+    def _host_to_target(self) -> str:
+        """Map detected host to asm_transpiler target names."""
+        if self.host == 'darwin':
+            return 'macos'
+        if self.host == 'windows':
+            return 'windows'
+        return 'linux'
 
     def _detect_host(self) -> str:
         """Return a normalized host id: 'linux', 'darwin', or 'windows'."""
@@ -98,7 +156,7 @@ class CASMCompiler:
             return 'windows'
         return 'linux'
     
-    def compile_to_assembly(self, input_file: str, output_file: str = None, quiet: bool = False) -> bool:
+    def compile_to_assembly(self, input_file: str, output_file: str = None, quiet: bool = False, target: Optional[str] = None, arch: Optional[str] = None) -> bool:
         """Compile CASM to assembly file"""
         try:
             # The higher-level CLI now controls visible messages; avoid duplicate system prints
@@ -106,7 +164,33 @@ class CASMCompiler:
             print_debug(f"Assembly generation for {input_file}...")
 
             # Generate assembly
+            # Generate assembly (unified/transpiler-friendly assembly)
             assembly_code = self.processor.process_file(input_file)
+
+            # Transpile unified assembly into platform-specific assembly
+            target = target or self._host_to_target()
+            arch = arch or self.arch
+            try:
+                assembly_code = transpile_text(assembly_code, target=target, arch=arch, opt_level='none')
+                # The transpiler may inject platform-specific section headers
+                # and reorder sections. Run the AssemblyFixer to normalize the
+                # output and then ensure string literals are placed under
+                # section .data via the codegen helper.
+                try:
+                    from .core.assembly_fixer import assembly_fixer
+                    assembly_code = assembly_fixer.fix_assembly(assembly_code)
+                except Exception:
+                    # Non-fatal: continue with transpiled code
+                    pass
+
+                try:
+                    # Ensure any STR... db lines are in .data
+                    assembly_code = self.processor.codegen._move_strings_to_data(assembly_code)
+                except Exception:
+                    pass
+            except Exception:
+                # If transpilation fails, fall back to original assembly
+                pass
 
             # Determine output file
             if output_file is None:
@@ -117,6 +201,21 @@ class CASMCompiler:
 
             # Add debug info and format
             final_assembly = formatter.add_debug_info(assembly_code, input_file)
+
+            # Final sanitization: ensure any duplicates accidentally
+            # reintroduced later in the pipeline are removed. This is
+            # defensive and uses the pretty printer's cleanup helpers to
+            # collapse repeated section headers and remove consecutive
+            # duplicate instruction lines (e.g., duplicated 'leave').
+            try:
+                from .core.pretty import pretty_printer
+                final_assembly = pretty_printer._collapse_duplicate_section_headers(final_assembly)
+                final_assembly = pretty_printer._remove_consecutive_duplicate_instructions(final_assembly)
+            except Exception:
+                # Non-fatal: if the pretty printer helpers are unavailable
+                # or fail for some reason, continue with the current
+                # assembly content rather than aborting the compilation.
+                pass
 
             # Write assembly file (no automatic asm prelude; prettifier will
             # emit grouped externs when appropriate)
@@ -131,7 +230,7 @@ class CASMCompiler:
             term_error(f"Assembly generation failed: {e}")
             return False
     
-    def compile_to_executable(self, input_file: str, output_executable: str = None, run_after: bool = False, quiet: bool = False) -> bool:
+    def compile_to_executable(self, input_file: str, output_executable: str = None, run_after: bool = False, quiet: bool = False, target: Optional[str] = None, arch: Optional[str] = None) -> bool:
         """Compile CASM to executable"""
         try:
             # Check dependencies first
@@ -158,6 +257,15 @@ class CASMCompiler:
                 print_stage(1, 4, f"Processing {input_file}...")
             # Process CASM file
             assembly_code = self.processor.process_file(input_file)
+
+            # Transpile unified assembly into platform-specific assembly
+            target = target or self._host_to_target()
+            arch = arch or self.arch
+            try:
+                assembly_code = transpile_text(assembly_code, target=target, arch=arch, opt_level='none')
+            except Exception:
+                # If transpilation fails, continue with the generated assembly
+                pass
 
             # Automatically generate a small driver if assembly references external
             # CASM variables (V#) or Winsock imports (__imp_*) so linking succeeds.

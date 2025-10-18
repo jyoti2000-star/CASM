@@ -8,9 +8,18 @@ import contextlib
 from pathlib import Path
 # Import the global compiler instance
 from src.compiler import compiler
+# Optional advanced asm transpiler (converts unified asm to target-specific NASM)
+try:
+    from src.utils.asm_transpiler import transpile_file as _transpile_asm_file
+    HAS_ASM_TRANSPILER = True
+except Exception:
+    HAS_ASM_TRANSPILER = False
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+
+sys.dont_write_bytecode = True
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 # Use questionary for interactive prompts
 try:
@@ -74,12 +83,12 @@ def show_menu(file_name: str) -> str:
     console.print(f"[dim]File:[/dim] [#9b59b6]{file_name}[/#9b59b6]\n")
     
     choices = [
-        {'name': 'Compile to Executable', 'value': 'exe'},
-        {'name': 'Generate Assembly', 'value': 'asm'},
-        {'name': 'Compile to Binary', 'value': 'bin'},
-        {'name': 'Compile to Object File', 'value': 'obj'}
+        questionary.Choice('Compile to Executable', value='exe'),
+        questionary.Choice('Generate Assembly', value='asm'),
+        questionary.Choice('Compile to Binary', value='bin'),
+        questionary.Choice('Compile to Object File', value='obj'),
     ]
-    
+
     try:
         result = questionary.select(
             "Select output format:",
@@ -97,7 +106,7 @@ def show_menu(file_name: str) -> str:
     except KeyboardInterrupt:
         raise
 
-def compile_with_progress(output_type, input_file, debug_save=False, cflags=None, ldflags=None):
+def compile_with_progress(output_type, input_file, debug_save=False, cflags=None, ldflags=None, platform_opt: str = 'linux', arch_opt: str = 'x86_64'):
     """Execute compilation with progress indicators"""
     success = False
     
@@ -151,7 +160,7 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                 buf_out = io.StringIO()
                 buf_err = io.StringIO()
                 with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                    success = compiler.compile_to_executable(input_file, run_after=False, quiet=True)
+                    success = compiler.compile_to_executable(input_file, run_after=False, quiet=True, target=platform_opt, arch=arch_opt)
                 captured = (buf_out.getvalue() or '') + '\n' + (buf_err.getvalue() or '')
                 captured = captured.strip()
                 if debug_save and captured:
@@ -196,7 +205,7 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
             buf_out = io.StringIO()
             buf_err = io.StringIO()
             with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                ok = compiler.compile_to_assembly(input_file, tmp_asm, quiet=True)
+                ok = compiler.compile_to_assembly(input_file, tmp_asm, quiet=True, target=platform_opt, arch=arch_opt)
             captured = (buf_out.getvalue() or '') + '\n' + (buf_err.getvalue() or '')
             captured = captured.strip()
             if not ok:
@@ -207,8 +216,28 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                     print_error_summary(err_text='Assembly generation failed')
                 return False
 
+            # Optionally run the ASM transpiler to convert to target-specific NASM
+            if HAS_ASM_TRANSPILER:
+                try:
+                    _transpile_asm_file(tmp_asm, target=platform_opt, out_path=tmp_asm)
+                except Exception as e:
+                    # Non-fatal: warn and continue with the original assembly
+                    try:
+                        console.print(f"[yellow]Warning:[/yellow] asm transpiler failed: {e}")
+                    except Exception:
+                        pass
+
             # run nasm to produce desired output
-            nasm_fmt = compiler._nasm_format_for_host() if hasattr(compiler, '_nasm_format_for_host') else 'elf64'
+            # Choose NASM output format from platform/arch
+            def _nasm_format_for(platform_name: str, arch_name: str) -> str:
+                p = (platform_name or 'linux').lower()
+                a = (arch_name or 'x86_64').lower()
+                if a in ('x86_64', 'amd64', 'x64'):
+                    return 'win64' if p == 'windows' else 'elf64'
+                else:
+                    return 'win32' if p == 'windows' else 'elf32'
+
+            nasm_fmt = _nasm_format_for(platform_opt, arch_opt)
             out_name = Path(input_file).stem + ('.bin' if output_type == 'bin' else '.o')
             out_path = os.path.join('output', out_name)
 
@@ -274,7 +303,7 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                 buf_out = io.StringIO()
                 buf_err = io.StringIO()
                 with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                    success = compiler.compile_to_assembly(input_file, output_file, quiet=True)
+                    success = compiler.compile_to_assembly(input_file, output_file, quiet=True, target=platform_opt, arch=arch_opt)
                 captured = (buf_out.getvalue() or '') + '\n' + (buf_err.getvalue() or '')
                 captured = captured.strip()
                 # Save full log if requested
@@ -323,6 +352,10 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
 
                 print_error_summary(err_text=preview_text, info_text=info_text)
                 return False
+            # Note: compile_to_assembly already runs the asm_transpiler internally
+            # to translate unified directives to platform-specific assembly. Do
+            # not invoke the transpiler again here (it would overwrite the
+            # sanitized file and could reintroduce duplicates).
 
     return success
 
@@ -405,10 +438,116 @@ def main():
     if not validate_file(input_file):
         sys.exit(1)
     
+    # Platform/architecture options for asm transpilation and assembler format
+    platform_opt = 'linux'
+    arch_opt = 'x86_64'
+
+    # Parse platform/arch from CLI options if present
+    i = 0
+    while i < len(options):
+        opt = options[i]
+        if opt == '--platform' and i + 1 < len(options):
+            platform_opt = options[i+1]
+            i += 2
+            continue
+        if opt == '--arch' and i + 1 < len(options):
+            arch_opt = options[i+1]
+            i += 2
+            continue
+        i += 1
+
     try:
         # Show header once, then interactive menu. Avoid printing the header
         # again later so it doesn't repeat.
         print_header()
+        # Interactive selection for target platform/architecture (only when
+        # not provided via CLI). Use the compiler detection as defaults.
+        try:
+            default_platform = compiler._host_to_target()
+        except Exception:
+            default_platform = platform_opt
+        try:
+            default_arch = compiler.arch
+        except Exception:
+            default_arch = arch_opt
+
+        def _text_choice(prompt: str, choices: list, default: str):
+            # Simple textual fallback when questionary isn't available or
+            # when it returns None (non-interactive terminals).
+            console.print(prompt)
+            for i, (name, val) in enumerate(choices, 1):
+                console.print(f"  {i}) {name}")
+            console.print(f"Press Enter for default: {default}")
+            try:
+                sel = input('> ').strip()
+            except Exception:
+                return default
+            if sel == '':
+                return default
+            try:
+                idx = int(sel) - 1
+                if 0 <= idx < len(choices):
+                    return choices[idx][1]
+            except Exception:
+                pass
+            return default
+
+        # Offer selection only when not supplied on CLI
+        if '--platform' not in options and '--arch' not in options and not requested_type:
+            # Try questionary first, but gracefully fall back to text input
+            if HAS_QUESTIONARY:
+                try:
+                    plat_choice = questionary.select(
+                        "Select target platform:",
+                        choices=[
+                            questionary.Choice('Linux', value='linux'),
+                            questionary.Choice('Windows', value='windows'),
+                            questionary.Choice('macOS', value='macos'),
+                            questionary.Choice('BSD', value='bsd'),
+                        ],
+                        default=default_platform,
+                        style=custom_style
+                    ).ask()
+                    if plat_choice:
+                        platform_opt = plat_choice
+                    else:
+                        # questionary returned None (non-interactive); fallback
+                        platform_opt = _text_choice("Select target platform:",
+                                                    [("Linux","linux"), ("Windows","windows"), ("macOS","macos"), ("BSD","bsd")],
+                                                    default_platform)
+
+                    arch_choice = questionary.select(
+                        "Select target architecture:",
+                        choices=[
+                            questionary.Choice('x86_64', value='x86_64'),
+                            questionary.Choice('ARM64', value='arm64'),
+                            questionary.Choice('RISC-V64', value='riscv64'),
+                        ],
+                        default=default_arch,
+                        style=custom_style
+                    ).ask()
+                    if arch_choice:
+                        arch_opt = arch_choice
+                    else:
+                        arch_opt = _text_choice("Select target architecture:",
+                                                [("x86_64","x86_64"), ("ARM64","arm64"), ("RISC-V64","riscv64")],
+                                                default_arch)
+                except Exception:
+                    # On any error with questionary, fall back to text-based selection
+                    platform_opt = _text_choice("Select target platform:",
+                                                [("Linux","linux"), ("Windows","windows"), ("macOS","macos"), ("BSD","bsd")],
+                                                default_platform)
+                    arch_opt = _text_choice("Select target architecture:",
+                                             [("x86_64","x86_64"), ("ARM64","arm64"), ("RISC-V64","riscv64")],
+                                             default_arch)
+            else:
+                # No questionary installed: use simple text fallback
+                platform_opt = _text_choice("Select target platform:",
+                                            [("Linux","linux"), ("Windows","windows"), ("macOS","macos"), ("BSD","bsd")],
+                                            default_platform)
+                arch_opt = _text_choice("Select target architecture:",
+                                         [("x86_64","x86_64"), ("ARM64","arm64"), ("RISC-V64","riscv64")],
+                                         default_arch)
         # If a type was requested via CLI, use it non-interactively. Otherwise
         # show the interactive menu.
         if requested_type:
@@ -424,7 +563,7 @@ def main():
         start_time = time.time()
         
         # Execute compilation with progress
-        success = compile_with_progress(output_type, input_file, debug_save, cflags=cflags, ldflags=ldflags)
+        success = compile_with_progress(output_type, input_file, debug_save, cflags=cflags, ldflags=ldflags, platform_opt=platform_opt, arch_opt=arch_opt)
         
         if not success:
             sys.exit(1)

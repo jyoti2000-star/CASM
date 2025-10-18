@@ -41,8 +41,20 @@ class CASMPrettyPrinter:
         # Pre-scan AST to collect for loop counters
         self._collect_for_loop_counters(ast)
         
-        lines = assembly_code.split('\n')
-        sections = self._parse_assembly_sections(assembly_code)
+        # Normalize platform-specific section headers to canonical NASM forms
+        normalized_code = assembly_code
+        # macOS style sections -> NASM canonical
+        normalized_code = re.sub(r'section\s+__DATA,__data', 'section .data', normalized_code, flags=re.I)
+        normalized_code = re.sub(r'section\s+__TEXT,__text', 'section .text', normalized_code, flags=re.I)
+        # common read-only/data sections mapping
+        normalized_code = re.sub(r'section\s+\.rdata', 'section .data', normalized_code, flags=re.I)
+        # .rodata (common GCC output) -> .data
+        normalized_code = re.sub(r'section\s+\.rodata', 'section .data', normalized_code, flags=re.I)
+        # map other common variants to canonical forms (case-insensitive)
+        normalized_code = re.sub(r'section\s+__DATA', 'section .data', normalized_code, flags=re.I)
+
+        lines = normalized_code.split('\n')
+        sections = self._parse_assembly_sections(normalized_code)
         # Collect scattered variable declarations (V# ...) from any section
         # and group them together under .equ/.data/.bss for cleaner output.
         equ_defs = []
@@ -225,6 +237,9 @@ class CASMPrettyPrinter:
         # un-indent/indent consistently and tidy spacing.
         final = '\n'.join(output)
 
+        # Collapse duplicate section headers (e.g. multiple 'section .text')
+        final = self._collapse_duplicate_section_headers(final)
+
         # Remove NOP markers that indicate start/end of C-generated
         # instructions, e.g. lines like:
         #     nop  ; start_c_instr CASM_BLOCK_0
@@ -239,8 +254,44 @@ class CASMPrettyPrinter:
             filtered_lines.append(ln)
 
         final = '\n'.join(filtered_lines)
+        # Remove immediate repeated blocks (defensive)
+        # Remove immediate repeated single-line instructions (e.g., duplicate 'leave')
+        final = self._remove_consecutive_duplicate_instructions(final)
+        # Remove larger repeated blocks defensively as well
+        final = self._remove_immediate_duplicate_blocks(final)
         final = self._normalize_indentation(final)
+        # Final safety-net: remove any remaining consecutive duplicate instructions
+        final = self._remove_consecutive_duplicate_instructions(final)
         return final
+
+    def _remove_consecutive_duplicate_instructions(self, assembly_code: str) -> str:
+        """Remove consecutive duplicate single instruction lines while preserving labels/directives/comments.
+
+        This is a narrow pass: it only removes duplicates when the exact same
+        instruction line appears immediately twice (ignoring whitespace). It
+        will not remove duplicates separated by labels, directives or comments.
+        """
+        lines = assembly_code.split('\n')
+        out = []
+        prev_norm = None
+        for ln in lines:
+            s = ln.strip()
+            # Preserve labels, directives, comments, blank lines
+            if not s or s.endswith(':') or s.startswith(';') or s.lower().startswith('section') or s.lower().startswith('extern') or s.lower().startswith('global') or s.lower().startswith('weak'):
+                out.append(ln)
+                prev_norm = None
+                continue
+
+            # Normalize whitespace inside instruction for comparison
+            norm = re.sub(r'\s+', ' ', s)
+            if prev_norm is not None and norm == prev_norm:
+                # Skip duplicate
+                continue
+
+            out.append(ln)
+            prev_norm = norm
+
+        return '\n'.join(out)
     
     def _collect_all_strings(self, ast: ProgramNode):
         """Pre-process AST to collect all string literals for consistent labeling"""
@@ -407,7 +458,7 @@ class CASMPrettyPrinter:
             # Regular assembly parsing
             if stripped.startswith('extern'):
                 sections['externals'].append(line)
-            elif stripped.startswith('section .data'):
+            elif stripped.startswith('section .data') or stripped.startswith('section .rodata'):
                 current_section = 'data'
                 sections['data'].append(line)
             elif stripped.startswith('section .bss'):
@@ -1170,6 +1221,119 @@ class CASMPrettyPrinter:
 
         # Ensure trailing newline
         return '\n'.join(out) + '\n'
+
+    def _collapse_duplicate_section_headers(self, assembly_code: str) -> str:
+        """Collapse repeated section headers and enforce ordering (data, bss, text).
+
+        This reduces noise when multiple passes insert platform-specific
+        section directives (e.g. macOS + NASM) and ensures a single canonical
+        header of each kind appears in the output.
+        """
+        lines = assembly_code.split('\n')
+        seen = set()
+        out = []
+        # We'll collect sections and re-emit in canonical order at the end
+        sections = {'header': [], 'data': [], 'bss': [], 'text': []}
+        current = 'header'
+
+        for ln in lines:
+            s = ln.strip()
+            if s.lower().startswith('section .data'):
+                current = 'data'
+                if 'data' in seen:
+                    # Skip duplicate header line
+                    continue
+                seen.add('data')
+                sections['data'].append('section .data')
+                continue
+            if s.lower().startswith('section .bss'):
+                current = 'bss'
+                if 'bss' in seen:
+                    continue
+                seen.add('bss')
+                sections['bss'].append('section .bss')
+                continue
+            if s.lower().startswith('section .text'):
+                current = 'text'
+                if 'text' in seen:
+                    continue
+                seen.add('text')
+                sections['text'].append('section .text')
+                continue
+
+            sections[current].append(ln)
+
+        # Rebuild with canonical ordering: header, data, bss, text
+        # Emit header lines first
+        out.extend([l for l in sections['header'] if l.strip()])
+
+        # Helper to emit a single canonical section: header once, then its content
+        def emit_section(section_key: str, header_name: str):
+            sec_lines = sections.get(section_key, [])
+            # If there are no lines for this section, skip it
+            if not sec_lines:
+                return
+            # Add a separating blank line between major sections
+            if out and out[-1].strip():
+                out.append('')
+            # Emit canonical header
+            out.append(header_name)
+            # Emit the rest of the lines for this section, skipping any existing header lines
+            for l in sec_lines:
+                if not l or not l.strip():
+                    continue
+                low = l.strip().lower()
+                # Normalize any rodata/rodata-like headers into data and skip header re-emissions
+                if low.startswith('section .data') or low.startswith('section .bss') or low.startswith('section .text') or low.startswith('section .rodata'):
+                    # skip any header-like lines that came from previous passes
+                    continue
+                out.append(l)
+
+        # Emit data, bss, text in canonical order
+        emit_section('data', 'section .data')
+        emit_section('bss', 'section .bss')
+        emit_section('text', 'section .text')
+
+        # Trim leading/trailing empties and join
+        cleaned = '\n'.join(out).strip() + '\n'
+        return cleaned
+
+    def _remove_immediate_duplicate_blocks(self, assembly_code: str, min_block_lines: int = 3) -> str:
+        """Remove immediate duplicate blocks: if a sequence of lines repeats
+        immediately after itself, remove the second occurrence. This is a
+        defensive cleanup for cases where earlier passes accidentally
+        duplicated code (common for small examples).
+
+        The algorithm checks for consecutive identical sequences of length
+        between min_block_lines and a reasonable upper bound (e.g. 80).
+        """
+        lines = assembly_code.split('\n')
+        i = 0
+        out = []
+        n = len(lines)
+
+        while i < n:
+            # Try to find a repeated block starting at i. Check longer blocks first.
+            found_repeat = False
+            max_block = min(80, (n - i) // 2)
+            for size in range(max_block, min_block_lines - 1, -1):
+                a_start = i
+                a_end = i + size
+                b_start = a_end
+                b_end = b_start + size
+                if b_end > n:
+                    continue
+                if lines[a_start:a_end] == lines[b_start:b_end]:
+                    # Emit the first block and skip the duplicate second block
+                    out.extend(lines[a_start:a_end])
+                    i = b_end
+                    found_repeat = True
+                    break
+            if not found_repeat:
+                out.append(lines[i])
+                i += 1
+
+        return '\n'.join(out)
     
     def _generate_condition_assembly(self, condition: str) -> tuple[List[str], str]:
         """Generate assembly code for condition evaluation and return the appropriate jump instruction"""

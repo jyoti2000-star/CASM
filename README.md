@@ -61,6 +61,25 @@ Non-interactive example (produce assembly without the interactive prompt):
 python3 casm.py examples/main.asm -t asm
 ```
 
+You can also use the newer, shorter unified directives (no leading "U" and in lowercase).
+For example the file `examples/ufunc_nou.asm` demonstrates `func` / `endfunc` / `call` / `ret` / `exit` usage.
+
+Generate assembly from the new-style example non-interactively:
+
+```bash
+python3 casm.py examples/ufunc_nou.asm -t asm
+```
+
+If you prefer to run the standalone transpiler (converts unified directives into target NASM):
+
+```bash
+# Transpile using the bundled transpiler (module form)
+python3 -m src.utils.asm_transpiler examples/ufunc_nou.asm --target linux --arch x86_64 -o output/ufunc_nou.asm
+
+# Or call the script directly (same effect)
+python3 src/utils/asm_transpiler.py examples/ufunc_nou.asm --target linux --arch x86_64 -o output/ufunc_nou.asm
+```
+
 Compile to a Windows executable (non-interactive, passing custom linker flags):
 
 ```bash
@@ -216,6 +235,122 @@ If GCC fails to compile the combined C file, the build aborts and the top-level 
 ### Raw assembly
 
 Any line that is not recognized as a CASM keyword/statement is treated as raw assembly (the lexer will emit `ASSEMBLY_LINE` tokens). These are passed directly to the output, possibly with minor normalization by the pretty-printer and assembly fixer.
+
+## Unified directives (U-prefixed and short aliases)
+
+CASM now supports a unified, platform-abstract directive set implemented by the bundled asm transpiler. Each directive has a canonical U-prefixed form (used internally and by older code) and a short, friendlier alias that you can write without the leading `U` and in lowercase. The transpiler accepts both styles interchangeably.
+
+Key points:
+
+- You can write `UFUNC name` or `func name` (both accepted).
+- The transpiler recognizes directives case-insensitively and will also accept end markers both with and without `U` (e.g. `UENDMACRO` or `endmacro`).
+- Use the U-prefixed forms when you want to be explicit; use the lowercase aliases for brevity.
+
+Common directives and their short aliases
+
+- Functions and calls
+
+  - UFUNC <name> (alias: func <name>) — begin function (emits prologue)
+  - UENDFUNC (alias: endfunc) — end function
+  - UCALL <name> [args...] (alias: call <name> [args...]) — call function, args handled by transpiler
+  - URET [value] (alias: ret [value]) — return from function
+
+- Parameters / locals
+
+  - UPARAM <index> <dest> (alias: param <index> <dest>) — move nth argument into local register/var
+  - ULOCAL <bytes> (alias: local <bytes>) — reserve local stack space (bytes)
+
+- Data and constants
+
+  - USTR <label> "text" (alias: str <label> "text") — define a string constant
+  - UWSTR <label> "text" (alias: wstr <label> "text") — wide string (Windows) or normal otherwise
+  - UCONST <name> <value> (alias: const <name> <value>) — assembler equ/constant
+  - UARRAY <label> <type> <values> (alias: array <label> <type> <values>) — define an array
+  - UBYTES <label> <count> (alias: bytes <label> <count>) — reserve bytes in BSS
+
+- I/O and libc helpers
+
+  - UPRINT <label> (alias: print <label>) — call puts/prints for a label
+  - UPRINTF "fmt" [args...] (alias: printf "fmt" [args...]) — formatted print
+  - UEXIT <code> (alias: exit <code>) — program exit (transpiler emits correct syscall or API)
+
+- Memory and syscalls
+
+  - UMALLOC <size> [dest] (alias: malloc <size> [dest])
+  - UFREE <ptr> (alias: free <ptr>)
+  - USYSCALL <name> [args] (alias: syscall <name> [args]) — platform syscall wrapper
+
+- Control / optimization
+
+  - ULOOP <label> [count] (alias: loop <label> [count])
+  - UENDLOOP (alias: endloop)
+  - UOPTIMIZE <directive> (alias: optimize <directive>)
+  - UPRAGMA <text> (alias: pragma <text>)
+
+- Inline / macros
+
+  - UINLINE [lang] (alias: inline [lang]) — begin inline block
+  - UENDINLINE / ENDINLINE — end inline block
+  - UMACRO <name> [params] (alias: macro <name> [params]) — begin macro
+  - UENDMACRO / ENDMACRO — end macro
+  - UEXPAND <name> [args] (alias: expand <name> [args]) — expand macro
+
+- Misc utilities
+  - UPUSH <regs> / UPOP <regs> (alias: push/pop) — save/restore registers
+  - UALIGN <n> (alias: align <n>) — align to boundary
+  - UCOMMENT <text> (alias: comment <text>) — assembly comment emission
+  - GLOBAL <name> / EXTERN <name> — same as before; exports/imports
+
+Examples
+
+Function + call (short aliases):
+
+```asm
+func myfunc
+    mov eax, 7
+    ret eax
+endfunc
+
+call myfunc
+```
+
+Same using canonical U-forms:
+
+```asm
+UFUNC myfunc
+    mov eax, 7
+    URET eax
+UENDFUNC
+
+UCALL myfunc
+```
+
+Formatted print + exit:
+
+```asm
+printf "%s\n", msg
+exit 0
+```
+
+Notes and migration tips
+
+- The transpiler accepts both `U`-prefixed directives and the short aliases. You can migrate incrementally: existing files with `U*` directives continue to work.
+- If you prefer the small, human-friendly form, use the short aliases (lowercase). The code generator (codegen) can be updated to emit the short forms automatically — tell me if you want me to do that across the project.
+- For C-interop, keep using `extern` for forwarded includes; the transpiler will still generate correct externs for libc functions it needs (printf, malloc, free, etc.).
+
+Advanced: argument passing and calling conventions
+
+The `UCALL` / `call` directive lets the transpiler handle platform ABI differences for you. When you write:
+
+```asm
+call printf rdi rsi
+```
+
+the transpiler will place arguments in the correct registers for the target platform (System V vs Windows x64) and handle shadow space/stack alignment when needed. Use explicit argument expressions (registers, immediates, or memory operands) separated by commas.
+
+If you want the call to push extra stack args (beyond register arguments), list them after the register args; the transpiler will emit pushes and cleanup.
+
+---
 
 ## Examples
 

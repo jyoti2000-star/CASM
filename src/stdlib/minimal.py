@@ -6,17 +6,17 @@ class MinimalStdLib:
     
     def __init__(self):
         self.available_functions = {
-            'println': self._println_info,
+            'print': self._println_info,
             'scanf': self._scanf_info,
         }
     
     def _println_info(self) -> Dict:
         """Information about println function"""
         return {
-            'name': 'println',
+            'name': 'print',
             'description': 'Print a line to console with newline',
             'parameters': ['message'],
-            'example': '%println "Hello World"',
+            'example': '%print "Hello World"',
             'external_deps': ['printf']
         }
     
