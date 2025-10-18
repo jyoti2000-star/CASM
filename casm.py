@@ -56,7 +56,7 @@ def print_header():
     console.print()
     console.print(Panel.fit(
         "[bold #9b59b6]CASM[/bold #9b59b6] [dim](C Assembly)[/dim]",
-        border_style="#8e44ad",
+        border_style="#202020",
         padding=(0, 2)
     ))
     console.print()
@@ -85,26 +85,21 @@ def show_menu(file_name: str) -> str:
     choices = [
         questionary.Choice('Compile to Executable', value='exe'),
         questionary.Choice('Generate Assembly', value='asm'),
-        questionary.Choice('Compile to Binary', value='bin'),
         questionary.Choice('Compile to Object File', value='obj'),
     ]
 
-    try:
-        result = questionary.select(
-            "Select output format:",
-            choices=choices,
-            style=custom_style,
-            use_shortcuts=False,
-            use_arrow_keys=True,
-            instruction="(Use arrow keys)"
-        ).ask()
-        
-        if result is None:  # User cancelled with Ctrl+C
-            raise KeyboardInterrupt
-            
-        return result
-    except KeyboardInterrupt:
-        raise
+    result = questionary.select(
+        "Select output format:",
+        choices=choices,
+        style=custom_style,
+        use_shortcuts=False,
+        use_arrow_keys=True,
+        instruction="(Use arrow keys)"
+    ).ask()
+    if result is None:
+        # treat cancel as KeyboardInterrupt to be handled by caller
+        raise KeyboardInterrupt
+    return result
 
 def compile_with_progress(output_type, input_file, debug_save=False, cflags=None, ldflags=None, platform_opt: str = 'linux', arch_opt: str = 'x86_64'):
     """Execute compilation with progress indicators"""
@@ -157,6 +152,11 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                     c_processor.user_cflags = cflags
                 if ldflags:
                     c_processor.user_ldflags = ldflags
+                # Ensure C processor knows the requested target/arch
+                try:
+                    c_processor.set_target(platform_opt, arch_opt)
+                except Exception:
+                    pass
                 buf_out = io.StringIO()
                 buf_err = io.StringIO()
                 with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
@@ -189,7 +189,7 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                 return False
         return True
 
-    elif output_type in ('bin', 'obj'):
+    elif output_type == 'obj':
         # Generate assembly in temp dir, then run nasm to produce bin or obj in output
         import tempfile, subprocess
         tmpdir = tempfile.mkdtemp(prefix='casm_')
@@ -238,7 +238,7 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                     return 'win32' if p == 'windows' else 'elf32'
 
             nasm_fmt = _nasm_format_for(platform_opt, arch_opt)
-            out_name = Path(input_file).stem + ('.bin' if output_type == 'bin' else '.o')
+            out_name = Path(input_file).stem + '.o'
             out_path = os.path.join('output', out_name)
 
             cmd = ['nasm', '-f', nasm_fmt, tmp_asm, '-o', out_path]
@@ -376,8 +376,6 @@ def prune_output(output_type: str, input_file: str):
         expected = os.path.join(out_dir, f"{stem}.asm")
     elif output_type == 'exe':
         expected = os.path.join(out_dir, f"{stem}.exe")
-    elif output_type == 'bin':
-        expected = os.path.join(out_dir, f"{stem}.bin")
     elif output_type == 'obj':
         expected = os.path.join(out_dir, f"{stem}.o")
     else:
@@ -456,6 +454,17 @@ def main():
             continue
         i += 1
 
+    # If user explicitly requested unsupported targets, reject early with
+    # a clear message. CASM's NASM-based pipeline does not support macOS
+    # or ARM64 targets in this release.
+    # Only linux/windows targets supported by the NASM-based pipeline in this release
+    if '--platform' in options and isinstance(platform_opt, str) and platform_opt.lower() not in ('linux', 'windows'):
+        console.print("[red]Error:[/red] Only 'linux' and 'windows' targets are supported. Choose --platform linux|windows or omit to use the host default.")
+        sys.exit(1)
+    if '--arch' in options and isinstance(arch_opt, str) and arch_opt.lower() not in ('x86_64', 'x86'):
+        console.print("[red]Error:[/red] Only 'x86_64' and 'x86' architectures are supported. Choose --arch x86_64|x86 or omit to use the host default.")
+        sys.exit(1)
+
     try:
         # Show header once, then interactive menu. Avoid printing the header
         # again later so it doesn't repeat.
@@ -470,6 +479,13 @@ def main():
             default_arch = compiler.arch
         except Exception:
             default_arch = arch_opt
+
+        # Clamp detected defaults to supported values to avoid showing
+        # unsupported host names (e.g. 'macos') in the interactive menu.
+        if default_platform not in ('linux', 'windows'):
+            default_platform = 'linux'
+        if default_arch not in ('x86_64', 'x86'):
+            default_arch = 'x86_64'
 
         def _text_choice(prompt: str, choices: list, default: str):
             # Simple textual fallback when questionary isn't available or
@@ -494,64 +510,66 @@ def main():
 
         # Offer selection only when not supplied on CLI
         if '--platform' not in options and '--arch' not in options and not requested_type:
-            # Try questionary first, but gracefully fall back to text input
-            if HAS_QUESTIONARY:
-                try:
-                    plat_choice = questionary.select(
-                        "Select target platform:",
-                        choices=[
-                            questionary.Choice('Linux', value='linux'),
-                            questionary.Choice('Windows', value='windows'),
-                            questionary.Choice('macOS', value='macos'),
-                            questionary.Choice('BSD', value='bsd'),
-                        ],
-                        default=default_platform,
-                        style=custom_style
-                    ).ask()
-                    if plat_choice:
-                        platform_opt = plat_choice
-                    else:
-                        # questionary returned None (non-interactive); fallback
-                        platform_opt = _text_choice("Select target platform:",
-                                                    [("Linux","linux"), ("Windows","windows"), ("macOS","macos"), ("BSD","bsd")],
-                                                    default_platform)
+            # Always use questionary.select for interactive selection. If the
+            # library is not installed, exit with a clear instruction so the
+            # user can install it rather than silently falling back to text.
+            if not HAS_QUESTIONARY:
+                console.print("[red]Error:[/red] questionary library required for interactive selection")
+                console.print("[dim]Install with:[/dim] pip install questionary")
+                sys.exit(1)
 
-                    arch_choice = questionary.select(
-                        "Select target architecture:",
-                        choices=[
-                            questionary.Choice('x86_64', value='x86_64'),
-                            questionary.Choice('ARM64', value='arm64'),
-                            questionary.Choice('RISC-V64', value='riscv64'),
-                        ],
-                        default=default_arch,
-                        style=custom_style
-                    ).ask()
-                    if arch_choice:
-                        arch_opt = arch_choice
-                    else:
-                        arch_opt = _text_choice("Select target architecture:",
-                                                [("x86_64","x86_64"), ("ARM64","arm64"), ("RISC-V64","riscv64")],
-                                                default_arch)
-                except Exception:
-                    # On any error with questionary, fall back to text-based selection
-                    platform_opt = _text_choice("Select target platform:",
-                                                [("Linux","linux"), ("Windows","windows"), ("macOS","macos"), ("BSD","bsd")],
-                                                default_platform)
-                    arch_opt = _text_choice("Select target architecture:",
-                                             [("x86_64","x86_64"), ("ARM64","arm64"), ("RISC-V64","riscv64")],
-                                             default_arch)
-            else:
-                # No questionary installed: use simple text fallback
-                platform_opt = _text_choice("Select target platform:",
-                                            [("Linux","linux"), ("Windows","windows"), ("macOS","macos"), ("BSD","bsd")],
-                                            default_platform)
-                arch_opt = _text_choice("Select target architecture:",
-                                         [("x86_64","x86_64"), ("ARM64","arm64"), ("RISC-V64","riscv64")],
-                                         default_arch)
+                    # If questionary is available but the terminal is not interactive
+                    # (e.g. piped stdin or some terminals), fall back to text prompts.
+            try:
+                if not sys.stdin.isatty():
+                    # Non-interactive stdin: fall back
+                    platform_opt = _text_choice("Select target platform:", [("Linux","linux"), ("Windows","windows")], default_platform)
+                    arch_opt = _text_choice("Select target architecture:", [("x86_64","x86_64"), ("x86","x86")], default_arch)
+                else:
+                    try:
+                        plat_choice = questionary.select(
+                            "Select target platform:",
+                            choices=[
+                                questionary.Choice('Linux', value='linux'),
+                                questionary.Choice('Windows', value='windows'),
+                            ],
+                            default=default_platform,
+                            style=custom_style,
+                            use_shortcuts=False,
+                            use_arrow_keys=True,
+                            instruction="(Use arrow keys)"
+                        ).ask()
+                        if plat_choice:
+                            platform_opt = plat_choice
+                        else:
+                            platform_opt = _text_choice("Select target platform:", [("Linux","linux"), ("Windows","windows")], default_platform)
+
+                        arch_choice = questionary.select(
+                            "Select target architecture:",
+                            choices=[
+                                questionary.Choice('x86_64', value='x86_64'),
+                                questionary.Choice('x86', value='x86'),
+                            ],
+                            default=default_arch,
+                            style=custom_style,
+                            use_shortcuts=False,
+                            use_arrow_keys=True,
+                            instruction="(Use arrow keys)"
+                        ).ask()
+                        if arch_choice:
+                            arch_opt = arch_choice
+                        else:
+                            arch_opt = _text_choice("Select target architecture:", [("x86_64","x86_64"), ("x86","x86")], default_arch)
+                    except Exception:
+                        # Any exception from questionary -> fall back to text prompts
+                        platform_opt = _text_choice("Select target platform:", [("Linux","linux"), ("Windows","windows")], default_platform)
+                        arch_opt = _text_choice("Select target architecture:", [("x86_64","x86_64"), ("x86","x86")], default_arch)
+            except KeyboardInterrupt:
+                raise
         # If a type was requested via CLI, use it non-interactively. Otherwise
         # show the interactive menu.
         if requested_type:
-            allowed = ('asm', 'exe', 'bin', 'obj')
+            allowed = ('asm', 'exe', 'obj')
             if requested_type not in allowed:
                 console.print(f"[red]Error:[/red] Unknown type: {requested_type}. Allowed: {', '.join(allowed)}")
                 sys.exit(1)
@@ -561,6 +579,17 @@ def main():
         
         # Track time
         start_time = time.time()
+        # If building an executable and the user didn't supply platform/arch
+        # use the compiler's host detection so CASM will invoke the local
+        # toolchain automatically.
+        try:
+            # Only override when the CLI didn't explicitly include these
+            if output_type == 'exe' and '--platform' not in options and '--arch' not in options:
+                platform_opt = compiler._host_to_target()
+                arch_opt = compiler.arch
+        except Exception:
+            # If detection fails, fall back to previously-determined values
+            pass
         
         # Execute compilation with progress
         success = compile_with_progress(output_type, input_file, debug_save, cflags=cflags, ldflags=ldflags, platform_opt=platform_opt, arch_opt=arch_opt)
@@ -583,8 +612,8 @@ def main():
             console.print()
             console.print(f"[green]Success:[/green] Assembly: {output_file}  Time: [#9b59b6]{elapsed_time:.2f}s[/#9b59b6]")
             console.print()
-        elif output_type in ('exe', 'bin', 'obj'):
-            ext = ".exe" if output_type == 'exe' else f".{output_type}"
+        elif output_type in ('exe', 'obj'):
+            ext = ".exe" if output_type == 'exe' else ".o"
             output_file = os.path.join("output", Path(input_file).stem + ext)
             console.print()
             console.print(f"[green]Success:[/green] Output: {output_file}  Time: [#9b59b6]{elapsed_time:.2f}s[/#9b59b6]")

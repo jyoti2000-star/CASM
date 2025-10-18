@@ -40,6 +40,11 @@ class CCodeProcessor:
         self._last_compile_output = ''
         # Short status message for the last compile attempt (single-line)
         self._last_status = ''
+        # Target platform/arch for compilation (affects compiler selection)
+        # platform: 'linux'|'windows'|'macos'
+        # arch: 'x86_64'|'x86'|'arm64'
+        self.target_platform = 'linux'
+        self.target_arch = 'x86_64'
         
     def add_header(self, header_name: str, use_angle: bool = False):
         """Add header file for C compilation.
@@ -300,15 +305,26 @@ class CCodeProcessor:
                     c_content = f.read()
                 print_info(f"Generated C file content:\n{c_content}")
             
-            # Compile with x86_64-w64-mingw32-gcc using Intel syntax
             asm_file = os.path.join(self.temp_dir, 'temp.s')
-            
-            # Try a sequence of compilers that are likely to use system include paths
-            compilers_to_try = [
-                (['gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
-                (['clang', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
-                (['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file])
-            ]
+
+            # Choose compilers based on target platform/arch
+            compilers_to_try = []
+
+            # If targeting Windows prefer mingw cross-compiler
+            if self.target_platform == 'windows':
+                # Try native cross compiler first
+                compilers_to_try.append((['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]))
+                # Try i686 mingw for 32-bit
+                compilers_to_try.append((['i686-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]))
+
+            # Generic host compilers
+            host_flags = ['-S', '-O0', '-masm=intel']
+            # If targeting 32-bit x86, add -m32
+            if self.target_arch in ('x86', 'i386', 'i686'):
+                host_flags = ['-S', '-O0', '-m32', '-masm=intel']
+
+            compilers_to_try.append((['gcc'] + host_flags + extra_flags + [c_file, '-o', asm_file]))
+            compilers_to_try.append((['clang'] + host_flags + extra_flags + [c_file, '-o', asm_file]))
 
             for cmd in compilers_to_try:
                 try:
@@ -946,6 +962,16 @@ class CCodeProcessor:
         self._raw_c_blocks.append(code)
         
         return block_id
+
+    def set_target(self, platform: str, arch: str = 'x86_64'):
+        """Set target platform and architecture for C compilation.
+
+        platform: 'linux' or 'windows' or 'macos'
+        arch: 'x86_64', 'x86' or 'arm64'
+        """
+        self.target_platform = (platform or 'linux').lower()
+        self.target_arch = (arch or 'x86_64').lower()
+        print_info(f"C processor target set to: {self.target_platform} / {self.target_arch}")
     
     def compile_all_c_code(self) -> Dict[str, str]:
         """Compile all collected C code blocks and extract assembly segments"""
@@ -1216,11 +1242,19 @@ class CCodeProcessor:
             print_warning(f"Could not gather pkg-config flags: {e}")
 
         # Try a sequence of compilers that are likely to use system include paths
-        compilers_to_try = [
-            (['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
-            (['gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]),
-            (['clang', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file])
-        ]
+        compilers_to_try = []
+
+        # Windows target: prefer mingw cross compilers
+        if self.target_platform == 'windows':
+            compilers_to_try.append((['x86_64-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]))
+            compilers_to_try.append((['i686-w64-mingw32-gcc', '-S', '-O0', '-masm=intel'] + extra_flags + [c_file, '-o', asm_file]))
+
+        host_flags = ['-S', '-O0', '-masm=intel']
+        if self.target_arch in ('x86', 'i386', 'i686'):
+            host_flags = ['-S', '-O0', '-m32', '-masm=intel']
+
+        compilers_to_try.append((['gcc'] + host_flags + extra_flags + [c_file, '-o', asm_file]))
+        compilers_to_try.append((['clang'] + host_flags + extra_flags + [c_file, '-o', asm_file]))
 
         compiled = False
         # If we're running on a non-x86_64 host (e.g. Apple Silicon), ensure

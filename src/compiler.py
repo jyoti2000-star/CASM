@@ -12,7 +12,6 @@ from pathlib import Path
 from .core.lexer import CASMLexer
 from .core.parser import CASMParser
 from .core.codegen import AssemblyCodeGenerator
-from .stdlib.minimal import stdlib
 from .utils.c_processor import c_processor
 from .utils.formatter import formatter
 from .utils.colors import print_info, print_success, print_warning, print_error, print_system
@@ -28,7 +27,7 @@ class CASMProcessor:
         self.parser = CASMParser()
         self.codegen = AssemblyCodeGenerator()
     
-    def process_file(self, input_file: str) -> str:
+    def process_file(self, input_file: str, target: Optional[str] = None, arch: Optional[str] = None) -> str:
         """Process CASM file and return assembly code"""
         try:
             # Read input file
@@ -75,26 +74,43 @@ class CASMProcessor:
 
             # Provide target hints to the code generator so it can emit
             # platform-appropriate section headers and conventions when
-            # generating unified assembly. Default to host detection.
+            # generating unified assembly. Prefer explicit target/arch if
+            # provided by the caller; otherwise fall back to host detection.
             try:
-                host = platform.system().lower()
-                if 'darwin' in host:
-                    tgt = 'macos'
-                elif 'windows' in host:
-                    tgt = 'windows'
+                if target:
+                    tgt = target
                 else:
-                    tgt = 'linux'
+                    host = platform.system().lower()
+                    if 'darwin' in host:
+                        tgt = 'macos'
+                    elif 'windows' in host:
+                        tgt = 'windows'
+                    else:
+                        tgt = 'linux'
                 setattr(self.codegen, 'target_platform', tgt)
-                arch = platform.machine().lower()
-                if 'aarch64' in arch or 'arm' in arch:
+
+                if arch:
+                    a = arch
+                else:
+                    a = platform.machine().lower()
+
+                if 'aarch64' in a or 'arm' in a:
                     setattr(self.codegen, 'target_arch', 'arm64')
-                elif 'riscv' in arch:
+                elif 'riscv' in a:
                     setattr(self.codegen, 'target_arch', 'riscv64')
                 else:
                     setattr(self.codegen, 'target_arch', 'x86_64')
             except Exception:
                 setattr(self.codegen, 'target_platform', None)
                 setattr(self.codegen, 'target_arch', None)
+
+            # Tell the C processor which target/arch we intend to build for so
+            # it can select appropriate compilers/flags for cross-compilation
+            try:
+                from .utils.c_processor import c_processor as _cp
+                _cp.set_target(tgt if 'tgt' in locals() else (target or self._host_to_target()), a if 'a' in locals() else (arch or self.arch))
+            except Exception:
+                pass
 
             assembly_code = self.codegen.generate(ast)
             line_count = len(assembly_code.split(chr(10)))
@@ -165,7 +181,7 @@ class CASMCompiler:
 
             # Generate assembly
             # Generate assembly (unified/transpiler-friendly assembly)
-            assembly_code = self.processor.process_file(input_file)
+            assembly_code = self.processor.process_file(input_file, target=target, arch=arch)
 
             # Transpile unified assembly into platform-specific assembly
             target = target or self._host_to_target()
@@ -233,8 +249,9 @@ class CASMCompiler:
     def compile_to_executable(self, input_file: str, output_executable: str = None, run_after: bool = False, quiet: bool = False, target: Optional[str] = None, arch: Optional[str] = None) -> bool:
         """Compile CASM to executable"""
         try:
-            # Check dependencies first
-            if not self._check_build_dependencies():
+            # Check dependencies first (use requested target/arch so we can
+            # detect cross-toolchains and give actionable advice)
+            if not self._check_build_dependencies(target=target, arch=arch):
                 return False
             
             # Set default output name
@@ -256,13 +273,19 @@ class CASMCompiler:
                 self._last_info = None
                 print_stage(1, 4, f"Processing {input_file}...")
             # Process CASM file
-            assembly_code = self.processor.process_file(input_file)
+            assembly_code = self.processor.process_file(input_file, target=target, arch=arch)
 
             # Transpile unified assembly into platform-specific assembly
             target = target or self._host_to_target()
             arch = arch or self.arch
             try:
                 assembly_code = transpile_text(assembly_code, target=target, arch=arch, opt_level='none')
+                # Run assembly fixer to normalize the transpiled NASM output
+                try:
+                    from .core.assembly_fixer import assembly_fixer
+                    assembly_code = assembly_fixer.fix_assembly(assembly_code)
+                except Exception:
+                    pass
             except Exception:
                 # If transpilation fails, continue with the generated assembly
                 pass
@@ -284,7 +307,7 @@ class CASMCompiler:
             extra_libs = []
             if filtered_v_symbols or any(s.startswith('__imp_') for s in imp_symbols):
                 # Create a driver C file in the temp dir and compile it
-                driver_obj = self._create_and_compile_driver(self.temp_dir, filtered_v_symbols, imp_symbols, create_main=(not has_main))
+                driver_obj = self._create_and_compile_driver(self.temp_dir, filtered_v_symbols, imp_symbols, create_main=(not has_main), target=target, arch=arch)
                 # Infer libs from saved combined C includes (if present)
                 inferred = self._infer_libs_from_includes(self.temp_dir)
                 extra_libs.extend(inferred)
@@ -337,6 +360,25 @@ class CASMCompiler:
             
             if not quiet:
                 print_stage(2, 4, "Assembling with NASM...")
+
+            # If target is macOS/arm64, NASM cannot assemble ARM instructions.
+            # Detect this case and give a clear, actionable error instead of
+            # letting NASM emit a confusing set of errors.
+            if (target and target.lower() == 'macos') and (arch and arch.lower().startswith('arm')):
+                # Provide concise guidance to the caller
+                msg = (
+                    "Native macOS/ARM64 (Apple Silicon) build is not supported by the NASM-based\n"
+                    "assembler path. You can:\n"
+                    "  - Generate assembly only and assemble/link with a native toolchain: run with --type asm\n"
+                    "  - Cross-compile to Windows x86_64: --platform windows --arch x86_64 (requires mingw-w64)\n"
+                    "  - Or run on a host with a native GAS/clang assembly pipeline (future support)."
+                )
+                if self._quiet_mode:
+                    self._last_error = msg
+                else:
+                    term_error(msg)
+                return False
+
             # Assemble with NASM
             obj_file = os.path.join(self.temp_dir, 'output.o')
             if not self._run_nasm(asm_file, obj_file, quiet=quiet):
@@ -345,9 +387,10 @@ class CASMCompiler:
             if not quiet:
                 print_stage(3, 4, "Linking...")
             # Link executable (include driver object and any extra libs)
-            exe_file = f"{output_executable}.exe"
+            # Choose output filename extension based on target
+            exe_file = f"{output_executable}.exe" if (target and target.lower() == 'windows') else f"{output_executable}"
             extra_objs = [driver_obj] if driver_obj else None
-            if not self._run_linker(obj_file, exe_file, extra_objs=extra_objs, extra_libs=extra_libs, quiet=quiet):
+            if not self._run_linker(obj_file, exe_file, extra_objs=extra_objs, extra_libs=extra_libs, target=target, arch=arch, quiet=quiet):
                 return False
             
             if not quiet:
@@ -375,29 +418,65 @@ class CASMCompiler:
             # reset quiet mode
             self._quiet_mode = False
     
-    def _check_build_dependencies(self) -> bool:
-        """Check if required build tools are available"""
-        # Choose default toolchain depending on host. For Windows host prefer
-        # MinGW cross/gcc; for Linux/macOS prefer system gcc/clang.
-        if self.host == 'windows':
-            required = ['nasm', 'x86_64-w64-mingw32-gcc']
+    def _check_build_dependencies(self, target: Optional[str] = None, arch: Optional[str] = None) -> bool:
+        """Check if required build tools are available for requested target/arch.
+
+        This will detect missing local native or cross toolchains and print
+        clear, actionable instructions (or Docker suggestions) instead of
+        failing with opaque linker errors.
+        """
+        tgt = (target or self._host_to_target()).lower()
+        a = (arch or self.arch).lower()
+
+        tools_needed = ['nasm']
+        suggestions = []
+
+        if tgt == 'windows':
+            # Cross-compiling to Windows requires MinGW cross toolchain on non-Windows hosts
+            if self.host == 'windows':
+                tools_needed.append('x86_64-w64-mingw32-gcc')
+            else:
+                # On macOS/Linux prefer an installed mingw-w64 cross-compiler
+                tools_needed.append('x86_64-w64-mingw32-gcc')
+                suggestions.append('Install MinGW-w64 (e.g., brew install mingw-w64 or apt install mingw-w64)')
+
+        elif tgt == 'linux':
+            # Native linux target: on a linux host use local gcc; on macOS host require a cross-linker/docker
+            if self.host == 'linux':
+                tools_needed.append('gcc')
+            else:
+                # Not on linux host: user needs a cross toolchain or Docker
+                suggestions.append('You are building linux on a non-Linux host. Install an x86_64-linux cross toolchain or use Docker to build inside linux/amd64.')
+                # still check for local gcc/clang in case user has cross-tools named differently
+                tools_needed.append('gcc')
+
         else:
-            # On Linux prefer gcc; on macOS prefer clang but gcc shim is often ok
-            required = ['nasm', shutil.which('gcc') and 'gcc' or 'clang']
-        missing = []
-        
-        for tool in required:
-            # some entries may be None if we used shutil.which during selection
-            if not tool:
-                continue
-            if not shutil.which(tool):
-                missing.append(tool)
-        
-        if missing:
-            term_error(f"Missing build tools: {', '.join(missing)}")
-            term_info("Install with: brew install nasm mingw-w64")
+            # Other targets (BSD etc): require host toolchain
+            tools_needed.append('gcc')
+
+        # Architecture-specific checks (future): ensure assembler/linker support
+        if a.startswith('arm'):
+            # NASM-based pipeline doesn't support ARM codegen in this release
+            term_error('ARM/ARM64 targets are not supported by the NASM-based build path.')
+            term_info('Generate assembly only (--type asm) and assemble with a native toolchain on the target host.')
             return False
-        
+
+        missing = []
+        for t in tools_needed:
+            if not t:
+                continue
+            if not shutil.which(t):
+                missing.append(t)
+
+        if missing or suggestions:
+            if missing:
+                term_error(f"Missing build tools: {', '.join(missing)}")
+            for s in suggestions:
+                term_info(s)
+            # Provide a Docker recommendation as a last resort
+            term_info("Tip: use Docker to build cross-platform binaries. Example:\n  docker run --rm -v \"$PWD\":/work -w /work --platform linux/amd64 debian:bookworm bash -lc \"apt-get update && apt-get install -y nasm build-essential python3 && python3 casm.py examples/ufunc_nou.asm --platform linux --arch x86_64 -t exe\"")
+            return False
+
         return True
 
     def _nasm_format_for_host(self) -> str:
@@ -407,6 +486,15 @@ class CASMCompiler:
         if self.host == 'windows':
             return 'win64'
         return 'elf64'
+
+    def _nasm_format_for_target(self, target: Optional[str], arch: Optional[str]) -> str:
+        """Return NASM output format appropriate for a requested target/arch."""
+        p = (target or 'linux').lower()
+        a = (arch or self.arch or 'x86_64').lower()
+        if a in ('x86_64', 'amd64', 'x64'):
+            return 'win64' if p == 'windows' else 'elf64'
+        else:
+            return 'win32' if p == 'windows' else 'elf32'
 
     def _collect_external_symbols(self, assembly_code: str):
         """Find referenced external symbols (V#, __imp_*) in assembly."""
@@ -486,7 +574,7 @@ class CASMCompiler:
 
         return sorted(list(libs))
 
-    def _create_and_compile_driver(self, temp_dir: str, v_symbols, imp_symbols, create_main: bool = True) -> Optional[str]:
+    def _create_and_compile_driver(self, temp_dir: str, v_symbols, imp_symbols, create_main: bool = True, target: Optional[str] = None, arch: Optional[str] = None) -> Optional[str]:
         """Create a small driver C file that defines V# variables and initializes Winsock if needed.
 
         Returns path to compiled object file or None on failure.
@@ -539,11 +627,19 @@ class CASMCompiler:
                 lines.append('    return 0;')
                 lines.append('}')
 
-            with open(driver_c, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lines))
-
             # Compile driver to object using cross-compiler
-            cmd = ['x86_64-w64-mingw32-gcc', '-c', '-O0', '-masm=intel', driver_c, '-o', driver_o]
+            # Allow override via CASM_CROSS_COMPILER environment variable
+            cross_compiler = os.environ.get('CASM_CROSS_COMPILER')
+            if cross_compiler:
+                cc = cross_compiler
+            else:
+                # Default to MinGW cross compiler for Windows targets; otherwise system gcc
+                if (target or self._host_to_target()) == 'windows':
+                    cc = shutil.which('x86_64-w64-mingw32-gcc') or 'x86_64-w64-mingw32-gcc'
+                else:
+                    cc = shutil.which('gcc') or shutil.which('clang') or 'gcc'
+
+            cmd = [cc, '-c', '-O0', '-masm=intel', driver_c, '-o', driver_o]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 term_error(f"Failed to compile automatic driver: {result.stderr}")
@@ -554,9 +650,9 @@ class CASMCompiler:
             term_error(f"Exception creating driver: {e}")
             return None
     
-    def _run_nasm(self, asm_file: str, obj_file: str, quiet: bool = False) -> bool:
-        """Run NASM assembler"""
-        fmt = self._nasm_format_for_host()
+    def _run_nasm(self, asm_file: str, obj_file: str, fmt: Optional[str] = None, quiet: bool = False) -> bool:
+        """Run NASM assembler. Accept optional fmt to assemble for a target format."""
+        fmt = fmt or self._nasm_format_for_host()
         cmd = ['nasm', '-f', fmt, asm_file, '-o', obj_file]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -570,14 +666,48 @@ class CASMCompiler:
 
         return True
     
-    def _run_linker(self, obj_file: str, exe_file: str, extra_objs: Optional[list] = None, extra_libs: Optional[list] = None, quiet: bool = False) -> bool:
+    def _run_linker(self, obj_file: str, exe_file: str, extra_objs: Optional[list] = None, extra_libs: Optional[list] = None, target: Optional[str] = None, arch: Optional[str] = None, quiet: bool = False) -> bool:
         """Run linker, optionally adding extra object files and libraries."""
-        # Choose linker based on host
-        if self.host == 'windows':
-            linker = 'x86_64-w64-mingw32-gcc'
+        # Choose linker based on requested target/arch first, otherwise host
+        tgt = (target or self._host_to_target()).lower() if target else self._host_to_target()
+        requested_arch = (arch or self.arch)
+        linker = None
+        if tgt == 'windows':
+            # Use MinGW cross linker when targeting Windows
+            linker = shutil.which('x86_64-w64-mingw32-gcc') or None
+            if not linker:
+                if quiet or getattr(self, '_quiet_mode', False):
+                    self._last_error = 'Missing MinGW cross-linker: x86_64-w64-mingw32-gcc'
+                else:
+                    term_error('Missing MinGW cross-linker: x86_64-w64-mingw32-gcc')
+                    term_info('Install mingw-w64 via your package manager')
+                return False
         else:
             # Prefer system gcc/clang
-            linker = shutil.which('gcc') or shutil.which('clang') or 'gcc'
+            linker = shutil.which('gcc') or shutil.which('clang') or None
+            # If host differs from requested target (e.g., building linux/x86_64 on macOS/arm64)
+            # we require an explicit cross-linker; otherwise the host linker will try to link
+            # for the host architecture and fail.
+            host_tgt = self._host_to_target()
+            if host_tgt != (tgt or host_tgt):
+                # Host != requested target
+                if not linker:
+                    if quiet or getattr(self, '_quiet_mode', False):
+                        self._last_error = f"Building for {tgt} from {self.host} requires a cross-linker"
+                    else:
+                        term_error(f"Building for {tgt} from {self.host} requires a cross-linker")
+                        term_info("Install an appropriate cross toolchain or run on a matching host")
+                    return False
+                else:
+                    # We have a host linker (e.g., clang) but it's for a different arch; warn and fail
+                    if quiet or getattr(self, '_quiet_mode', False):
+                        self._last_error = f"Host linker cannot produce binaries for target {tgt}."
+                    else:
+                        term_error(f"Host linker cannot produce binaries for target {tgt}.")
+                        term_info("Use a cross-linker or build on a matching host")
+                    return False
+            # Otherwise linker is the host linker and is acceptable
+            linker = linker or 'gcc'
 
         cmd = [linker]
         cmd.append(obj_file)

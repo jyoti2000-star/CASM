@@ -411,3 +411,32 @@ If you add syntax or change parsing behavior, update the `README.md` and add sma
 ## License
 
 This project is licensed under the MIT License. See `LICENSE` for details.
+
+## Docker helper (cross-build)
+
+If you don't have a native cross-toolchain installed, the easiest and most
+reproducible way to build Linux/Windows binaries from macOS or other hosts is
+to use Docker. The repository includes a small helper script that runs CASM
+inside a linux/amd64 container and writes the resulting artifacts back into
+your project's `output/` directory.
+
+Usage (example):
+
+```bash
+# make the script executable once
+chmod +x tools/docker-build-linux-x86_64.sh
+
+# Build a linux/amd64 executable from macOS (or any host with Docker):
+./tools/docker-build-linux-x86_64.sh examples/ufunc_nou.asm --platform linux --arch x86_64 -t exe
+```
+
+What the script does:
+
+- Mounts the current repository into a Debian container (linux/amd64).
+- Installs `nasm`, `build-essential` and `python3` inside the container.
+- Runs `python3 casm.py` with the provided arguments so the assembly and
+  linking steps happen in a linux/amd64 environment.
+
+This avoids installing cross-linkers on the host and is the recommended path
+for one-off cross-builds or CI integration. The produced files are available in
+`output/` on the host filesystem because the repository root is bind-mounted.
