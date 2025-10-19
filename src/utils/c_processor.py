@@ -742,9 +742,17 @@ class CCodeProcessor:
                 # Make .L labels unique by adding block ID prefix
                 cleaned_line = line.replace('\t', '    ')  # Convert tabs to spaces
                 if block_id and '.L' in cleaned_line:
-                    # Replace .L labels with unique ones: .L2 -> .B0_L2 (where B0 is block 0)
+                    # Replace .L labels with unique ones scoped to this block.
+                    # Use a prefixed form to avoid creating dotted composite
+                    # symbols when a local label is referenced as
+                    # "FUNCTION.L3" (which could become
+                    # "FUNCTION.CASM_BLOCK_3_L3" and collide). We convert
+                    # ".L123" -> "_CASM_BLOCK_3_L123" so references like
+                    # "FUNC.L123" turn into "FUNC_CASM_BLOCK_3_L123" and
+                    # label definitions become "_CASM_BLOCK_3_L123:" which
+                    # prevents the dot from joining two names.
                     import re
-                    cleaned_line = re.sub(r'\.L(\d+)', rf'.{block_id}_L\1', cleaned_line)
+                    cleaned_line = re.sub(r'(?<!\w)\.L(\d+)', rf'_{block_id}_L\1', cleaned_line)
                 
                 # If this line is a label (.L...) or an assembler label ending with ':' keep as-is
                 s = cleaned_line.strip()
@@ -1409,40 +1417,67 @@ class CCodeProcessor:
                 stripped = line.strip()
                 # Look for label definitions like ".BLOCK_15_L2:"
                 import re
-                label_match = re.match(r'\.(' + block_id + r'_L\d+):', stripped)
+                label_match = re.match(r'\.(' + re.escape(block_id) + r'_L\d+):', stripped)
                 if label_match:
                     new_label = label_match.group(1)
                     # Extract original label (L2 from BLOCK_15_L2)
                     original_match = re.search(r'_L(\d+)', new_label)
                     if original_match:
                         original_label = f"L{original_match.group(1)}"
-                        label_definitions[original_label] = (block_id, new_label)
+                        # If this original_label already has a definition, we
+                        # will still record it; duplicates will be resolved
+                        # below so labels become unique across blocks.
+                        if original_label in label_definitions:
+                            # Convert existing entry into a list to preserve
+                            # multiple definitions (we'll make them unique)
+                            prev = label_definitions[original_label]
+                            if isinstance(prev[0], list):
+                                prev[0].append((block_id, new_label))
+                            else:
+                                label_definitions[original_label] = ([prev, (block_id, new_label)], None)
+                        else:
+                            label_definitions[original_label] = (block_id, new_label)
                         print_info(f"Found label definition: .{original_label} -> .{new_label} in {block_id}")
         
-        # Second pass: find and fix label references
+        # label_definitions currently maps original_label -> (block_id, new_label)
+        # but may contain lists for duplicates. Normalize into a mapping of
+        # original_label -> list of (block_id, new_label) so we can make
+        # duplicate new_label names unique.
+        normalized_defs = {}
+        for orig, val in list(label_definitions.items()):
+            if isinstance(val[0], list):
+                # val is ([ (block,new_label), (block,new_label) ], None)
+                pairs = val[0]
+            else:
+                pairs = [val]
+            normalized_defs[orig] = pairs
+
+        # Simpler approach: rewrite local GCC '.L<number>' references so they
+        # become underscore-scoped names that include the originating block id.
+        # This avoids generating dotted composites like 'FUNC.CASM_BLOCK_3_L2'
+        # which NASM treats as separate symbols and can cause redefinition
+        # errors when multiple definitions collide. The scoped name we use is
+        # '_<BLOCKID>_L<number>' and qualified references become
+        # 'PREFIX_<BLOCKID>_L<number>'.
         fixed_segments = {}
+        import re
         for block_id, assembly in segments.items():
             lines = assembly.split('\n')
-            fixed_lines = []
-            
+            out_lines = []
             for line in lines:
-                fixed_line = line
-                # Look for label references like "je .L2" or "jmp .L3"
-                import re
-                for match in re.finditer(r'\.L(\d+)(?!\w)', line):
-                    original_label = f"L{match.group(1)}"
-                    if original_label in label_definitions:
-                        def_block_id, new_label = label_definitions[original_label]
-                        # Replace the reference with the correct block-prefixed label
-                        old_ref = f".L{match.group(1)}"
-                        new_ref = f".{new_label}"
-                        fixed_line = fixed_line.replace(old_ref, new_ref)
-                        print_info(f"Fixed reference in {block_id}: {old_ref} -> {new_ref}")
-                
-                fixed_lines.append(fixed_line)
-            
-            fixed_segments[block_id] = '\n'.join(fixed_lines)
-        
+                sline = line
+                # Normalize label definitions that may start with a dot or underscore
+                sline = re.sub(r"^\s*\.?" + re.escape(block_id) + r"_L(\d+):", lambda m: f"_{block_id}_L{m.group(1)}:", sline)
+
+                # Replace standalone .L123 references with _<block>_L123
+                sline = re.sub(r'\.L(\d+)(?!\w)', lambda m: f"_{block_id}_L{m.group(1)}", sline)
+
+                # Replace qualified NAME.L123 -> NAME_<block>_L123
+                sline = re.sub(r'(?P<prefix>\b\w+)\.L(\d+)(?!\w)', lambda m: f"{m.group('prefix')}_{block_id}_L{m.group(2)}", sline)
+
+                out_lines.append(sline)
+            fixed_segments[block_id] = '\n'.join(out_lines)
+
         return fixed_segments
     
     def _extract_string_constants(self, assembly: str) -> str:

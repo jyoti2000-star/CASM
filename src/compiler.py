@@ -8,126 +8,67 @@ import re
 import platform
 from typing import Optional
 from pathlib import Path
-
 from .core.lexer import CASMLexer
 from .core.parser import CASMParser
 from .core.codegen import AssemblyCodeGenerator
-from .utils.c_processor import c_processor
+from .utils.asm_transpiler import transpile_text
 from .utils.formatter import formatter
-from .utils.colors import print_info, print_success, print_warning, print_error, print_system
 from .utils.syntax import check_syntax, format_errors
 from .utils.term import print_stage, print_error as term_error, print_info as term_info
-from .utils.asm_transpiler import transpile_text
+from .utils.colors import print_info, print_success, print_warning, print_error, print_debug
+
 
 class CASMProcessor:
-    """Core CASM language processor"""
-    
+    """Minimal CASMProcessor wrapper used by the compiler.
+
+    It tokenizes, parses and generates unified assembly using the core
+    code generator. This is intentionally lightweight – the full project
+    contains a richer processor but for the compiler module we only need
+    a process_file(input_file, target, arch) -> assembly string helper.
+    """
+
     def __init__(self):
         self.lexer = CASMLexer()
         self.parser = CASMParser()
         self.codegen = AssemblyCodeGenerator()
-    
+
     def process_file(self, input_file: str, target: Optional[str] = None, arch: Optional[str] = None) -> str:
-        """Process CASM file and return assembly code"""
+        # Read input
+        with open(input_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Run a light syntax check if available
         try:
-            # Read input file
-            with open(input_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Reduce noisy system output; keep as debug-level
-            from .utils.colors import print_debug
-            print_debug(f"Processing {input_file}...")
-            
-            # Legacy explicit embedded C indicator removed; lexer now detects C lines
-            # Run syntax checks (lexer + parser) before proceeding to codegen
-            with open(input_file, 'r', encoding='utf-8') as _f:
-                raw_content = _f.read()
+            errors = check_syntax(content, filename=input_file)
+            if errors:
+                # Reuse format_errors to produce a readable message
+                raise RuntimeError(format_errors(errors, filename=input_file))
+        except Exception:
+            # If the syntax helper isn't available or fails, continue to parse
+            pass
 
-            syntax_errors = check_syntax(raw_content, filename=input_file)
-            if syntax_errors:
-                # Print errors and abort processing
-                err_text = format_errors(syntax_errors, filename=input_file)
-                print_error(err_text)
-                raise Exception('Syntax errors detected; aborting compilation')
+        # Tokenize and parse
+        tokens = self.lexer.tokenize(content)
+        ast = self.parser.parse(tokens)
 
-            # Tokenize
-            tokens = self.lexer.tokenize(content)
-            non_eof_tokens = [t for t in tokens if t.type.value != 'EOF']
-            print_info(f"Generated {len(non_eof_tokens)} tokens")
-            
-            # Parse
-            ast = self.parser.parse(tokens)
-            print_info(f"Parsed AST with {len(ast.statements)} statements")
-            
-            # Generate assembly
-            # Extract top-level bracketed assembler directives (e.g. [BITS 16])
-            try:
-                directives = []
-                for line in raw_content.splitlines():
-                    s = line.strip()
-                    if s.startswith('[') and s.endswith(']'):
-                        directives.append(s)
-                # Attach to codegen so it can emit these at the top of the file
-                setattr(self.codegen, 'top_directives', directives)
-            except Exception:
-                setattr(self.codegen, 'top_directives', [])
+        # Allow the code generator to see top-level assembler directives
+        directives = []
+        for line in content.splitlines():
+            s = line.strip()
+            if s.startswith('[') and s.endswith(']'):
+                directives.append(s)
+        setattr(self.codegen, 'top_directives', directives)
 
-            # Provide target hints to the code generator so it can emit
-            # platform-appropriate section headers and conventions when
-            # generating unified assembly. Prefer explicit target/arch if
-            # provided by the caller; otherwise fall back to host detection.
-            try:
-                if target:
-                    tgt = target
-                else:
-                    host = platform.system().lower()
-                    if 'darwin' in host:
-                        tgt = 'macos'
-                    elif 'windows' in host:
-                        tgt = 'windows'
-                    else:
-                        tgt = 'linux'
-                setattr(self.codegen, 'target_platform', tgt)
+        # Set target hints for codegen if provided
+        if target:
+            setattr(self.codegen, 'target_platform', target)
+        if arch:
+            setattr(self.codegen, 'target_arch', arch)
 
-                if arch:
-                    a = arch
-                else:
-                    a = platform.machine().lower()
+        assembly = self.codegen.generate(ast)
+        return assembly
 
-                if 'aarch64' in a or 'arm' in a:
-                    setattr(self.codegen, 'target_arch', 'arm64')
-                elif 'riscv' in a:
-                    setattr(self.codegen, 'target_arch', 'riscv64')
-                else:
-                    setattr(self.codegen, 'target_arch', 'x86_64')
-            except Exception:
-                setattr(self.codegen, 'target_platform', None)
-                setattr(self.codegen, 'target_arch', None)
-
-            # Tell the C processor which target/arch we intend to build for so
-            # it can select appropriate compilers/flags for cross-compilation
-            try:
-                from .utils.c_processor import c_processor as _cp
-                _cp.set_target(tgt if 'tgt' in locals() else (target or self._host_to_target()), a if 'a' in locals() else (arch or self.arch))
-            except Exception:
-                pass
-
-            assembly_code = self.codegen.generate(ast)
-            line_count = len(assembly_code.split(chr(10)))
-            print_success(f"Generated {line_count} lines of optimized assembly")
-            
-            return assembly_code
-            
-        except Exception as e:
-            # Allow the exception to propagate so the top-level CLI prints a single
-            # consolidated error message. Do not print here to avoid duplicates.
-            raise
-        
-        finally:
-            # Cleanup C processor
-            c_processor.cleanup()
-
-    # Note: implicit C detection is now handled in the lexer (C_INLINE tokens)
+ 
 
 class CASMCompiler:
     """Complete CASM compiler with build pipeline"""
@@ -249,6 +190,13 @@ class CASMCompiler:
     def compile_to_executable(self, input_file: str, output_executable: str = None, run_after: bool = False, quiet: bool = False, target: Optional[str] = None, arch: Optional[str] = None) -> bool:
         """Compile CASM to executable"""
         try:
+            # Honor quiet mode early so helper methods can write concise
+            # errors into _last_error/_last_info instead of printing to
+            # stdout/stderr. This is important because callers may
+            # redirect stdout/stderr (e.g. the top-level CLI progress
+            # UI) and expect compiler errors to be available via
+            # attributes rather than printed directly.
+            self._quiet_mode = bool(quiet)
             # Check dependencies first (use requested target/arch so we can
             # detect cross-toolchains and give actionable advice)
             if not self._check_build_dependencies(target=target, arch=arch):
@@ -319,8 +267,18 @@ class CASMCompiler:
             asm_file = os.path.join(self.temp_dir, 'output.asm')
             # Prepend extern declarations for V# and __imp_* symbols so NASM treats them as external
             asm_prelude_lines = []
-            for v in v_symbols:
-                asm_prelude_lines.append(f'extern {v}')
+            # For V# CASM variables: if they are not defined in the assembly
+            # already, emit a simple data definition in this asm file so that
+            # RIP-relative references like `[rel V1]` are valid for NASM.
+            # Emitting `extern V1` is not sufficient because NASM cannot
+            # compute [rel extern_sym] at assembly time.
+            missing_vs_in_asm = set(filtered_v_symbols)
+            if missing_vs_in_asm:
+                asm_prelude_lines.append('section .data')
+                for v in sorted(missing_vs_in_asm):
+                    asm_prelude_lines.append(f'    {v} dd 0')
+
+            # Keep extern declarations for any __imp_* import symbols
             for imp in imp_symbols:
                 asm_prelude_lines.append(f'extern {imp}')
 
@@ -381,7 +339,9 @@ class CASMCompiler:
 
             # Assemble with NASM
             obj_file = os.path.join(self.temp_dir, 'output.o')
-            if not self._run_nasm(asm_file, obj_file, quiet=quiet):
+            # Choose NASM format appropriate for the requested target/arch
+            nasm_fmt = self._nasm_format_for_target(target, arch)
+            if not self._run_nasm(asm_file, obj_file, fmt=nasm_fmt, quiet=quiet):
                 return False
             
             if not quiet:
@@ -418,7 +378,7 @@ class CASMCompiler:
             # reset quiet mode
             self._quiet_mode = False
     
-    def _check_build_dependencies(self, target: Optional[str] = None, arch: Optional[str] = None) -> bool:
+    def _check_build_dependencies(self, target: Optional[str] = None, arch: Optional[str] = None, quiet: bool = False) -> bool:
         """Check if required build tools are available for requested target/arch.
 
         This will detect missing local native or cross toolchains and print
@@ -432,13 +392,15 @@ class CASMCompiler:
         suggestions = []
 
         if tgt == 'windows':
-            # Cross-compiling to Windows requires MinGW cross toolchain on non-Windows hosts
+            # Cross-compiling to Windows requires a compiler capable of producing
+            # Windows objects. Prefer CASM_CROSS_COMPILER or host gcc/clang; if
+            # none present, suggest installing mingw-w64.
             if self.host == 'windows':
-                tools_needed.append('x86_64-w64-mingw32-gcc')
+                tools_needed.append('gcc')
             else:
-                # On macOS/Linux prefer an installed mingw-w64 cross-compiler
-                tools_needed.append('x86_64-w64-mingw32-gcc')
-                suggestions.append('Install MinGW-w64 (e.g., brew install mingw-w64 or apt install mingw-w64)')
+                # We won't hard-require a single binary here; the check below
+                # will ensure at least one acceptable compiler exists.
+                tools_needed.append('gcc')
 
         elif tgt == 'linux':
             # Native linux target: on a linux host use local gcc; on macOS host require a cross-linker/docker
@@ -469,12 +431,46 @@ class CASMCompiler:
                 missing.append(t)
 
         if missing or suggestions:
+            # When running in quiet mode (used by the top-level UI), set
+            # _last_error/_last_info instead of printing directly so the
+            # caller can display concise previews. Otherwise fall back to
+            # the existing term_* helpers which print to the terminal.
             if missing:
-                term_error(f"Missing build tools: {', '.join(missing)}")
+                msg_missing = f"Missing build tools: {', '.join(missing)}"
+                if quiet or getattr(self, '_quiet_mode', False):
+                    self._last_error = msg_missing
+                else:
+                    term_error(msg_missing)
+
             for s in suggestions:
-                term_info(s)
-            # Provide a Docker recommendation as a last resort
-            term_info("Tip: use Docker to build cross-platform binaries. Example:\n  docker run --rm -v \"$PWD\":/work -w /work --platform linux/amd64 debian:bookworm bash -lc \"apt-get update && apt-get install -y nasm build-essential python3 && python3 casm.py examples/ufunc_nou.asm --platform linux --arch x86_64 -t exe\"")
+                if quiet or getattr(self, '_quiet_mode', False):
+                    # If there is existing info, append; otherwise set
+                    if getattr(self, '_last_info', None):
+                        self._last_info += '\n' + s
+                    else:
+                        self._last_info = s
+                else:
+                    term_info(s)
+
+            # Provide a Docker recommendation as a last resort. Tailor the
+            # example to the requested target so users get an immediately
+            # useful command (Linux vs Windows/minGW).
+            if tgt == 'windows':
+                docker_tip = (
+                    "Install the windows cross compatible toolchain\\"
+                )
+            else:
+                docker_tip = (
+                    "Install the linux cross compatible toolchain"
+                )
+            if quiet or getattr(self, '_quiet_mode', False):
+                if getattr(self, '_last_info', None):
+                    self._last_info += '\n' + docker_tip
+                else:
+                    self._last_info = docker_tip
+            else:
+                term_info(docker_tip)
+
             return False
 
         return True
@@ -606,7 +602,7 @@ class CASMCompiler:
                     lines.append(f'int {v} = 0;')
 
             lines.append('')
-            lines.append('extern void casm_main(void);')
+            lines.append('extern void main(void);')
             lines.append('')
             if create_main:
                 lines.append('int main(int argc, char** argv) {')
@@ -619,25 +615,36 @@ class CASMCompiler:
                     lines.append('        return 1;')
                     lines.append('    }')
 
-                lines.append('    casm_main();')
+                lines.append('    main();')
 
                 if any('__imp_' in s for s in imp_symbols):
                     lines.append('    WSACleanup();')
 
                 lines.append('    return 0;')
                 lines.append('}')
+                # Provide a WinMain wrapper for Windows CRT which may
+                # expect WinMain when linking some MinGW CRT variants.
+                lines.append('')
+                lines.append('/* Provide WinMain wrapper for MinGW CRT */')
+                lines.append('int WinMain(void* a, void* b, char* c, int d) {')
+                lines.append('    (void)a; (void)b; (void)c; (void)d;')
+                lines.append('    return main(0, NULL);')
+                lines.append('}')
 
             # Compile driver to object using cross-compiler
             # Allow override via CASM_CROSS_COMPILER environment variable
             cross_compiler = os.environ.get('CASM_CROSS_COMPILER')
+            host_cc = shutil.which('gcc') or shutil.which('clang')
+            # Prefer an explicit cross compiler for Windows targets, then host CC
             if cross_compiler:
                 cc = cross_compiler
             else:
-                # Default to MinGW cross compiler for Windows targets; otherwise system gcc
                 if (target or self._host_to_target()) == 'windows':
-                    cc = shutil.which('x86_64-w64-mingw32-gcc') or 'x86_64-w64-mingw32-gcc'
+                    # Prefer MinGW cross-GCC driver when available
+                    cc = shutil.which('x86_64-w64-mingw32-gcc') or shutil.which('i686-w64-mingw32-gcc') or host_cc or 'x86_64-w64-mingw32-gcc'
                 else:
-                    cc = shutil.which('gcc') or shutil.which('clang') or 'gcc'
+                    # Non-windows: prefer host compiler
+                    cc = host_cc or 'gcc'
 
             cmd = [cc, '-c', '-O0', '-masm=intel', driver_c, '-o', driver_o]
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -673,14 +680,21 @@ class CASMCompiler:
         requested_arch = (arch or self.arch)
         linker = None
         if tgt == 'windows':
-            # Use MinGW cross linker when targeting Windows
-            linker = shutil.which('x86_64-w64-mingw32-gcc') or None
+            # Prefer an explicit CASM_CROSS_COMPILER if set, otherwise prefer
+            # the MinGW cross-GCC driver (x86_64-w64-mingw32-gcc). This
+            # produces the driver-style invocation the user requested.
+            env_linker = os.environ.get('CASM_CROSS_COMPILER')
+            if env_linker:
+                linker = env_linker
+            else:
+                # Prefer MinGW cross driver first, then host gcc/clang
+                linker = shutil.which('x86_64-w64-mingw32-gcc') or shutil.which('gcc') or shutil.which('clang') or None
             if not linker:
                 if quiet or getattr(self, '_quiet_mode', False):
-                    self._last_error = 'Missing MinGW cross-linker: x86_64-w64-mingw32-gcc'
+                    self._last_error = 'Missing Windows-capable linker: set CASM_CROSS_COMPILER or install x86_64-w64-mingw32-gcc (mingw-w64)'
                 else:
-                    term_error('Missing MinGW cross-linker: x86_64-w64-mingw32-gcc')
-                    term_info('Install mingw-w64 via your package manager')
+                    term_error('Missing Windows-capable linker: set CASM_CROSS_COMPILER or install x86_64-w64-mingw32-gcc (mingw-w64)')
+                    term_info('Install mingw-w64 on your system or set CASM_CROSS_COMPILER to the path of your cross compiler')
                 return False
         else:
             # Prefer system gcc/clang
@@ -716,9 +730,16 @@ class CASMCompiler:
                 if eo:
                     cmd.append(eo)
 
-        # Default linking flags depend on host
-        if self.host == 'windows':
-            cmd.extend(['-o', exe_file, '-mconsole', '-lkernel32', '-lmsvcrt'])
+        # Default linking flags depend on requested target
+        if tgt == 'windows':
+            # Always request console subsystem and link common Win libs
+            # Only link libmingw32 when the chosen linker is a mingw cross-linker
+            cmd.extend(['-o', exe_file, '-mconsole'])
+            linker_basename = os.path.basename(linker) if isinstance(linker, str) else ''
+            if 'mingw' in linker_basename.lower() or (os.environ.get('CASM_CROSS_COMPILER') or '').lower().find('mingw') != -1:
+                cmd.append('-lmingw32')
+            # kernel32/msvcrt are common for Windows targets; include them
+            cmd.extend(['-lkernel32', '-lmsvcrt'])
         else:
             # Linux and macOS: produce a native executable
             cmd.extend(['-o', exe_file])

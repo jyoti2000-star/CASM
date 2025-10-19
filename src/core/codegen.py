@@ -21,6 +21,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.variable_info = {}  # Store complete variable information for C integration
         self.label_counter = 0
         self.used_functions = set()
+        self._auto_declared_vars = set()
         # Deterministic counters for human-friendly labels
         self.naming_salt = None
         self.var_counter = 0
@@ -56,6 +57,7 @@ class AssemblyCodeGenerator(ASTVisitor):
         self.variable_info = {}
         self.label_counter = 0
         self.used_functions = set()
+        self._auto_declared_vars = set()
         
         # Pass variable information to C processor
         try:
@@ -834,15 +836,17 @@ class AssemblyCodeGenerator(ASTVisitor):
         # alongside unified directives which the transpiler also expands.
         stripped_lower = line.strip().lower()
 
-        # func <name>
-        m = _re.match(r"^func\s+(\w+)\s*$", stripped_lower, re.I)
+        # func <name> -- preserve the original casing from the source so
+        # that calls (which may be cased by the author) match the definition.
+        stripped = line.strip()
+        m = _re.match(r"^func\s+(\w+)\s*$", stripped, re.I)
         if m:
             name = m.group(1)
             self.text_section.append(f"UFUNC {name}")
             return
 
         # endfunc
-        if _re.match(r"^endfunc\s*$", stripped_lower, re.I):
+        if _re.match(r"^endfunc\s*$", stripped, re.I):
             self.text_section.append("UENDFUNC")
             return
 
@@ -1077,7 +1081,19 @@ class AssemblyCodeGenerator(ASTVisitor):
                         # Replace with actual assembly
                         assembly_code = assembly_segments[marker]
                         if assembly_code.strip():
-                            for asm_line in assembly_code.split('\n'):
+                            # If the same assembly segment is reused for multiple
+                            # CASM_BLOCK markers (aliasing), we must avoid
+                            # inserting identical internal labels more than once
+                            # into the final assembly. Namespace the internal
+                            # CASM block local labels to the placeholder marker
+                            # being inserted so repeated insertions remain unique.
+                            import re as _re
+
+                            def _rename_block_labels(code: str, target_marker: str) -> str:
+                                return _re.sub(r'_(CASM_BLOCK_\d+_L)(\d+)', lambda m: f"_{target_marker}_L{m.group(2)}", code)
+
+                            namespaced = _rename_block_labels(assembly_code, marker)
+                            for asm_line in namespaced.split('\n'):
                                 if asm_line.strip():
                                     updated_sections.append(f"    {asm_line}")
                         else:
@@ -1208,6 +1224,13 @@ class AssemblyCodeGenerator(ASTVisitor):
         label = f"V{self.var_counter}"
         # Ensure mapping for future references
         self.variable_labels[name] = label
+        # Add a minimal data declaration so references have a defined symbol.
+        # Track auto-declared vars so later explicit declarations can update
+        # this placeholder instead of generating duplicates.
+        if label not in self._auto_declared_vars:
+            self._auto_declared_vars.add(label)
+            # Use dd 0 as a safe default for integer-like variables
+            self.data_section.append(f"    {label} dd 0  ; auto-declared placeholder")
         return label
 
     def _format_var_operand(self, var_name: str, as_memory: bool = True) -> str:

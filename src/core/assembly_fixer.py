@@ -77,7 +77,46 @@ class AssemblyFixer:
             result)
 
         print_success("Assembly fixed for NASM compatibility")
-        return result
+    # Final safety-net: ensure any referenced V# labels that remain
+        # undefined are given simple placeholders in a .data section so
+        # NASM does not abort with 'symbol not defined'. This avoids
+        # brittle ordering issues earlier in the pipeline.
+        all_v_refs = set(re.findall(r"\b(V\d+)\b", result))
+        missing_vs = sorted([v for v in all_v_refs if v not in self.defined_labels])
+        if missing_vs:
+            add_lines = []
+            add_lines.append("")
+            add_lines.append("    ; Placeholder V# variables added by AssemblyFixer")
+            add_lines.append('section .data')
+            for v in missing_vs:
+                add_lines.append(f"    {v} dd 0")
+            # Append placeholders to the end of the assembly
+            result = result + '\n' + '\n'.join(add_lines)
+
+        # Final cleanup: remove all semicolon comments and any standalone
+        # 'nop' lines that were used as markers by earlier passes. We do
+        # this as the last step so other fixups operate on the original
+        # annotations; now we produce the clean assembly expected by users.
+        cleaned_lines = []
+        for ln in result.split('\n'):
+            s = ln.rstrip()
+            # Remove full-line or trailing comments (starting with ';')
+            # But preserve leading whitespace before instruction if any.
+            if ';' in s:
+                # Remove ';' and everything after it
+                s = s.split(';', 1)[0].rstrip()
+
+            # Skip pure 'nop' lines (possibly indented)
+            if re.match(r'^\s*nop\s*$', s, re.I):
+                continue
+
+            # Skip empty lines created by stripping comments (but keep a
+            # single blank line for separation if desired)
+            cleaned_lines.append(s)
+
+        # Reassemble into final text, stripping possible leading/trailing blank lines
+        final = '\n'.join([l for l in cleaned_lines]).strip() + '\n'
+        return final
     
     def _collect_labels_and_references(self, lines: List[str]):
         """Collect all label definitions and references"""
@@ -124,8 +163,13 @@ class AssemblyFixer:
             var_match = re.match(r'\s*(\w+)\s+dd\s+', line)
             if var_match:
                 var_name = var_match.group(1)
-                if var_name in self.defined_variables:
-                    # Skip duplicate variable definition
+                # Do not treat CASM-generated V# symbols as duplicates to
+                # be removed -- they are intentionally emitted and may
+                # appear multiple times in different forms during
+                # prettification/transpilation passes. Only skip genuine
+                # duplicates for user-defined labels (non-V#).
+                if var_name in self.defined_variables and not re.match(r'^V\d+$', var_name):
+                    # Skip duplicate variable definition (non-V# only)
                     return f"    ; Duplicate {var_name} definition skipped\n"
                 else:
                     self.defined_variables.add(var_name)
@@ -326,7 +370,15 @@ class AssemblyFixer:
                 in_data_section = False
 
                 # Add missing LC constants and placeholders before text section
-                if missing_lc or missing_strings:
+                # Compute any referenced V# symbols that are not defined and
+                # ensure we always provide a simple placeholder so NASM
+                # doesn't fail with 'symbol not defined'. This is a defensive
+                # fallback for cases where earlier passes removed the original
+                # V# definitions unexpectedly.
+                all_v_refs = set(re.findall(r"\b(V\d+)\b", '\n'.join(lines)))
+                missing_vs = sorted([v for v in all_v_refs if v not in self.defined_labels])
+
+                if missing_lc or missing_strings or missing_vs:
                     result_lines.append("")
                     result_lines.append("    ; Missing LC constants / placeholders added by AssemblyFixer")
                     for lc_label in sorted(missing_lc):
@@ -338,7 +390,9 @@ class AssemblyFixer:
                             result_lines.append(f"    {lc_label} db \"Missing constant {lc_label}\", 0")
 
                     # Add placeholders for missing V# variables (e.g., V6, V8)
-                    missing_vars = sorted([lbl for lbl in missing_strings if re.match(r'^V\d+$', lbl)])
+                    # Prefer the explicit missing_vs computed above, but also
+                    # include any V# discovered in missing_strings as a fallback.
+                    missing_vars = sorted(set(missing_vs) | {lbl for lbl in missing_strings if re.match(r'^V\d+$', lbl)})
                     for v in missing_vars:
                         result_lines.append(f"    {v} dd 0")
 

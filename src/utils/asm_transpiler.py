@@ -1881,7 +1881,7 @@ class AssemblyTranspiler:
 
             # Function directives
             (r'^(?:U)?FUNC\s+(\w+)(?:\s+(.+))?', self.handle_ufunc),
-            (r'^(?:U)?ENDFUNC', self.handle_uendfunc),
+            (r'^(?:U)?ENDFUNC\b', self.handle_uendfunc),
             (r'^(?:U)?PARAM\s+(\d+)\s+(\w+)', self.handle_uparam),
             (r'^(?:U)?LOCAL\s+(\d+)', lambda m: setattr(self.current_function, "local_size",
                                                      self.current_function.local_size + int(m.group(1)))),
@@ -1908,7 +1908,7 @@ class AssemblyTranspiler:
 
             # Control flow - ULOOP accepts multiple forms
             (r'^(?:U)?LOOP\s+(.+)', self.handle_uloop),
-            (r'^(?:U)?ENDLOOP', self.handle_uendloop),
+            (r'^(?:U)?ENDLOOP\b', self.handle_uendloop),
 
             # Inline assembly
             (r'^(?:U)?INLINE(?:\s+(\w+))?', self.handle_uinline),
@@ -1925,12 +1925,12 @@ class AssemblyTranspiler:
             (r'^(?:U)?IFARCH\s+(\w+)', self.handle_uifarch),
             (r'^(?:U)?IFDEF\s+(\w+)', self.handle_uifdef),
             (r'^(?:U)?IFNDEF\s+(\w+)', self.handle_uifndef),
-            (r'^(?:U)?ELSE', self.handle_uelse),
-            (r'^(?:U)?ENDIF', self.handle_uendif),
+            (r'^(?:U)?ELSE\b', self.handle_uelse),
+            (r'^(?:U)?ENDIF\b', self.handle_uendif),
 
             # Macros
             (r'^(?:U)?MACRO\s+(\w+)(?:\s+(.+))?', self.handle_umacro),
-            (r'^(?:U)?ENDMACRO', self.handle_uendmacro),
+            (r'^(?:U)?ENDMACRO\b', self.handle_uendmacro),
             (r'^(?:U)?EXPAND\s+(\w+)(?:\s+(.+))?', self.handle_uexpand),
 
             # Utilities
