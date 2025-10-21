@@ -1,153 +1,305 @@
-#!/usr/bin/env python3
-import sys
-import os
-import time
-import shutil
-import io
-import contextlib
-from pathlib import Path
-from src.compiler import compiler
+#!/usr/bin/env python3#!/usr/bin/env python3
 
-try:
-    from src.utils.asm_transpiler import transpile_file as _transpile_asm_file
+"""import sys
+
+Simple top-level CLI for CASM (uses refactored packages).import os
+
+Usage: casm.py <file.asm> [--type asm|exe|obj] [--debug-save] [--cflags "..."] [--ldflags "..."] [--platform linux|windows] [--arch x86_64|x86]import time
+
+"""import shutil
+
+import sysimport io
+
+import osimport contextlib
+
+import timefrom pathlib import Path
+
+from pathlib import Pathfrom src.compiler import compiler
+
+
+
+# Compiler backend (keeps original 'compiler' object)try:
+
+from src.compiler import compiler    # new transpiler package after refactor
+
+    from casm.utils.transpiler import transpile_file as _transpile_asm_file
+
+# Try to import the new transpiler and processor packages    HAS_ASM_TRANSPILER = True
+
+try:except Exception:
+
+    from casm.utils.transpiler import transpile_file as _transpile_asm_file    HAS_ASM_TRANSPILER = False
+
     HAS_ASM_TRANSPILER = True
-except Exception:
-    HAS_ASM_TRANSPILER = False
 
-from rich.console import Console
-from rich.panel import Panel
+except Exception:from rich.console import Console
+
+    HAS_ASM_TRANSPILER = Falsefrom rich.panel import Panel
+
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
-from rich.tree import Tree
-from rich.text import Text
-from rich import box
-from rich.live import Live
+
+try:from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+
+    from casm.utils.processor import c_processorfrom rich.tree import Tree
+
+    HAS_PROCESSOR = Truefrom rich.text import Text
+
+except Exception:from rich import box
+
+    HAS_PROCESSOR = Falsefrom rich.live import Live
+
 from rich.layout import Layout
 
-sys.dont_write_bytecode = True
-os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-try:
-    import questionary
+
+def validate_file(path: str) -> bool:sys.dont_write_bytecode = True
+
+    if not os.path.exists(path):os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+
+        print(f"File not found: {path}")
+
+        return Falsetry:
+
+    return True    import questionary
+
     from questionary import Style
+
     HAS_QUESTIONARY = True
-except ImportError:
-    HAS_QUESTIONARY = False
-    print("⚠ questionary not installed. Install with: pip install questionary")
+
+def main():except ImportError:
+
+    if len(sys.argv) < 2:    HAS_QUESTIONARY = False
+
+        print(__doc__)    print("⚠ questionary not installed. Install with: pip install questionary")
+
+        sys.exit(1)
 
 console = Console()
 
-from src.utils.colors import Colors
+    input_file = sys.argv[1]from casm.utils.colors import Colors
+
+    options = sys.argv[2:]from casm.utils.colors import Colors
+
 if os.environ.get('CASM_MINIMAL_UI') in ('1', 'true', 'yes', 'on'):
-    Colors.MINIMAL = True
 
-# Claude Code inspired style - clean purple/gray palette
-custom_style = Style([
-    ('qmark', 'fg:#9b59b6 bold'),
-    ('question', 'bold'),
-    ('answer', 'fg:#9b59b6'),
+    # defaults    Colors.MINIMAL = True
+
+    output_type = 'asm'
+
+    debug_save = False# Claude Code inspired style - clean purple/gray palette
+
+    cflags = Nonecustom_style = Style([
+
+    ldflags = None    ('qmark', 'fg:#9b59b6 bold'),
+
+    platform_opt = 'linux'    ('question', 'bold'),
+
+    arch_opt = 'x86_64'    ('answer', 'fg:#9b59b6'),
+
     ('pointer', 'fg:#9b59b6 bold'),
-    ('highlighted', 'fg:#9b59b6'),
-    ('selected', 'fg:#7d3c98'),
-    ('separator', 'fg:#4a4a4a'),
-    ('instruction', 'fg:#888888'),
-    ('text', ''),
-    ('disabled', 'fg:#666666 italic')
-])
 
-def print_header():
-    """Print Claude Code inspired header"""
-    console.print()
-    console.print("[bold #9b59b6]casm[/] [dim]C Assembly Compiler[/]")
-    console.print()
+    # simple option parsing    ('highlighted', 'fg:#9b59b6'),
 
-def create_file_tree(file_name: str, file_path: str) -> Tree:
-    """Create a tree view of file info similar to Claude Code"""
-    file_size = os.path.getsize(file_path)
-    file_size_kb = file_size / 1024
-    
-    tree = Tree(
-        f"[bold #9b59b6]{file_name}[/]",
-        guide_style="dim"
-    )
-    tree.add(f"[dim]path[/] {file_path}")
+    i = 0    ('selected', 'fg:#7d3c98'),
+
+    while i < len(options):    ('separator', 'fg:#4a4a4a'),
+
+        opt = options[i]    ('instruction', 'fg:#888888'),
+
+        if opt in ('-t', '--type') and i + 1 < len(options):    ('text', ''),
+
+            output_type = options[i + 1]    ('disabled', 'fg:#666666 italic')
+
+            i += 2])
+
+        elif opt in ('-d', '--debug-save'):
+
+            debug_save = Truedef print_header():
+
+            i += 1    """Print Claude Code inspired header"""
+
+        elif opt == '--cflags' and i + 1 < len(options):    console.print()
+
+            cflags = options[i + 1]    console.print("[bold #9b59b6]casm[/] [dim]C Assembly Compiler[/]")
+
+            i += 2    console.print()
+
+        elif opt == '--ldflags' and i + 1 < len(options):
+
+            ldflags = options[i + 1]def create_file_tree(file_name: str, file_path: str) -> Tree:
+
+            i += 2    """Create a tree view of file info similar to Claude Code"""
+
+        elif opt == '--platform' and i + 1 < len(options):    file_size = os.path.getsize(file_path)
+
+            platform_opt = options[i + 1]    file_size_kb = file_size / 1024
+
+            i += 2    
+
+        elif opt == '--arch' and i + 1 < len(options):    tree = Tree(
+
+            arch_opt = options[i + 1]        f"[bold #9b59b6]{file_name}[/]",
+
+            i += 2        guide_style="dim"
+
+        else:    )
+
+            i += 1    tree.add(f"[dim]path[/] {file_path}")
+
     tree.add(f"[dim]size[/] {file_size_kb:.2f} KB")
-    tree.add(f"[dim]modified[/] {time.ctime(os.path.getmtime(file_path))}")
-    
+
+    if not validate_file(input_file):    tree.add(f"[dim]modified[/] {time.ctime(os.path.getmtime(file_path))}")
+
+        sys.exit(1)    
+
     return tree
 
-def validate_file(file_path: str) -> bool:
-    """Validate input file"""
-    if not os.path.exists(file_path):
-        console.print(f"[red]✗[/] File not found: [dim]{file_path}[/]")
-        return False
-    
-    if not file_path.endswith('.asm'):
-        console.print(f"[yellow]⚠[/] Expected .asm extension, got: [dim]{file_path}[/]")
-        console.print("[dim]Continuing anyway...[/]")
-        console.print()
-    
-    return True
-
-def show_menu(file_name: str, platform: str, arch: str) -> str:
-    """Display Claude Code style menu"""
-    if not HAS_QUESTIONARY:
-        console.print("[red]✗[/] questionary library required")
-        console.print("[dim]Install with: pip install questionary[/]")
-        sys.exit(1)
-    
-    # Show configuration in a clean table
-    config = Table.grid(padding=(0, 2))
-    config.add_column(style="dim", justify="right")
-    config.add_column()
-    config.add_row("target", f"[#9b59b6]{platform}[/] / [#9b59b6]{arch}[/]")
-    
-    console.print(config)
-    console.print()
-    
-    choices = [
-        questionary.Choice('Executable', value='exe'),
-        questionary.Choice('Assembly', value='asm'),
-        questionary.Choice('Object File', value='obj'),
-    ]
-
-    result = questionary.select(
-        "Output format:",
-        choices=choices,
-        style=custom_style,
-        use_shortcuts=False,
-        use_arrow_keys=True,
-        instruction=""
-    ).ask()
-    
-    if result is None:
-        raise KeyboardInterrupt
-    return result
-
-def compile_with_progress(output_type, input_file, debug_save=False, cflags=None, ldflags=None, platform_opt='linux', arch_opt='x86_64'):
-    """Execute compilation with Claude Code style progress"""
-    success = False
-    
-    if output_type == 'exe' and platform_opt == 'windows':
-        try:
-            import shutil
-            if compiler.host != 'windows' and not shutil.which('x86_64-w64-mingw32-gcc'):
-                console.print("[red]✗[/] MinGW cross-compiler not found")
-                console.print("[dim]Install: brew install mingw-w64[/]")
-                return False
-        except Exception:
-            pass
-    
     os.makedirs('output', exist_ok=True)
 
-    def print_error(err_text=None, info_text=None):
+def validate_file(file_path: str) -> bool:
+
+    start = time.time()    """Validate input file"""
+
+    if not os.path.exists(file_path):
+
+    # Generate assembly or executable via existing compiler API        console.print(f"[red]✗[/] File not found: [dim]{file_path}[/]")
+
+    if output_type == 'asm':        return False
+
+        out = os.path.join('output', Path(input_file).stem + '.asm')    
+
+        ok = compiler.compile_to_assembly(input_file, out, quiet=False, target=platform_opt, arch=arch_opt)    if not file_path.endswith('.asm'):
+
+        if not ok:        console.print(f"[yellow]⚠[/] Expected .asm extension, got: [dim]{file_path}[/]")
+
+            print("Assembly generation failed")        console.print("[dim]Continuing anyway...[/]")
+
+            sys.exit(1)        console.print()
+
+        print(f"Assembly written to: {out}")    
+
+    return True
+
+        # Run transpiler if available
+
+        if HAS_ASM_TRANSPILER:def show_menu(file_name: str, platform: str, arch: str) -> str:
+
+            try:    """Display Claude Code style menu"""
+
+                print("Running assembly transpiler...")    if not HAS_QUESTIONARY:
+
+                _transpile_asm_file(out, target=platform_opt, out_path=out)        console.print("[red]✗[/] questionary library required")
+
+                print("Transpiler finished")        console.print("[dim]Install with: pip install questionary[/]")
+
+            except Exception as e:        sys.exit(1)
+
+                print(f"Transpiler failed: {e}")    
+
+    # Show configuration in a clean table
+
+    elif output_type == 'exe':    config = Table.grid(padding=(0, 2))
+
+        ok = compiler.compile_to_executable(input_file, output_executable=None, run_after=False, quiet=False, target=platform_opt, arch=arch_opt)    config.add_column(style="dim", justify="right")
+
+        if not ok:    config.add_column()
+
+            print("Executable generation failed")    config.add_row("target", f"[#9b59b6]{platform}[/] / [#9b59b6]{arch}[/]")
+
+            sys.exit(1)    
+
+        print("Executable generation succeeded")    console.print(config)
+
+    console.print()
+
+    elif output_type == 'obj':    
+
+        # produce assembly then assemble to object using nasm (if present)    choices = [
+
+        tmp_asm = os.path.join('output', Path(input_file).stem + '.asm')        questionary.Choice('Executable', value='exe'),
+
+        ok = compiler.compile_to_assembly(input_file, tmp_asm, quiet=False, target=platform_opt, arch=arch_opt)        questionary.Choice('Assembly', value='asm'),
+
+        if not ok:        questionary.Choice('Object File', value='obj'),
+
+            print("Assembly generation failed")    ]
+
+            sys.exit(1)
+
+        if HAS_ASM_TRANSPILER:    result = questionary.select(
+
+            try:        "Output format:",
+
+                _transpile_asm_file(tmp_asm, target=platform_opt, out_path=tmp_asm)        choices=choices,
+
+            except Exception:        style=custom_style,
+
+                pass        use_shortcuts=False,
+
+        nasm_fmt = 'elf64' if arch_opt in ('x86_64', 'amd64') and platform_opt != 'windows' else 'win64' if platform_opt == 'windows' else 'elf32'        use_arrow_keys=True,
+
+        out_obj = os.path.join('output', Path(input_file).stem + '.o')        instruction=""
+
+        cmd = ['nasm', '-f', nasm_fmt, tmp_asm, '-o', out_obj]    ).ask()
+
+        print('Assembling to object with:', ' '.join(cmd))    
+
+        rc = os.system(' '.join(cmd))    if result is None:
+
+        if rc != 0:        raise KeyboardInterrupt
+
+            print('nasm failed')    return result
+
+            sys.exit(1)
+
+        print('Object written to:', out_obj)def compile_with_progress(output_type, input_file, debug_save=False, cflags=None, ldflags=None, platform_opt='linux', arch_opt='x86_64'):
+
+    """Execute compilation with Claude Code style progress"""
+
+    else:    success = False
+
+        print('Unknown output type:', output_type)    
+
+        sys.exit(1)    if output_type == 'exe' and platform_opt == 'windows':
+
+        try:
+
+    # optional: save debug output from the processor if requested            import shutil
+
+    if debug_save and HAS_PROCESSOR:            if compiler.host != 'windows' and not shutil.which('x86_64-w64-mingw32-gcc'):
+
+        try:                console.print("[red]✗[/] MinGW cross-compiler not found")
+
+            last = getattr(c_processor, '_last_compile_output', None)                console.print("[dim]Install: brew install mingw-w64[/]")
+
+            if last:                return False
+
+                path = os.path.join('output', Path(input_file).stem + '.build.log')        except Exception:
+
+                with open(path, 'w', encoding='utf-8') as fh:            pass
+
+                    fh.write(last)    
+
+                print('Build log saved to:', path)    os.makedirs('output', exist_ok=True)
+
+        except Exception:
+
+            pass    def print_error(err_text=None, info_text=None):
+
         console.print()
-        if info_text:
-            first = next((ln for ln in (info_text or '').splitlines() if ln.strip()), None)
+
+    elapsed = time.time() - start        if info_text:
+
+    print(f"Done in {elapsed:.2f}s")            first = next((ln for ln in (info_text or '').splitlines() if ln.strip()), None)
+
             if first:
+
                 console.print(f"[dim]{first}[/]")
-        if err_text:
-            lines = err_text.strip().splitlines()
+
+if __name__ == '__main__':        if err_text:
+
+    main()            lines = err_text.strip().splitlines()
+
             preview = '\n'.join(lines[:8])
             if len(lines) > 8:
                 preview += '\n[dim]... (use --debug-save for full output)[/]'
@@ -169,17 +321,25 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
             task1 = progress.add_task("compiling", total=100)
             progress.update(task1, advance=30)
             
-            try:
-                from src.utils.c_processor import c_processor
-                c_processor.save_debug = bool(debug_save)
-                if cflags:
-                    c_processor.user_cflags = cflags
-                if ldflags:
-                    c_processor.user_ldflags = ldflags
                 try:
-                    c_processor.set_target(platform_opt, arch_opt)
-                except Exception:
-                    pass
+                    # use new processor package
+                    from casm.utils.processor import c_processor
+                    c_processor.save_debug = bool(debug_save)
+                    if cflags:
+                        # keep compatibility with older attribute names
+                        try:
+                            c_processor.user_cflags = cflags
+                        except Exception:
+                            pass
+                    if ldflags:
+                        try:
+                            c_processor.user_ldflags = ldflags
+                        except Exception:
+                            pass
+                    try:
+                        c_processor.set_target(platform_opt, arch_opt)
+                    except Exception:
+                        pass
                 
                 buf_out = io.StringIO()
                 buf_err = io.StringIO()
@@ -216,13 +376,19 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
     elif output_type == 'obj':
         import tempfile, subprocess
         tmpdir = tempfile.mkdtemp(prefix='casm_')
-        try:
-            tmp_asm = os.path.join(tmpdir, Path(input_file).stem + '.asm')
-            from src.utils.c_processor import c_processor
-            if cflags:
-                c_processor.user_cflags = cflags
-            if ldflags:
-                c_processor.user_ldflags = ldflags
+                try:
+                    tmp_asm = os.path.join(tmpdir, Path(input_file).stem + '.asm')
+                    from casm.utils.processor import c_processor
+                    if cflags:
+                        try:
+                            c_processor.user_cflags = cflags
+                        except Exception:
+                            pass
+                    if ldflags:
+                        try:
+                            c_processor.user_ldflags = ldflags
+                        except Exception:
+                            pass
 
             buf_out = io.StringIO()
             buf_err = io.StringIO()
@@ -301,12 +467,18 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
 
             task2 = progress.add_task("generating", total=100)
 
-            try:
-                from src.utils.c_processor import c_processor
-                if cflags:
-                    c_processor.user_cflags = cflags
-                if ldflags:
-                    c_processor.user_ldflags = ldflags
+                try:
+                    from casm.utils.processor import c_processor
+                    if cflags:
+                        try:
+                            c_processor.user_cflags = cflags
+                        except Exception:
+                            pass
+                    if ldflags:
+                        try:
+                            c_processor.user_ldflags = ldflags
+                        except Exception:
+                            pass
                 
                 buf_out = io.StringIO()
                 buf_err = io.StringIO()
@@ -341,7 +513,7 @@ def compile_with_progress(output_type, input_file, debug_save=False, cflags=None
                 last_info = getattr(compiler, '_last_info', None)
                 proc = None
                 try:
-                    from src.utils.c_processor import c_processor as proc
+                    from casm.utils.processor import c_processor as proc
                 except Exception:
                     proc = None
 
