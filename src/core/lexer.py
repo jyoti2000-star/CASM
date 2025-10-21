@@ -1,280 +1,62 @@
-#!/usr/bin/env python3
-from typing import List, Tuple, Optional, Dict
-import re
-from .tokens import Token, TokenType, LexerError
+"""
+Compatibility wrapper: delegate core CASMLexer functionality to the
+implementation in src.compiler.lexer when available. The core pipeline
+expects CASMLexer(source, filename) with a .tokenize() method that returns
+token list; src.compiler.lexer provides a similar but slightly different API.
+"""
+from typing import List, Tuple, Dict, Optional
+from .tokens import TokenType, Token, SourceLocation
+from .diagnostics import DiagnosticEngine
+
+try:
+    # Prefer the compiler lexer implementation
+    from src.compiler.lexer import CASMLexer as _CompilerCASMLexer
+except Exception:
+    _CompilerCASMLexer = None
+
 
 class CASMLexer:
-    """Clean lexical analyzer for CASM language"""
-    
-    def __init__(self):
-        self.current_line = 1
-        self.current_column = 1
-        self.current_line_text = ""
-        # When True, we are inside a multi-line C statement that started
-        # with a '(' and hasn't yet seen the matching ')'. In that case,
-        # subsequent lines should be treated as C_INLINE until the block
-        # closes so the parser can collect full C statements.
-        self._in_c_paren_block = False
-        
-        # Essential keywords only
-        self.keywords = {
-            'if': TokenType.IF,
-            'else': TokenType.ELSE,
-            'endif': TokenType.ENDIF,
-            'while': TokenType.WHILE,
-            'endwhile': TokenType.ENDWHILE,
-            'for': TokenType.FOR,
-            'endfor': TokenType.ENDFOR,
-            'print': TokenType.PRINT,
-            'scan': TokenType.SCAN,
-            'var': TokenType.VAR,
-            
-            # Data types with @ prefix (handled separately)
-            'int': TokenType.INT_TYPE,
-            'str': TokenType.STR_TYPE,
-            'bool': TokenType.BOOL_TYPE,
-            'float': TokenType.FLOAT_TYPE,
-            'buffer': TokenType.BUFFER_TYPE,
-            # Assembler/data directive types allowed in `var` declarations
-            'db': TokenType.ASM_DIRECTIVE,
-            'dd': TokenType.ASM_DIRECTIVE,
-            'dq': TokenType.ASM_DIRECTIVE,
-            'dw': TokenType.ASM_DIRECTIVE,
-            'resb': TokenType.ASM_DIRECTIVE,
-            'resw': TokenType.ASM_DIRECTIVE,
-            'resd': TokenType.ASM_DIRECTIVE,
-            'resq': TokenType.ASM_DIRECTIVE,
-            'equ': TokenType.ASM_DIRECTIVE,
-            'in': TokenType.IN,
-            'range': TokenType.RANGE,
-            'extern': TokenType.EXTERN,
-        }
-        
-        # Operators (ordered by length for proper matching)
-        self.operators = [
-            ('==', TokenType.EQUALS),
-            ('!=', TokenType.NOT_EQUALS),
-            ('<=', TokenType.LESS_EQUAL),
-            ('>=', TokenType.GREATER_EQUAL),
-            ('=', TokenType.ASSIGN),
-            ('<', TokenType.LESS_THAN),
-            ('>', TokenType.GREATER_THAN),
-            ('+', TokenType.PLUS),
-            ('-', TokenType.MINUS),
-            ('*', TokenType.MULTIPLY),
-            ('/', TokenType.DIVIDE),
-            ('%', TokenType.MODULO),
-            # removed '@' legacy operator
-        ]
-        
-        # Punctuation
-        self.punctuation = {
-            '(': TokenType.LEFT_PAREN,
-            ')': TokenType.RIGHT_PAREN,
-            '[': TokenType.LEFT_BRACKET,
-            ']': TokenType.RIGHT_BRACKET,
-            '{': TokenType.LEFT_BRACE,
-            '}': TokenType.RIGHT_BRACE,
-            ',': TokenType.COMMA,
-            ';': TokenType.SEMICOLON,
-            ':': TokenType.COLON,
-        }
-    
-    def tokenize(self, text: str) -> List[Token]:
-        """Tokenize input text and return list of tokens"""
-        tokens = []
-        lines = text.split('\n')
-        
-        for line_num, line in enumerate(lines, 1):
-            self.current_line = line_num
-            self.current_line_text = line
-            self.current_column = 1
-            
-            line_tokens = self._tokenize_line(line)
-            tokens.extend(line_tokens)
-            
-            # Add newline token if line is not empty
-            if line.strip():
-                tokens.append(Token(TokenType.NEWLINE, '\n', line_num, len(line) + 1, line))
-        
-        # Add EOF token
-        tokens.append(Token(TokenType.EOF, '', self.current_line, self.current_column, ''))
-        
-        return tokens
-    
-    def _tokenize_line(self, line: str) -> List[Token]:
-        """Tokenize a single line"""
-        # Heuristic: if a line looks like C (ends with ';', starts with '#',
-        # or uses C-style control constructs with parentheses), return a
-        # single C_INLINE token so the parser can collect contiguous C lines.
-        stripped_line = line.strip()
-        if stripped_line:
-            # If we are currently inside a C parenthesis block, treat every
-            # line as C_INLINE until the closing parenthesis is found.
-            if self._in_c_paren_block:
-                # If this line contains the closing ')', end the block after
-                # emitting the C_INLINE token.
-                if ')' in stripped_line:
-                    self._in_c_paren_block = False
-                return [Token(TokenType.C_INLINE, stripped_line, self.current_line, 1, line)]
+    def __init__(self, source: str, filename: str = "<stdin>"):
+        self.source = source
+        self.filename = filename
+        self.diagnostics = DiagnosticEngine()
 
-            # C preprocessor or statement ending with semicolon
-            # Also treat lines that contain a '{' (likely a C function header)
-            # as C_INLINE so multi-line function definitions are collected.
-            if (stripped_line.startswith('#') or stripped_line.endswith(';')
-                or '{' in stripped_line or '}' in stripped_line
-                or '(' in stripped_line or ')' in stripped_line):
-                # If this line opens a parenthesis block that doesn't close
-                # on the same line, set the flag so following lines are
-                # considered C_INLINE as well.
-                if '(' in stripped_line and ')' not in stripped_line:
-                    self._in_c_paren_block = True
-                return [Token(TokenType.C_INLINE, stripped_line, self.current_line, 1, line)]
-            # Do not treat C-style 'for/if/while(...)' as C here; loops are
-            # CASM constructs and should be tokenized as such. C statements
-            # remain only those ending with ';' or starting with '#'.
+        if _CompilerCASMLexer:
+            # The compiler lexer expects either a filename or text; create an
+            # instance and keep it for tokenize delegation.
+            try:
+                # The compiler lexer.tokenize(text) expects text input, so no
+                # constructor side-effects are assumed. We'll not rely on
+                # _CompilerCASMLexer(filename) signature; instead we'll call its
+                # tokenize method directly.
+                self._delegate = _CompilerCASMLexer()
+            except TypeError:
+                # If the constructor signature differs, don't crash — fallback
+                self._delegate = None
+        else:
+            self._delegate = None
 
-        tokens = []
-        i = 0
-        
-        while i < len(line):
-            # Skip whitespace
-            if line[i].isspace():
-                self.current_column += 1
-                i += 1
-                continue
-            
-            # Comments
-            if line[i:i+1] == ';':
-                comment_text = line[i:].rstrip()
-                tokens.append(Token(TokenType.COMMENT, comment_text, 
-                                  self.current_line, self.current_column, line))
-                break  # Rest of line is comment
-            
-            # Strings
-            if line[i] in ['"', "'"]:
-                string_value, new_i = self._extract_string(line, i)
-                tokens.append(Token(TokenType.STRING, string_value,
-                                  self.current_line, self.current_column, line))
-                i = new_i
-                continue
-            
-            # Numbers
-            if line[i].isdigit():
-                number_value, new_i = self._extract_number(line, i)
-                tokens.append(Token(TokenType.NUMBER, number_value,
-                                  self.current_line, self.current_column, line))
-                i = new_i
-                continue
-            
-            # Keywords and identifiers
-            if line[i].isalpha() or line[i] == '_':
-                identifier, new_i = self._extract_identifier(line, i)
-                
-                # Check if it's a keyword
-                token_type = self.keywords.get(identifier.lower(), TokenType.IDENTIFIER)
-                
-                tokens.append(Token(token_type, identifier,
-                              self.current_line, self.current_column, line))
-                
-                i = new_i
-                continue
-            
-            # Operators (check multi-character first)
-            found_operator = False
-            for op_text, op_type in self.operators:
-                if line[i:i+len(op_text)] == op_text:
-                    tokens.append(Token(op_type, op_text,
-                                      self.current_line, self.current_column, line))
-                    i += len(op_text)
-                    self.current_column += len(op_text)
-                    found_operator = True
-                    break
-            
-            if found_operator:
-                continue
-            
-            # Punctuation
-            if line[i] in self.punctuation:
-                token_type = self.punctuation[line[i]]
-                tokens.append(Token(token_type, line[i],
-                                  self.current_line, self.current_column, line))
-                i += 1
-                self.current_column += 1
-                continue
-            
-            # If we reach here, it's likely raw assembly code
-            # Treat the rest of the line as assembly
-            assembly_code = line[i:].strip()
-            if assembly_code:
-                tokens.append(Token(TokenType.ASSEMBLY_LINE, assembly_code,
-                                  self.current_line, self.current_column, line))
-            break
-        
-        return tokens
-    
-    def _extract_string(self, line: str, start: int) -> Tuple[str, int]:
-        """Extract a string literal"""
-        quote_char = line[start]
-        i = start + 1
-        result = quote_char
-        
-        while i < len(line):
-            char = line[i]
-            result += char
-            
-            if char == quote_char:
-                # End of string
-                i += 1
-                break
-            elif char == '\\' and i + 1 < len(line):
-                # Escape sequence
-                i += 1
-                if i < len(line):
-                    result += line[i]
-            
-            i += 1
-        
-        self.current_column += len(result)
-        return result, i
-    
-    def _extract_number(self, line: str, start: int) -> Tuple[str, int]:
-        """Extract a number (integer or float)"""
-        i = start
-        result = ""
-        has_dot = False
-        
-        while i < len(line):
-            char = line[i]
-            if char.isdigit():
-                result += char
-            elif char == '.' and not has_dot:
-                has_dot = True
-                result += char
-            elif char in 'xXabcdefABCDEF' and result.startswith('0'):
-                # Hexadecimal number
-                result += char
-            else:
-                break
-            i += 1
-        
-        self.current_column += len(result)
-        return result, i
-    
-    def _extract_identifier(self, line: str, start: int) -> Tuple[str, int]:
-        """Extract an identifier or keyword"""
-        i = start
-        result = ""
-        
-        # No legacy '%!' handling - legacy markers removed
-        
-        while i < len(line):
-            char = line[i]
-            if char.isalnum() or char in ['%', '_']:
-                result += char
-            else:
-                break
-            i += 1
-        
-        self.current_column += len(result)
-        return result, i
+    def tokenize(self) -> List[Token]:
+        """Return a list of tokens for the stored source text.
+
+        The core pipeline calls CASMLexer(source, filename).tokenize() so
+        provide that behavior by delegating to the compiler lexer if
+        available, otherwise perform a minimal split into EOF token.
+        """
+        if self._delegate is not None:
+            # compiler.CASMLexer.tokenize expects text input
+            try:
+                return self._delegate.tokenize(self.source)
+            except TypeError:
+                # Some versions may expect no args and use internal filename; try both
+                try:
+                    return self._delegate.tokenize()
+                except Exception as e:
+                    raise
+
+        # Minimal fallback tokenization to avoid hard failure. This will
+        # produce an EOF token only and likely fail later in parsing, but it
+        # prevents import-time crashes.
+        from .tokens import Token, TokenType, SourceLocation
+        eof = Token(type=TokenType.EOF, value='', location=SourceLocation(line=1, column=1, file=self.filename, raw_line=''))
+        return [eof]

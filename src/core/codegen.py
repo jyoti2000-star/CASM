@@ -1,1404 +1,313 @@
-#!/usr/bin/env python3
-
-from typing import List, Dict, Set
-import os
-import secrets
+from typing import List
 import re
-from .ast_nodes import *
-from ..utils.formatter import formatter
-from ..utils.colors import print_info, print_success, print_error, print_warning
+from .ast import ProgramNode, FunctionDeclarationNode, PrintlnNode, ReturnNode
+from .diagnostics import DiagnosticEngine
+from .ast import VarDeclarationNode, AssignmentNode, LiteralNode, IdentifierNode, BinaryOpNode, FunctionCallNode
 
-class AssemblyCodeGenerator(ASTVisitor):
-    """Generate x86-64 Windows assembly from CASM AST"""
-    
-    def __init__(self):
-        """Initialize code generator with empty sections"""
-        self.data_section = []
-        self.bss_section = []
-        self.text_section = []
-        self.string_labels = {}
-        self.variable_labels = {}
-        self.variable_info = {}  # Store complete variable information for C integration
-        self.label_counter = 0
-        self.used_functions = set()
-        self._auto_declared_vars = set()
-        # Deterministic counters for human-friendly labels
-        self.naming_salt = None
-        self.var_counter = 0
+
+class AssemblyCodeGenerator:
+    def __init__(self, target_os: str = 'linux'):
+        self.target_os = target_os
+        self.data_section: List[str] = []
+        self.rodata_section: List[str] = []
+        self.text_section: List[str] = []
         self.str_counter = 0
-        self.fmt_counter = 0
-        self.lc_counter = 0
-        self.equ_defs = []
-        # Control whether the generator emits an automatic function epilogue
-        # Default: enabled. Set environment variable CASM_AUTO_EPILOGUE=0 to disable.
-        # Per workspace/request, default to not appending an automatic
-        # epilogue so users can add it manually. If an env var is set and
-        # truthy, it can still be enabled (for backward compatibility).
-        try:
-            # Default to '0' (disabled). If CASM_AUTO_EPILOGUE is set to a
-            # truthy value, treat epilogue as enabled.
-            self.auto_epilogue = str(os.getenv('CASM_AUTO_EPILOGUE', '0')).strip() not in ('0', 'false', 'no')
-        except Exception:
-            self.auto_epilogue = False
-        # Control automatic prologue emission (push/mov/sub). Default: disabled
-        try:
-            self.auto_prologue = str(os.getenv('CASM_AUTO_PROLOGUE', '0')).strip() not in ('0', 'false', 'no')
-        except Exception:
-            self.auto_prologue = False
-    
-    def generate(self, ast: ProgramNode) -> str:
-        """Generate complete assembly program"""
-        # Reset state
-        self.data_section = []
-        self.bss_section = []
-        self.text_section = []
-        self.string_labels = {}
-        self.variable_labels = {}
-        self.variable_info = {}
+        self.diagnostics = DiagnosticEngine()
         self.label_counter = 0
-        self.used_functions = set()
-        self._auto_declared_vars = set()
-        
-        # Pass variable information to C processor
-        try:
-            from ..utils.c_processor import c_processor
-            c_processor.set_casm_variables(self.variable_info)
-        except ImportError:
-            print_warning("C processor not available")
-        
-        # Visit the AST
-        ast.accept(self)
-        # Now that we've visited the AST, pass full variable information to
-        # the C processor so it can generate correct externs/defines.
-        try:
-            from ..utils.c_processor import c_processor
-            c_processor.set_casm_variables(self.variable_info)
-        except ImportError:
-            pass
-
-        # Finalize C code compilation and replace placeholders
-        self.finalize_c_code()
-        
-        # Get any C variables for potential CASM access
-        try:
-            from ..utils.c_processor import c_processor
-            c_variables = c_processor.get_c_variables()
-            if c_variables:
-                print_info(f"C variables available for CASM: {list(c_variables.keys())}")
-        except ImportError:
-            c_variables = {}
-        
-        # Build final assembly
-        lines = []
-
-        # Emit any top-level bracketed assembler directives collected from
-        # the source (e.g. [BITS 16], [ORG 0x7C00]). These are emitted verbatim
-        # at the top of the file so users can include boot directives or mode
-        # toggles without the generator hardcoding them.
-        directives = getattr(self, 'top_directives', []) or []
-        for d in directives:
-            lines.append(d)
-        if directives:
-            lines.append("")
-        
-        # Add external function declarations
-        external_functions = set()
-        external_functions.update(self.used_functions)
-        
-        # Always add common C library functions that might be used by compiled C code
-        common_c_functions = {'printf', 'puts', 'putchar', 'scanf', 'strlen', 'strcpy', 
-                             'strcmp', 'strstr', 'malloc', 'free', 'pow', 'sqrt', 'sin', 'cos',
-                             'srand', 'rand', 'exit', 'abort'}
-        external_functions.update(common_c_functions)
-        
-        if external_functions:
-            for func in sorted(external_functions):
-                lines.append(f"extern {func}")
-            lines.append("")
-
-        # Emit assembler-time equ definitions (constants) before sections
-        if getattr(self, 'equ_defs', None):
-            for eq in self.equ_defs:
-                lines.append(eq)
-            lines.append("")
-        
-        # Add C function declarations if any
-        if c_variables:
-            lines.append("; C variables accessible from CASM")
-            for var_name, var_info in c_variables.items():
-                lines.append(f"extern {var_info['c_name']}")
-            lines.append("")
-        
-        # Data section - emit canonical NASM section header (.data)
-        # The asm_transpiler will translate these into platform-specific
-        # segment names (e.g. __DATA,__data) when necessary. Emitting the
-        # canonical names here prevents duplicate or mixed headers later
-        # in the pretty/fixer pipeline.
-        if self.data_section:
-            lines.append('section .data')
-            lines.extend(self.data_section)
-            lines.append("")
-            from ..utils.colors import print_debug
-            print_debug(f"Added .data section with {len(self.data_section)} items")
-        
-        # BSS section (uninitialized data) - emit canonical NASM header
-        if hasattr(self, 'bss_section') and self.bss_section:
-            lines.append('section .bss')
-            lines.extend(self.bss_section)
-            lines.append("")
-            from ..utils.colors import print_debug
-            print_debug(f"Added .bss section with {len(self.bss_section)} items")
-        
-        # Text section - canonical NASM header
-        lines.append('section .text')
-        # Optionally emit a standard `main` symbol using unified assembly UFUNC.
-        # Emit a GLOBAL directive and a UFUNC so the asm_transpiler will
-        # generate the correct prologue/epilogue per-target.
-        if getattr(self, 'auto_prologue', False):
-            lines.append("global main")
-            lines.append("")
-            # Use unified assembly directive - let the transpiler emit actual
-            # function label and prologue for the target platform.
-            lines.append("UFUNC main")
-            lines.append("")
+        # collected external symbols (from ExternDirectiveNode)
+        self.externs = set()
+        # argument register ordering (basic)
+        if self.target_os == 'windows':
+            self.arg_regs = ['rcx', 'rdx', 'r8', 'r9']
         else:
-            # Keep a blank line for readability when not emitting the prologue
-            lines.append("")
-        
-        lines.extend(self.text_section)
-        
-        # Optionally append a default program epilogue. Emit a unified
-        # assembly exit directive so the transpiler performs the correct
-        # target-specific termination sequence.
-        if getattr(self, 'auto_epilogue', True):
-            lines.append("")
-            lines.append("    ; Exit program (unified directive)")
-            lines.append("UEXIT 0")
-        
-        # Format the assembly
-        assembly_code = '\n'.join(lines)
-        
-        # Use the pretty printer for context-aware formatting
-        try:
-            from .pretty import pretty_printer
-            from ..utils.c_processor import c_processor
-            from .assembly_fixer import assembly_fixer
-            
-            # Get the compiled assembly segments for the pretty printer
-            c_assembly_segments = getattr(c_processor, '_last_assembly_segments', {})
-            
-            # Pass existing string label mapping so the pretty printer doesn't
-            # generate duplicate STR labels for the same literals.
-            prettified_code = pretty_printer.prettify(assembly_code, ast, self.variable_labels, c_assembly_segments, existing_string_labels=self.string_labels)
+            self.arg_regs = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
 
-            # Dump prettified code to a temp file for debugging inspection
-            try:
-                with open('/tmp/casm_prettified_debug.asm', 'w', encoding='utf-8') as _df:
-                    _df.write(prettified_code)
-            except Exception:
-                pass
-
-            # Fix assembly for NASM compatibility
-            fixed_code = assembly_fixer.fix_assembly(prettified_code)
-
-            # Ensure string definitions are placed in .data (post-pass)
-            final_code = self._move_strings_to_data(fixed_code)
-
-            print_success("Assembly code generated, prettified and fixed for NASM")
-            return final_code
-        except ImportError as e:
-            print_warning(f"Pretty printer or fixer not available: {e}")
-            # Fallback to regular formatting if pretty printer fails
-            formatted_code = formatter.format_assembly(assembly_code)
-            print_success("Assembly code generated and formatted")
-            return formatted_code
-    
-    def visit_program(self, node: ProgramNode):
-        """Visit program root node"""
-        for stmt in node.statements:
-            stmt.accept(self)
-
-    def _move_strings_to_data(self, assembly: str) -> str:
-        """Ensure any `str_... db ...` lines are in section .data and not in .bss.
-
-        This is a small, defensive post-pass to avoid string declarations ending up
-        in the BSS after other transformation passes.
-        """
-        import re
-
-        lines = assembly.split('\n')
-
-        # Collect all string db lines (deduplicated, preserve order)
-        string_lines = []
-        seen = set()
-        str_re = re.compile(r"^\s*(STR[\w\d_]+\s+db\s+.*)$")
-        for line in lines:
-            m = str_re.match(line)
-            if m:
-                s = m.group(1).strip()
-                if s not in seen:
-                    seen.add(s)
-                    string_lines.append(s)
-
-        if not string_lines:
-            return assembly
-
-        # Remove all occurrences of those string lines from the assembly
-        new_lines = []
-        for line in lines:
-            if str_re.match(line):
-                # skip string lines (we will reinsert under .data)
-                continue
-            new_lines.append(line)
-
-        # Find insertion point: after 'section .data' header if present, else before first section
-        out = []
-        inserted = False
-        for i, line in enumerate(new_lines):
-            out.append(line)
-            if not inserted and line.strip().startswith('section .data'):
-                # Insert strings after this header
-                for s in string_lines:
-                    out.append(f"    {s}")
-                inserted = True
-
-        if not inserted:
-            # No data section found; prepend one at top
-            header = ["section .data"] + [f"    {s}" for s in string_lines] + [""]
-            out = header + out
-
-        return '\n'.join(out)
-    
-    def visit_var_declaration(self, node: VarDeclarationNode):
-        """Visit variable declaration with type support"""
-        # Extract variable metadata
-        var_type = node.var_type
-        var_size = node.size
-        value = node.value
-
-        # Determine label: always use deterministic V# labels for all CASM
-        # variables (including assembler-level directives and equ). This keeps
-        # emitted assembly consistent and avoids introducing user-provided
-        # symbol names that could conflict with system headers.
-        self.var_counter += 1
-        label = f"V{self.var_counter}"
-        self.variable_labels[node.name] = label
-
-        # Store variable metadata
-        self.variable_info[node.name] = {
-            'type': var_type,
-            'size': var_size,
-            'label': label,
-            'value': value
-        }
-
-        from ..utils.colors import print_debug
-        print_debug(f"Processing variable: {node.name}, type: {var_type}, size: {var_size}, value: '{value}'")
-
-        # Handle assembler-time constants (equ) early -> emit unified constant
-        if var_type == 'equ':
-            raw_value = (value or '').strip()
-            if raw_value == '':
-                raw_value = '0'
-            # Use the original symbolic name for equates so they are readable
-            self.variable_labels[node.name] = node.name
-            self.variable_info[node.name] = {
-                'type': 'equ', 'size': var_size, 'label': node.name, 'value': raw_value
-            }
-            # Emit unified constant directive (transpiler will convert to equ)
-            self.text_section.append(f"UCONST {node.name} {raw_value}  ; equ {node.name}")
-            self.text_section.append(f"    ; Equ: {node.name} = {raw_value}")
-            return
-
-        # Support direct assembler directives as var types (db, dd, dq, dw, res*)
-        asm_directives = {'db', 'dd', 'dq', 'dw', 'resb', 'resw', 'resd', 'resq', 'equ'}
-        if var_type in asm_directives:
-            raw_value = (value or '').strip()
-            # Reserves (res*) go into BSS
-            if var_type.startswith('res'):
-                count = var_size or 1
-                try:
-                    count_num = int(count)
-                except Exception:
-                    count_num = 1
-                # Emit unified bytes reservation
-                self.text_section.append(f"UBYTES {label} {count_num}  ; {var_type} {node.name}")
-                self.text_section.append(f"    ; Reserved: {node.name} as {var_type} {count_num} (label: {label})")
-                return
-
-            # Data directives
-            if var_size:
-                # Emit unified array directive
-                if raw_value:
-                    values = [v.strip() for v in raw_value.split(',')]
-                    values_str = ','.join(values)
-                    self.text_section.append(f"UARRAY {label} {var_type} {values_str}  ; {var_type} {node.name}[{var_size}] (label: {label})")
-                else:
-                    # repeat initializer
-                    self.text_section.append(f"UARRAY {label} {var_type} times {var_size} 0  ; {var_type} {node.name}[{var_size}] (label: {label})")
-                self.text_section.append(f"    ; Array: {var_type} {node.name}[{var_size}] (label: {label})")
-                return
-
-            if raw_value:
-                self.text_section.append(f"UARRAY {label} {var_type} {raw_value}  ; {var_type} {node.name} (label: {label})")
-            else:
-                self.text_section.append(f"UARRAY {label} {var_type} 0  ; {var_type} {node.name} (label: {label})")
-            self.text_section.append(f"    ; Variable ({var_type}): {node.name} = {value} (label: {label})")
-            return
-
-        if var_type == "buffer" and var_size:
-            # Buffers -> unified bytes reservation
-            self.text_section.append(f"UBYTES {label} {var_size}  ; buffer[{var_size}]")
-            self.text_section.append(f"    ; Buffer: {node.name}[{var_size}] in .bss")
-            print_debug(f"Added buffer as UBYTES: {label} {var_size}")
-            
-        elif var_type == "int":
-            # If value is a simple integer literal (decimal, hex, negative),
-            # emit it directly in the data section. Otherwise initialize to
-            # zero and generate runtime assignment code for expressions.
-            raw_value = (value or "").strip()
-            # Normalize a common lexer artifact where negative numbers are
-            # tokenized as '-' and '1' separately, resulting in values like
-            # '- 1' or '- 0x1'. Collapse these into a single token '-1' or
-            # '-0x1' so int(..., 0) recognizes hex and decimal negatives.
-            import re as _re
-            m = _re.match(r'^([+-])\s*(0x[0-9a-fA-F]+|\d+)$', raw_value)
-            if m:
-                raw_value = m.group(1) + m.group(2)
-            emitted = False
-            if raw_value and raw_value != "0":
-                try:
-                    # int(..., 0) accepts 0x... hex and decimal, and negatives
-                    _ = int(raw_value, 0)
-                    self.data_section.append(f"    {label} dd {raw_value}  ; int {node.name}")
-                    self.text_section.append(f"    ; Variable: int {node.name} = {value}")
-                    emitted = True
-                except Exception:
-                    # Not a simple literal; fall back to default and emit assignment code
-                    pass
-
-            if not emitted:
-                self.data_section.append(f"    {label} dd 0  ; int {node.name}")
-                self.text_section.append(f"    ; Variable: int {node.name} = {value}")
-                # Handle initialization expression (only when non-empty and not literal zero)
-                if raw_value and raw_value != "0":
-                    self._generate_assignment_code(node.name, raw_value)
-            
-        elif var_type == "bool":
-            bool_value = 1 if value.lower() in ['true', '1', 'yes'] else 0
-            self.data_section.append(f"    {label} db {bool_value}  ; bool {node.name}")
-            self.text_section.append(f"    ; Variable: bool {node.name} = {value}")
-            
-        elif var_type == "float":
-            try:
-                # Convert float to IEEE 754 format or use default
-                float_value = float(value)
-                # For simplicity, store as a string and let assembler handle it
-                self.data_section.append(f"    {label} dq {float_value}  ; float {node.name}")
-            except ValueError:
-                self.data_section.append(f"    {label} dq 0.0  ; float {node.name} = {value}")
-            self.text_section.append(f"    ; Variable: float {node.name} = {value}")
-            
-        elif var_type == "str":
-            # Remove quotes if present
-            str_value = value.strip()
-            if str_value.startswith('"') and str_value.endswith('"'):
-                str_value = str_value[1:-1]
-
-            # Emit unified string directive (transpiler will place into .data)
-            # Keep the variable label mapping so other code can reference it
-            self.text_section.append(f'USTR {label} "{str_value}"  ; str {node.name}')
-            self.text_section.append(f"    ; Variable: str {node.name} = {value} (label: {label})")
-        elif var_type == "int" and var_size:
-            # Integer array
-            if value and value.strip():
-                # Parse comma-separated values
-                values = [v.strip() for v in value.split(',')]
-                values_str = ', '.join(values)
-                self.data_section.append(f"    {label} dd {values_str}  ; int {node.name}[{var_size}]")
-            else:
-                # Initialize with zeros
-                self.data_section.append(f"    {label} times {var_size} dd 0  ; int {node.name}[{var_size}]")
-            self.text_section.append(f"    ; Array: int {node.name}[{var_size}]")
-
+    def _emit_call_puts(self, label: str):
+        # Emit code to call puts with address of label in appropriate register
+        if self.target_os == 'windows':
+            self.text_section.append(f'    lea rcx, [rel {label}]')
+            self.text_section.append('    call puts')
         else:
-            # Fallback to old behavior
-            try:
-                int_value = int(value)
-                self.data_section.append(f"    {label} dd {int_value}")
-            except ValueError:
-                self.data_section.append(f"    {label} dd 0  ; {value}")
-            self.text_section.append(f"    ; Variable: {node.name} = {value}")
+            self.text_section.append(f'    lea rdi, [rel {label}]')
+            self.text_section.append('    call puts')
 
-        # Note: equ handling is performed earlier to avoid emitting a data
-        # directive for the symbol; nothing to do here.
-    
-    def _generate_assignment_code(self, var_name: str, expression: str):
-        """Generate assembly code for variable assignment with expression evaluation (supports parentheses and precedence)"""
-        var_label = self._get_var_label(var_name)
+    def _new_str_label(self) -> str:
+        self.str_counter += 1
+        return f"str{self.str_counter}"
 
-        # Tokenize the expression
-        def tokenize(expr):
-            tokens = []
-            i = 0
-            while i < len(expr):
-                if expr[i].isspace():
-                    i += 1
-                elif expr[i] in '+-*/()':
-                    tokens.append(expr[i])
-                    i += 1
-                else:
-                    j = i
-                    while j < len(expr) and (expr[j].isalnum() or expr[j] == '_'):
-                        j += 1
-                    tokens.append(expr[i:j])
-                    i = j
-            return tokens
-
-        tokens = tokenize(expression)
-        pos = [0]
-
-        # Recursive descent parser for expressions
-        def parse_expr():
-            node = parse_term()
-            while pos[0] < len(tokens) and tokens[pos[0]] in ('+', '-'):
-                op = tokens[pos[0]]
-                pos[0] += 1
-                right = parse_term()
-                node = (op, node, right)
-            return node
-
-        def parse_term():
-            node = parse_factor()
-            while pos[0] < len(tokens) and tokens[pos[0]] in ('*', '/'):
-                op = tokens[pos[0]]
-                pos[0] += 1
-                right = parse_factor()
-                node = (op, node, right)
-            return node
-
-        def parse_factor():
-            if pos[0] < len(tokens) and tokens[pos[0]] == '(':  # Parenthesized
-                pos[0] += 1
-                node = parse_expr()
-                if pos[0] < len(tokens) and tokens[pos[0]] == ')':
-                    pos[0] += 1
-                return node
-            elif pos[0] < len(tokens):
-                token = tokens[pos[0]]
-                pos[0] += 1
-                return token
-            return None
-
-        ast = parse_expr()
-
-        # Generate assembly from AST
-        temp_reg = ['eax', 'ebx', 'ecx', 'edx']
-        used_regs = set()
-
-        def eval_node(node):
-            # Returns the register holding the result
-            if isinstance(node, tuple):
-                op, left, right = node
-                reg_left = eval_node(left)
-                # For division, right must be in ecx
-                if op == '/':
-                    reg_right = 'ecx'
-                    if reg_left != 'eax':
-                        self.text_section.append(f"    mov eax, {reg_left}")
-                        reg_left = 'eax'
-                    eval_node_to_reg(right, reg_right)
-                    self.text_section.append(f"    xor edx, edx")
-                    self.text_section.append(f"    div {reg_right}")
-                    return 'eax'
-                else:
-                    # For +, -, *
-                    reg_right = None
-                    for r in temp_reg:
-                        if r not in used_regs and r != reg_left:
-                            reg_right = r
-                            break
-                    if reg_right is None:
-                        reg_right = 'ebx'  # fallback
-                    eval_node_to_reg(right, reg_right)
-                    if op == '+':
-                        self.text_section.append(f"    add {reg_left}, {reg_right}")
-                    elif op == '-':
-                        self.text_section.append(f"    sub {reg_left}, {reg_right}")
-                    elif op == '*':
-                        self.text_section.append(f"    imul {reg_left}, {reg_right}")
-                    return reg_left
-            else:
-                # node is a variable or number
-                reg = None
-                for r in temp_reg:
-                    if r not in used_regs:
-                        reg = r
-                        used_regs.add(r)
-                        break
-                if node.isdigit():
-                    self.text_section.append(f"    mov {reg}, {node}")
-                elif node in self.variable_labels:
-                    # Always load variable into register, never memory-to-memory
-                    var_info = self.variable_info.get(node, {})
-                    if var_info.get('type') == 'equ':
-                        # equ is an assembler-time constant; reference directly
-                        operand = self._format_var_operand(node, as_memory=False)
-                        self.text_section.append(f"    mov {reg}, {operand}")
+    def generate(self, program: ProgramNode) -> str:
+        # Walk program statements (functions)
+        # collect externs from ExternDirectiveNode
+        for stmt in program.statements:
+            if stmt.__class__.__name__ == 'ExternDirectiveNode':
+                name = getattr(stmt, 'name', None)
+                if name:
+                    # If the 'name' looks like a captured C code block (contains '\n' or large content),
+                    # preserve it in the assembly output as a commented C block so users can see/compile it
+                    # separately. Otherwise, map known headers to extern functions as before.
+                    if '\n' in name or len(name) > 200 or 'windows.h' in name.lower():
+                        # Emit the C block as comments in the text section so it survives
+                        self.text_section.append('; --- begin embedded C code passthrough ---')
+                        for line in name.splitlines():
+                            self.text_section.append('; ' + line)
+                        self.text_section.append('; --- end embedded C code passthrough ---')
+                        continue
+                    # map some known headers to extern functions
+                    if 'math.h' in name or 'math' in name:
+                        # common math functions
+                        for fn in ('sin', 'cos', 'tan', 'sqrt'):
+                            self.externs.add(fn)
                     else:
-                        operand = self._format_var_operand(node, as_memory=True)
-                        self.text_section.append(f"    mov {reg}, dword {operand}")
-                else:
-                    var_label = self._get_var_label(node)
-                    operand = self._format_var_operand(node, as_memory=True)
-                    self.text_section.append(f"    mov {reg}, dword {operand}")
-                return reg
+                        # treat other extern directives as symbol names
+                        self.externs.add(name)
 
-        def eval_node_to_reg(node, reg):
-            # Evaluate node and move result to reg
-            result_reg = eval_node(node)
-            if result_reg != reg:
-                self.text_section.append(f"    mov {reg}, {result_reg}")
+        for stmt in program.statements:
+            if isinstance(stmt, FunctionDeclarationNode):
+                self._emit_function(stmt)
 
-        result_reg = eval_node(ast)
-        # If result_reg is not a register, move to eax first
-        valid_regs = {"eax", "ebx", "ecx", "edx"}
-        if result_reg not in valid_regs:
-            self.text_section.append(f"    mov eax, {result_reg}")
-            result_reg = "eax"
-        # Store result back to variable (assignment target)
-        # Note: assigning to an 'equ' is invalid; we still emit a store and
-        # let the assembler/linker surface an error if attempted.
-        self.text_section.append(f"    mov dword [rel {var_label}], {result_reg}")
-    
-    def visit_assignment(self, node: AssignmentNode):
-        """Visit variable assignment"""
-        # Use the new assignment code generator
-        self._generate_assignment_code(node.name, node.value.strip())
-    
-    def visit_if(self, node: IfNode):
-        """Visit if statement with proper nested if handling"""
-        # Generate randomized labels for this if/else block
-        end_label = self._generate_label("if_end")
-        else_label = self._generate_label("else") if node.else_body else None
-        
-        self.text_section.append(f"    ; if {node.condition}")
-        
-        # Evaluate the condition and get the appropriate jump instruction
-        jump_instruction = self._evaluate_condition_with_jump(node.condition)
-        
-        if else_label:
-            self.text_section.append(f"    {jump_instruction} {else_label}")
-        else:
-            self.text_section.append(f"    {jump_instruction} {end_label}")
-        
-        # If body
-        for stmt in node.if_body:
-            stmt.accept(self)
-        
-        if else_label:
-            self.text_section.append(f"    jmp {end_label}")
-            self.text_section.append(f"{else_label}:")
-            
-            # Else body - handle nested if statements properly
-            for stmt in node.else_body:
-                stmt.accept(self)
-        
-        self.text_section.append(f"{end_label}:")
-    
-    def visit_while(self, node: WhileNode):
-        """Visit while loop"""
-        # Generate randomized labels for while loop
-        start_label = self._generate_label("while_start")
-        end_label = self._generate_label("while_end")
-        
-        self.text_section.append(f"{start_label}:")
-        self.text_section.append(f"    ; while {node.condition}")
-        
-        # Evaluate the condition and get the appropriate jump instruction
-        jump_instruction = self._evaluate_condition_with_jump(node.condition)
-        self.text_section.append(f"    {jump_instruction} {end_label}")
-        
-        # Loop body
-        for stmt in node.body:
-            stmt.accept(self)
-        
-        self.text_section.append(f"    jmp {start_label}")
-        self.text_section.append(f"{end_label}:")
-    
-    def visit_for(self, node: ForNode):
-        """Visit for loop (fix: declare and update loop variable, avoid label redefinition)"""
-        # Generate labels and counter variable with randomized salt
-        start_label = self._generate_label("for_start")
-        end_label = self._generate_label("for_end")
-        counter_var = self._generate_label("for_counter")
+        parts: List[str] = []
 
-        # Use existing variable label if declared, otherwise create a new var label
-        if node.variable in self.variable_labels:
-            loop_var = self.variable_labels[node.variable]
-        else:
-            loop_var = f"var_{node.variable}_{self.naming_salt}"
+        # Ensure commonly used runtime symbols are exported when needed
+        if any(re.search(r'\bcall\s+(_?puts)\b', line) for line in self.text_section):
+            self.externs.add('puts')
 
-        self.text_section.append(f"    ; for {node.variable} in range({node.count})")
+        if self.externs:
+            for ext in sorted(self.externs):
+                parts.append(f'extern {ext}')
+            parts.append('')
 
-        # Add counter variable and loop variable to data section if not already present
-        if counter_var not in self.variable_labels.values():
-            self.data_section.append(f"    {counter_var} dd 0")
-        if loop_var not in self.variable_labels.values():
-            self.data_section.append(f"    {loop_var} dd 0")
-        # Ensure mapping for loop variable exists
-        self.variable_labels.setdefault(node.variable, loop_var)
+        if self.rodata_section:
+            parts.append('section .rodata')
+            parts.extend(self.rodata_section)
+            parts.append('')
 
-        # Initialize counter and loop variable
-        self.text_section.append(f"    mov dword [rel {counter_var}], 0")
-        self.text_section.append(f"    mov dword [rel {loop_var}], 0")
-        self.text_section.append(f"{start_label}:")
+        parts.append('section .text')
+        parts.extend(self.text_section)
+        return '\n'.join(parts)
 
-        # Check condition - handle both numbers and variables
-        self.text_section.append(f"    mov eax, dword [rel {counter_var}]")
-        if node.count.isdigit():
-            self.text_section.append(f"    cmp eax, {node.count}")
-        else:
-            if node.count in self.variable_labels:
-                count_label = self.variable_labels[node.count]
-                self.text_section.append(f"    cmp eax, dword [rel {count_label}]")
+    def _emit_function(self, func: FunctionDeclarationNode):
+        name = func.name
+        self.text_section.append(f'global {name}')
+        self.text_section.append(f'{name}:')
+        self.text_section.append('    push rbp')
+        self.text_section.append('    mov rbp, rsp')
+        if self.target_os == 'windows':
+            # reserve x64 shadow space for callees (32 bytes)
+            self.text_section.append('    sub rsp, 32    ; shadow space')
+
+        # simple local variable area tracking
+        local_offset = 0
+        locals_map = {}
+
+        # First pass: compute locals map and total local allocation size
+        for s in func.body or []:
+            if isinstance(s, VarDeclarationNode):
+                local_offset += 8
+                locals_map[s.name] = -local_offset
+
+        total_local_alloc = local_offset
+        # align to 16 bytes for stack alignment
+        if total_local_alloc % 16 != 0:
+            pad = 16 - (total_local_alloc % 16)
+            total_local_alloc += pad
+
+        # emit single allocation for all locals (after shadow space if any)
+        if total_local_alloc > 0:
+            self.text_section.append(f'    sub rsp, {total_local_alloc}    ; alloc locals')
+
+        # emit body
+        # emit body via helper (handles nested blocks properly)
+        self._emit_block(func.body or [], locals_map, total_local_alloc)
+
+        # restore stack to rbp then pop rbp to correctly unwind frame
+        self.text_section.append('    mov rsp, rbp')
+        self.text_section.append('    pop rbp')
+        self.text_section.append('    ret')
+
+    def _emit_expr(self, expr, locals_map, local_offset):
+        # Emit code to evaluate expr and leave result in rax
+        if isinstance(expr, LiteralNode):
+            if isinstance(expr.value, int):
+                self.text_section.append(f'    mov rax, {expr.value}')
             else:
-                count_label = self._get_var_label(node.count)
-                self.text_section.append(f"    cmp eax, dword [rel {count_label}]")
-        self.text_section.append(f"    jge {end_label}")
+                # string literal: load address into rax
+                label = self._new_str_label()
+                self.rodata_section.append(f"{label}: db \"{expr.value}\", 0")
+                self.text_section.append(f'    lea rax, [rel {label}]')
 
-
-        # Set loop variable to current counter value (use register to avoid memory-to-memory move)
-        self.text_section.append(f"    mov eax, dword [rel {counter_var}]")
-        self.text_section.append(f"    mov dword [rel {loop_var}], eax")
-
-        # Loop body
-        for stmt in node.body:
-            stmt.accept(self)
-
-        # Increment counter
-        self.text_section.append(f"    inc dword [rel {counter_var}]")
-        self.text_section.append(f"    jmp {start_label}")
-        self.text_section.append(f"{end_label}:")
-    
-    def visit_println(self, node: PrintlnNode):
-        """Visit println statement"""
-        self.used_functions.add("printf")
-
-        # Clean the message
-        message = node.message.strip()
-
-        # If the message refers to a declared variable, emit formatted prints
-        if message in self.variable_labels:
-            var_label = self.variable_labels[message]
-            var_info = self.variable_info.get(message, {})
-            var_type = var_info.get('type', 'int')
-
-            if var_type in ['int', 'bool']:
-                # Load integer into rdx (transpiler will place args appropriately)
-                operand = self._format_var_operand(message, as_memory=True)
-                if self.variable_info.get(message, {}).get('type') == 'equ':
-                    self.text_section.append(f"    mov rdx, {operand}")
-                else:
-                    self.text_section.append(f"    mov rdx, dword {operand}")
-                self.text_section.append(f"    ; print int {message}")
-                # Use unified formatted print
-                self.text_section.append(f"UPRINTF \"%d\", rdx")
-
-            elif var_type in ['str', 'string']:
-                # Address of the string into rdx
-                operand = self._format_var_operand(message, as_memory=False)
-                if self.variable_info.get(message, {}).get('type') == 'equ':
-                    self.text_section.append(f"    lea rdx, [{operand}]")
-                else:
-                    self.text_section.append(f"    lea rdx, [rel {operand}]")
-                self.text_section.append(f"    ; print string {message}")
-                self.text_section.append(f"UPRINTF \"%s\", rdx")
-
+        elif isinstance(expr, IdentifierNode):
+            name = expr.name
+            if name in locals_map:
+                self.text_section.append(f'    mov rax, [rbp{locals_map[name]}]')
             else:
-                # Generic fallback prints as integer
-                operand = self._format_var_operand(message, as_memory=True)
-                if self.variable_info.get(message, {}).get('type') == 'equ':
-                    self.text_section.append(f"    mov rdx, {operand}")
-                else:
-                    self.text_section.append(f"    mov rdx, dword {operand}")
-                self.text_section.append(f"    ; print (fallback) {message}")
-                self.text_section.append(f"UPRINTF \"%d\", rdx")
+                self.text_section.append('    mov rax, 0')
 
-        else:
-            # String literal
-            if message.startswith('"') and message.endswith('"'):
-                literal = message[1:-1]
-            else:
-                literal = message
-
-            if literal in self.string_labels:
-                string_label = self.string_labels[literal]
-            else:
-                string_label = self._generate_label("str")
-                self.string_labels[literal] = string_label
-                escaped_message = literal.replace('\\n', '\\n').replace('\\t', '\\t')
-                # Use data_section so pretty printer will place it correctly
-                self.data_section.append(f'    {string_label} db "{escaped_message}", 10, 0')
-
-            self.text_section.append(f"    ; print \"{literal}\"")
-            # Emit unified print directive which the transpiler maps to puts/printf
-            self.text_section.append(f"UPRINT {string_label}")
-    
-    def visit_scanf(self, node: ScanfNode):
-        """Visit scanf statement"""
-        self.used_functions.add("scanf")
-        
-        # Clean format string
-        format_str = node.format_string.strip()
-        if format_str.startswith('"') and format_str.endswith('"'):
-            format_str = format_str[1:-1]
-        
-        # Generate labels
-        format_label = self._generate_label("fmt")
-        var_label = self._get_var_label(node.variable)
-        
-        # Add format string to data section
-        self.data_section.append(f'    {format_label} db "{format_str}", 0')
-
-        # Ensure variable exists
-        if node.variable not in self.variable_labels:
-            self.data_section.append(f"    {var_label} dd 0")
-            self.variable_labels[node.variable] = var_label
-
-        # Generate scanf call (unified directive - transpiler handles arg setup)
-        self.text_section.append(f"    ; scanf \"{format_str}\" -> {node.variable}")
-        self.text_section.append(f"    lea rcx, [rel {format_label}]")
-        # Use _format_var_operand to respect 'equ' variables
-        if self.variable_info.get(node.variable, {}).get('type') == 'equ':
-            operand = self._format_var_operand(node.variable, as_memory=False)
-            # Need the address of the symbol
-            self.text_section.append(f"    lea rdx, [{operand}]")
-        else:
-            operand = self._format_var_operand(node.variable, as_memory=False)
-            self.text_section.append(f"    lea rdx, [rel {operand}]")
-
-        # Emit unified call for scanf so transpiler handles argument registers
-        self.text_section.append("UCALL scanf rcx rdx")
-    
-    def visit_assembly(self, node: AssemblyNode):
-        """Visit raw assembly line"""
-        # Attempt to map CASM variable names to their V# labels inside raw
-        # assembly lines so emitted assembly references the data labels.
-        line = node.code
-        import re as _re
-
-        var_names = list(self.variable_labels.keys())
-        if var_names:
-            # Replace bracketed occurrences first: [name] -> [ rel V# ] or direct symbol for equ
-            def _bracket_replace(m):
-                name = m.group(1)
-                label = self.variable_labels.get(name)
-                if not label:
-                    return m.group(0)
-                if self.variable_info.get(name, {}).get('type') == 'equ':
-                    return f"[{label}]"
-                return f"[ rel {label} ]"
-
-            line = _re.sub(r"\[\s*(" + "|".join(_re.escape(n) for n in var_names) + r")\s*\]",
-                           _bracket_replace,
-                           line)
-
-            # Replace standalone variable tokens with a plain memory operand
-            # like '[ rel V# ]' or the bare symbol for equ variables.
-            pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in var_names) + r")\b")
-            def _standalone_replace(m):
-                name = m.group(1)
-                label = self.variable_labels.get(name)
-                if not label:
-                    return name
-                if self.variable_info.get(name, {}).get('type') == 'equ':
-                    return label
-                return f"[ rel {label} ]"
-
-            line = pattern.sub(_standalone_replace, line)
-
-        # Detect top-level label definitions (e.g. 'foo:') and convert them
-        # into unified assembly UFUNC directives so the asm_transpiler can
-        # handle prologue/epilogue generation. Only convert simple labels
-        # without spaces or special characters.
-        label_match = _re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*$", line)
-        if label_match:
-            label = label_match.group(1)
-            # Emit UFUNC directive instead of raw label
-            self.text_section.append(f"UFUNC {label}")
-            return
-
-        # Ensure proper indentation for normal assembly lines
-        # Normalize some common high-level directives that users may write
-        # without the leading 'U' so we emit the canonical unified form.
-        # This prevents emitting raw target-specific instructions (e.g. 'ret')
-        # alongside unified directives which the transpiler also expands.
-        stripped_lower = line.strip().lower()
-
-        # func <name> -- preserve the original casing from the source so
-        # that calls (which may be cased by the author) match the definition.
-        stripped = line.strip()
-        m = _re.match(r"^func\s+(\w+)\s*$", stripped, re.I)
-        if m:
-            name = m.group(1)
-            self.text_section.append(f"UFUNC {name}")
-            return
-
-        # endfunc
-        if _re.match(r"^endfunc\s*$", stripped, re.I):
-            self.text_section.append("UENDFUNC")
-            return
-
-        # ret [value]
-        m = _re.match(r"^ret(?:\s+(.+))?", line.strip(), re.I)
-        if m:
-            val = m.group(1)
-            if val:
-                self.text_section.append(f"URET {val}")
-            else:
-                self.text_section.append("URET")
-            return
-
-        # call <func> [args...]
-        m = _re.match(r"^call\s+(\w+)(?:\s+(.+))?", line.strip(), re.I)
-        if m:
-            func = m.group(1)
-            args = m.group(2) or ""
-            args = args.strip()
-            if args:
-                self.text_section.append(f"UCALL {func} {args}")
-            else:
-                self.text_section.append(f"UCALL {func}")
-            return
-
-        # print "..." or print <var>
-        m = _re.match(r'^print\s+"(.*)"', line.strip(), re.I)
-        if m:
-            literal = m.group(1)
-            # Reuse string labels if possible
-            if literal in self.string_labels:
-                string_label = self.string_labels[literal]
-            else:
-                string_label = self._generate_label("str")
-                self.string_labels[literal] = string_label
-                escaped_message = literal.replace('\\n', '\\n').replace('\\t', '\\t')
-                self.data_section.append(f'    {string_label} db "{escaped_message}", 10, 0')
-            self.text_section.append(f"UPRINT {string_label}")
-            return
-
-        # exit <code>
-        m = _re.match(r"^exit\s+(\d+)", line.strip(), re.I)
-        if m:
-            code = m.group(1)
-            self.text_section.append(f"UEXIT {code}")
-            return
-
-        # Ensure proper indentation for normal assembly lines
-        if not line.startswith('    ') and not line.endswith(':'):
-            line = f"    {line}"
-
-        self.text_section.append(line)
-    
-    def visit_comment(self, node: CommentNode):
-        """Visit comment"""
-        self.text_section.append(f"    {node.text}")
-    
-    def visit_c_code_block(self, node: CCodeBlockNode):
-        """Visit C code block"""
-        # Processing logs for embedded C are noisy; use debug-only output
-        from ..utils.colors import print_debug
-        print_debug(f"Processing C code: '{node.c_code}'")
-        
-        if not node.c_code.strip():
-            # Empty C code block
-            self.text_section.append("    ; Empty C code block")
-            return
-        
-        # Update C processor with current CASM variables before processing
-        try:
-            from ..utils.c_processor import c_processor
-            c_processor.set_casm_variables(self.variable_info)
-            
-            # Add C code block to collection and get marker
-            block_marker = c_processor.add_c_code_block(node.c_code)
-            
-            # Store the block ID in the node for the pretty printer
-            node._block_id = block_marker.replace('CASM_BLOCK_', '')
-            
-            # Add NOP-wrapped placeholder for the assembly that will be filled after compilation
-            self.text_section.append(f"    ; C code block: {block_marker}")
-            # Emit original C code as comments so the assembly output shows the source C statements
-            if node.c_code and node.c_code.strip():
-                for c_line in node.c_code.split('\n'):
-                    if c_line.strip():
-                        self.text_section.append(f"    ; {c_line.strip()}")
-            self.text_section.append(f"    nop  ; Start of C block {block_marker}")
-            self.text_section.append(f"    ; {{{block_marker}}} ; Placeholder for assembly")
-            self.text_section.append(f"    nop  ; End of C block {block_marker}")
-            
-        except ImportError:
-            print_warning("C processor not available, skipping C code")
-            self.text_section.append(f"    ; C code skipped: {node.c_code}")
-        except Exception as e:
-            print_error(f"C compilation error: {e}")
-            self.text_section.append(f"    ; C code error: {node.c_code}")
-
-        # Debug-only message to indicate collection
-        from ..utils.colors import print_debug
-        print_debug(f"C code collected: {node.c_code}")
-    
-    def visit_asm_block(self, node: AsmBlockNode):
-        """Visit assembly block"""
-        print_info(f"Processing assembly block: '{node.asm_code}'")
-        
-        if not node.asm_code.strip():
-            # Empty assembly block
-            self.text_section.append("    ; Empty assembly block")
-            return
-        
-        # Split assembly code into lines and add each line
-        asm_lines = node.asm_code.strip().split('\n')
-        self.text_section.append("    ; === Raw Assembly Block ===")
-
-        # Helper: replace CASM variable names with their assembly labels.
-        # - If a variable appears inside square brackets (memory operand),
-        #   replace the name with 'rel <LABEL>' so it becomes '[rel V#]'.
-        # - If a variable appears as a standalone operand, replace it with
-        #   'dword [rel <LABEL>]' which mirrors how other codegen emits
-        #   memory loads for integer variables.
-        import re as _re
-
-        # Pre-build a regex pattern for variable names if any exist
-        var_names = list(self.variable_labels.keys())
-        var_pattern = None
-        if var_names:
-            var_pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in var_names) + r")\b")
-
-        from ..utils.colors import print_debug
-        for line in asm_lines:
-            raw = line.strip()
-            if not raw:
-                continue
-
-            # First, replace occurrences inside square brackets: [name] -> [ rel V# ] or [label] if equ
-            if var_names:
-                def _bracket_replace(match):
-                    name = match.group(1)
-                    label = self.variable_labels.get(name)
-                    if not label:
-                        return match.group(0)
-                    if self.variable_info.get(name, {}).get('type') == 'equ':
-                        return f"[{label}]"
-                    return f"[ rel {label} ]"
-
-                # Replace patterns like [name] or [ name ]
-                raw = _re.sub(r"\[\s*(" + "|".join(_re.escape(n) for n in var_names) + r")\s*\]", _bracket_replace, raw)
-
-                # Now replace standalone usages (not inside brackets) with a plain
-                # memory operand '[ rel LABEL ]' or bare label for equ vars.
-                def _standalone_replace(m):
-                    name = m.group(1)
-                    label = self.variable_labels.get(name)
-                    if not label:
-                        return name
-                    if self.variable_info.get(name, {}).get('type') == 'equ':
-                        return label
-                    return f"[ rel {label} ]"
-
-                raw = var_pattern.sub(_standalone_replace, raw)
-
-            # Debug: show before/after for this asm line
-            print_debug(f"ASM raw before/after: '{line.strip()}' => '{raw}'")
-
-            # Add proper indentation if not already present and not a label
-            if not raw.startswith('    ') and not raw.endswith(':'):
-                raw = f"    {raw}"
-
-            self.text_section.append(raw)
-
-        self.text_section.append("    ; === End Assembly Block ===")
-    
-    def finalize_c_code(self):
-        """Compile all C code and replace placeholders with actual assembly
-
-        Exceptions from the C compilation step are intentionally propagated so the
-        caller can abort the overall build when GCC fails. This avoids writing a
-        potentially broken assembly file when embedded C cannot be compiled.
-        """
-        from ..utils.c_processor import c_processor
-
-        print_info(f"Finalizing C code: {len(c_processor.c_code_blocks)} blocks collected")
-
-        # Compile all collected C code blocks (may raise RuntimeError on failure)
-        assembly_segments = c_processor.compile_all_c_code()
-
-        # Fallback: if no segments were returned, try reading a saved combined
-        # assembly file that the C processor may have emitted for debugging.
-        if not assembly_segments:
-            try:
-                out_dir = os.path.join(os.getcwd(), 'output')
-                asm_out = os.path.join(out_dir, 'combined_asm_from_cprocessor.s')
-                if os.path.exists(asm_out):
-                    with open(asm_out, 'r', encoding='utf-8') as _f:
-                        raw_asm = _f.read()
-                    print_info('Attempting fallback extraction from saved combined assembly')
-                    assembly_segments = c_processor._extract_assembly_segments(raw_asm)
-                    # Also extract string constants if present
-                    sc = c_processor._extract_string_constants(raw_asm)
-                    if sc:
-                        assembly_segments['_STRING_CONSTANTS'] = sc
-            except Exception as e:
-                print_warning(f'Fallback assembly extraction failed: {e}')
-
-        if not assembly_segments and c_processor.c_code_blocks:
-            print_warning("No C code blocks were compiled into assembly")
-
-        print_success(f"Compiled {len(assembly_segments)} C code blocks")
-
-        # Add string constants to data section if available
-        if '_STRING_CONSTANTS' in assembly_segments:
-            string_constants = assembly_segments['_STRING_CONSTANTS']
-            if string_constants.strip():
-                print_info("Adding C string constants to data section")
-                # Add string constants to the beginning of data section
-                string_lines = string_constants.split('\n')
-                for line in reversed(string_lines):
-                    if line.strip():
-                        self.data_section.insert(0, f"    {line.strip()}")
-            del assembly_segments['_STRING_CONSTANTS']
-
-        # Replace placeholders with actual assembly
-        updated_sections = []
-        import re
-        for line in self.text_section:
-            if "{CASM_BLOCK_" in line and "} ; Placeholder for assembly" in line:
-                # Extract marker from placeholder
-                marker_match = re.search(r'\{(CASM_BLOCK_\d+)\}', line)
-                if marker_match:
-                    marker = marker_match.group(1)
-                    if marker in assembly_segments:
-                        # Replace with actual assembly
-                        assembly_code = assembly_segments[marker]
-                        if assembly_code.strip():
-                            # If the same assembly segment is reused for multiple
-                            # CASM_BLOCK markers (aliasing), we must avoid
-                            # inserting identical internal labels more than once
-                            # into the final assembly. Namespace the internal
-                            # CASM block local labels to the placeholder marker
-                            # being inserted so repeated insertions remain unique.
-                            import re as _re
-
-                            def _rename_block_labels(code: str, target_marker: str) -> str:
-                                return _re.sub(r'_(CASM_BLOCK_\d+_L)(\d+)', lambda m: f"_{target_marker}_L{m.group(2)}", code)
-
-                            namespaced = _rename_block_labels(assembly_code, marker)
-                            for asm_line in namespaced.split('\n'):
-                                if asm_line.strip():
-                                    updated_sections.append(f"    {asm_line}")
-                        else:
-                            updated_sections.append("    ; Empty assembly block")
-                    else:
-                        # Fallback: if exactly one segment is available, use it
-                        fallback_keys = [k for k in assembly_segments.keys() if k != '_STRING_CONSTANTS']
-                        if len(fallback_keys) == 1:
-                            fk = fallback_keys[0]
-                            print_warning(f"Marker {marker} not found; using fallback segment {fk}")
-                            assembly_code = assembly_segments[fk]
-                            if assembly_code.strip():
-                                for asm_line in assembly_code.split('\n'):
-                                    if asm_line.strip():
-                                        updated_sections.append(f"    {asm_line}")
-                            else:
-                                updated_sections.append("    ; Empty assembly block (fallback)")
-                        else:
-                            updated_sections.append(f"    ; Assembly not found for {marker}")
-                else:
-                    updated_sections.append(line)
-            else:
-                updated_sections.append(line)
-
-        self.text_section = updated_sections
-        print_success("C code assembly integration complete")
-    
-    def _fallback_c_processing(self, c_code: str):
-        """Fallback processing for C code when GCC compilation fails"""
-        try:
-            from ..utils.c_processor import c_processor
-            # Process variable references in C code
-            processed_c_code = c_processor._process_variable_references(c_code)
-            
-            # Process the single line of C code
-            if '=' in processed_c_code and processed_c_code.endswith(';'):
-                # Assignment
-                asm_lines = c_processor._convert_assignment(processed_c_code)
-            elif processed_c_code.endswith(';') and '(' in processed_c_code:
-                # Function call
-                asm_lines = c_processor._convert_function_call(processed_c_code)
-            elif any(type_name in processed_c_code for type_name in ['int ', 'char ', 'float ', 'double ']):
-                # Declaration
-                asm_lines = c_processor._convert_declaration(processed_c_code)
-            else:
-                # Unknown C statement
-                asm_lines = [f"    ; C: {processed_c_code}"]
-            
-            # Add the generated assembly
-            for line in asm_lines:
-                if line.strip():
-                    self.text_section.append(line)
-        except ImportError:
-            # Ultimate fallback
-            self.text_section.append(f"    ; C code: {c_code}")
-    
-    def visit_extern_directive(self, node: 'ExternDirectiveNode'):
-        """Visit extern directive for header files"""
-        header = node.header_name
-        print_info(f"Processing extern directive: {header}")
-        
-        # If this extern is a C include (e.g. <math.h> or "mylib.h"), forward
-        # it to the C processor so it becomes a #include in the combined C file.
-        try:
-            from ..utils.c_processor import c_processor
-
-            # Normalize header string (strip surrounding whitespace)
-            raw = header.strip() if header is not None else ''
-
-            # If the parser flagged this as a C include, honor it.
-            is_c_include_flag = bool(getattr(node, 'is_c_include', False))
-            use_angle_flag = bool(getattr(node, 'use_angle', False))
-
-            # Heuristic: if the header string contains angle brackets or looks
-            # like an include (e.g. '< math .h>' or '<math.h>'), treat it as
-            # a C include even if the parser didn't set the flag.
-            if (is_c_include_flag) or ('<' in raw or '>' in raw):
-                # Remove angle brackets and extra spaces from header name
-                cleaned = raw.replace('<', '').replace('>', '').replace(' ', '')
-                # If parser suggested use_angle, prefer that; otherwise assume angle when original had <>
-                use_angle = use_angle_flag or ('<' in raw and '>' in raw)
-                c_processor.add_header(cleaned, use_angle=use_angle)
-                # Add a brief comment in assembly that the include was forwarded
-                self.text_section.append(f"    ; forwarded C include: {cleaned}")
-            else:
-                # Treat as assembler extern symbol and emit an extern directive
-                self.text_section.append(f"    extern {raw}")
-        except ImportError:
-            print_warning("C processor not available for header processing")
-            # Fallback: always emit as assembler extern
-            self.text_section.append(f"    extern {header}")
-    
-    def _generate_label(self, prefix: str) -> str:
-        """Generate unique label"""
-        # Deterministic, human-friendly label generation
-        # Special-case common prefixes
-        if prefix.startswith("fmt") or prefix == "fmt_int" or prefix == "fmt_str" or prefix == "fmt":
-            self.fmt_counter += 1
-            return f"FMT{self.fmt_counter - 1 if self.fmt_counter>0 else 0}"
-        if prefix == "str" or prefix.startswith("str"):
-            # STR labels for string literals
-            self.str_counter += 1
-            return f"STR{self.str_counter}"
-        if prefix.startswith("LC") or prefix == "LC":
-            self.lc_counter += 1
-            return f"LC{self.lc_counter - 1}"
-
-        # Generic prefix: use prefix capitalized + counter
-        self.label_counter += 1
-        return f"{prefix.upper()}{self.label_counter}"
-    
-    def _generate_unique_id(self) -> int:
-        """Generate unique ID for complex constructs like if/while/for"""
-        self.label_counter += 1
-        return self.label_counter
-
-    def _get_var_label(self, name: str) -> str:
-        """Return the assembly label for a given CASM variable name.
-
-        If the variable was declared, return the canonical label. Otherwise
-        fall back to the predictable var_<name>_salt form so references remain
-        consistent with randomized naming.
-        """
-        if name in self.variable_labels:
-            return self.variable_labels[name]
-        # Fallback: allocate a new deterministic variable label
-        self.var_counter += 1
-        label = f"V{self.var_counter}"
-        # Ensure mapping for future references
-        self.variable_labels[name] = label
-        # Add a minimal data declaration so references have a defined symbol.
-        # Track auto-declared vars so later explicit declarations can update
-        # this placeholder instead of generating duplicates.
-        if label not in self._auto_declared_vars:
-            self._auto_declared_vars.add(label)
-            # Use dd 0 as a safe default for integer-like variables
-            self.data_section.append(f"    {label} dd 0  ; auto-declared placeholder")
-        return label
-
-    def _format_var_operand(self, var_name: str, as_memory: bool = True) -> str:
-        """Return the correct assembly operand for a CASM variable.
-
-        - If the variable is declared as 'equ', return the label directly (no [rel]).
-        - Otherwise return a memory operand '[ rel LABEL ]' when as_memory=True,
-          or the plain label when as_memory=False.
-        """
-        label = self._get_var_label(var_name)
-        info = self.variable_info.get(var_name, {})
-        if info.get('type') == 'equ':
-            # Assembler-time constant: reference directly
-            return label
-        # Default: memory operand
-        return f"[ rel {label} ]" if as_memory else label
-    
-    def _evaluate_condition_with_jump(self, condition: str):
-        """Evaluate a condition and return the appropriate jump instruction to skip the block"""
-        condition = condition.strip()
-        
-        # Handle comparisons like "variable > value", "variable == value", etc.
-        comparison_ops = ['>=', '<=', '==', '!=', '>', '<']
-        # Helper: detect register names so we don't treat them as CASM variables
-        regs = {"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
-                "eax","ebx","ecx","edx","esi","edi","ax","bx",
-                "cx","dx","al","bl","cl","dl","r8","r9","r10",
-                "r11","r12","r13","r14","r15"}
-
-        for op in comparison_ops:
-            if op in condition:
-                left, right = condition.split(op, 1)
-                left = left.strip()
-                right = right.strip()
-
-                # Load left operand into appropriate register or use it directly
-                left_is_reg = left.lower() in regs
-                right_is_reg = right.lower() in regs
-
-                if left.isdigit():
-                    self.text_section.append(f"    mov eax, {left}")
-                    left_operand_for_cmp = 'eax'
-                elif left_is_reg:
-                    # Use the register directly
-                    left_operand_for_cmp = left
-                else:
-                    # Use format helper so 'equ' variables become bare symbols
-                    left_operand = self._format_var_operand(left, as_memory=True)
-                    if self.variable_info.get(left, {}).get('type') == 'equ':
-                        left_operand_for_cmp = left_operand
-                    else:
-                        # Load into eax for comparison if memory operand
-                        self.text_section.append(f"    mov eax, dword {left_operand}")
-                        left_operand_for_cmp = 'eax'
-
-                # Compare with right operand. Use direct cmp when possible to
-                # avoid unnecessary loads and to support register comparisons.
-                if right.isdigit():
-                    self.text_section.append(f"    cmp {left_operand_for_cmp}, {right}")
-                elif right_is_reg:
-                    self.text_section.append(f"    cmp {left_operand_for_cmp}, {right}")
-                else:
-                    right_operand = self._format_var_operand(right, as_memory=True)
-                    if self.variable_info.get(right, {}).get('type') == 'equ':
-                        self.text_section.append(f"    cmp {left_operand_for_cmp}, {right_operand}")
-                    else:
-                        # Compare register/memory with memory; ensure right is memory
-                        self.text_section.append(f"    cmp {left_operand_for_cmp}, dword {right_operand}")
-
-                # Return the opposite jump to skip the if block when condition is false
+        elif isinstance(expr, BinaryOpNode):
+            # evaluate left -> rax, push, evaluate right -> rbx, compute
+            self._emit_expr(expr.left, locals_map, local_offset)
+            self.text_section.append('    push rax')
+            self._emit_expr(expr.right, locals_map, local_offset)
+            self.text_section.append('    mov rbx, rax')
+            self.text_section.append('    pop rax')
+            op = expr.operator
+            if op == '+':
+                self.text_section.append('    add rax, rbx')
+            elif op == '-':
+                self.text_section.append('    sub rax, rbx')
+            elif op == '*':
+                self.text_section.append('    imul rax, rbx')
+            elif op == '/':
+                # idiv requires rdx:rax, keep simple and do unsigned div
+                self.text_section.append('    cqo')
+                self.text_section.append('    idiv rbx')
+            elif op in ('<', '>', '<=', '>=', '==', '!='):
+                # comparison: rax = left, rbx = right -> set rax to 1 or 0
+                # cmp rax, rbx ; setcc al ; movzx rax, al
                 if op == '<':
-                    return 'jge'    # Jump if greater or equal (opposite of <)
-                elif op == '<=':
-                    return 'jg'     # Jump if greater (opposite of <=)
+                    self.text_section.append('    cmp rax, rbx')
+                    self.text_section.append('    setl al')
                 elif op == '>':
-                    return 'jle'    # Jump if less or equal (opposite of >)
+                    self.text_section.append('    cmp rax, rbx')
+                    self.text_section.append('    setg al')
+                elif op == '<=':
+                    self.text_section.append('    cmp rax, rbx')
+                    self.text_section.append('    setle al')
                 elif op == '>=':
-                    return 'jl'     # Jump if less (opposite of >=)
+                    self.text_section.append('    cmp rax, rbx')
+                    self.text_section.append('    setge al')
                 elif op == '==':
-                    return 'jne'    # Jump if not equal (opposite of ==)
+                    self.text_section.append('    cmp rax, rbx')
+                    self.text_section.append('    sete al')
                 elif op == '!=':
-                    return 'je'     # Jump if equal (opposite of !=)
-        
-        # Handle simple variable checks (non-zero)
-        if condition in self.variable_labels:
-            operand = self._format_var_operand(condition, as_memory=True)
-            if self.variable_info.get(condition, {}).get('type') == 'equ':
-                self.text_section.append(f"    mov eax, {operand}")
+                    self.text_section.append('    cmp rax, rbx')
+                    self.text_section.append('    setne al')
+                self.text_section.append('    movzx rax, al')
             else:
-                self.text_section.append(f"    mov eax, dword {operand}")
-            self.text_section.append(f"    cmp eax, 0")
-        elif condition.isdigit():
-            # Direct number comparison
-            self.text_section.append(f"    mov eax, {condition}")
-            self.text_section.append(f"    cmp eax, 0")
-        else:
-            # Try to treat as variable name
-            cond_label = self._get_var_label(condition)
-            self.text_section.append(f"    mov eax, dword [rel {cond_label}]")
-            self.text_section.append(f"    cmp eax, 0")
-        
-        # For simple variable/number checks, jump if zero (false)
-        return 'je'
+                self.text_section.append('    ; unknown binop')
 
-    def _evaluate_condition(self, condition: str):
-        """Evaluate a condition and set flags for conditional jumps"""
-        # Parse common condition patterns
-        condition = condition.strip()
-        
-        # Handle comparisons like "variable > value", "variable == value", etc.
-        comparison_ops = ['>=', '<=', '==', '!=', '>', '<']
-        
-        # Helper: register set (same as in jump helper)
-        regs = {"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
-                "eax","ebx","ecx","edx","esi","edi","ax","bx",
-                "cx","dx","al","bl","cl","dl","r8","r9","r10",
-                "r11","r12","r13","r14","r15"}
+    def _emit_block(self, stmts, locals_map, local_offset):
+        """Emit a sequence of statements (used for function bodies and nested blocks)."""
+        for s in stmts:
+            # Handle assignment expressed as BinaryOpNode(left=id, operator='=', right=expr)
+            if isinstance(s, BinaryOpNode) and s.operator == '=' and isinstance(s.left, IdentifierNode):
+                # evaluate right-hand side into rax
+                self._emit_expr(s.right, locals_map, local_offset)
+                name = s.left.name
+                if name in locals_map:
+                    self.text_section.append(f'    mov [rbp{locals_map[name]}], rax')
+                continue
+            # If node
+            if s.__class__.__name__ == 'IfNode':
+                cond = s.condition
+                lbl_else = f"L{self.label_counter+1}"
+                lbl_end = f"L{self.label_counter+2}"
+                self.label_counter += 2
+                # evaluate cond -> rax
+                self._emit_expr(cond, locals_map, local_offset)
+                self.text_section.append('    cmp rax, 0')
+                self.text_section.append(f'    je {lbl_else}')
+                # emit if body
+                self._emit_block(s.if_body or [], locals_map, local_offset)
+                self.text_section.append(f'    jmp {lbl_end}')
+                self.text_section.append(f'{lbl_else}:')
+                # else (empty for now)
+                self.text_section.append(f'{lbl_end}:')
+                continue
 
-        for op in comparison_ops:
-            if op in condition:
-                left, right = condition.split(op, 1)
-                left = left.strip()
-                right = right.strip()
+            # While node
+            if s.__class__.__name__ == 'WhileNode':
+                lbl_start = f"L{self.label_counter+1}"
+                lbl_end = f"L{self.label_counter+2}"
+                self.label_counter += 2
+                self.text_section.append(f'{lbl_start}:')
+                self._emit_expr(s.condition, locals_map, local_offset)
+                self.text_section.append('    cmp rax, 0')
+                self.text_section.append(f'    je {lbl_end}')
+                self._emit_block(s.body or [], locals_map, local_offset)
+                self.text_section.append(f'    jmp {lbl_start}')
+                self.text_section.append(f'{lbl_end}:')
+                continue
 
-                # Load left operand into appropriate register or use it directly
-                left_is_reg = left.lower() in regs
-                right_is_reg = right.lower() in regs
+            # Label
+            if s.__class__.__name__ == 'LabelNode':
+                self.text_section.append(f'{s.name}:')
+                continue
 
-                if left.isdigit():
-                    self.text_section.append(f"    mov eax, {left}")
-                    left_operand_for_cmp = 'eax'
-                elif left_is_reg:
-                    left_operand_for_cmp = left
-                else:
-                    left_operand = self._format_var_operand(left, as_memory=True)
-                    if self.variable_info.get(left, {}).get('type') == 'equ':
-                        left_operand_for_cmp = left_operand
+            # Inline assembly block
+            if s.__class__.__name__ == 'AssemblyNode':
+                # paste asm lines directly, but replace references to local variables
+                # and indent to match function body
+                def replace_ident(match):
+                    name = match.group(0)
+                    if name in locals_map:
+                        return f'[rbp{locals_map[name]}]'
+                    return name
+
+                for line in s.code.splitlines():
+                    if not line.strip():
+                        self.text_section.append(line)
+                        continue
+                    transformed = re.sub(r"\b([A-Za-z_]\w*)\b", replace_ident, line)
+                    self.text_section.append('    ' + transformed.lstrip())
+                continue
+            # Println
+            if isinstance(s, PrintlnNode):
+                for expr in s.expressions:
+                    # expression may be a string literal or expression node
+                    if isinstance(expr, str):
+                        label = self._new_str_label()
+                        self.rodata_section.append(f"{label}: db \"{expr}\", 0")
+                        self._emit_call_puts(label)
                     else:
-                        self.text_section.append(f"    mov eax, dword {left_operand}")
-                        left_operand_for_cmp = 'eax'
+                        # evaluate expr to rax for possible future handling
+                        self._emit_expr(expr, locals_map, local_offset)
+                        pass
 
-                # Compare with right operand
-                if right.isdigit() or right_is_reg:
-                    self.text_section.append(f"    cmp {left_operand_for_cmp}, {right}")
-                else:
-                    right_operand = self._format_var_operand(right, as_memory=True)
-                    if self.variable_info.get(right, {}).get('type') == 'equ':
-                        self.text_section.append(f"    cmp {left_operand_for_cmp}, {right_operand}")
+            # Variable declaration
+            elif isinstance(s, VarDeclarationNode):
+                # locals were allocated in a single prologue allocation
+                # emit initializer if present
+                if s.value is not None:
+                    self._emit_expr(s.value, locals_map, local_offset)
+                    # move rax to local slot
+                    self.text_section.append(f'    mov [rbp{locals_map[s.name]}], rax')
+
+            elif isinstance(s, AssignmentNode):
+                # evaluate rhs -> rax
+                self._emit_expr(s.value, locals_map, local_offset)
+                # lhs identifier
+                if isinstance(s.target, IdentifierNode):
+                    name = s.target.name
+                    if name in locals_map:
+                        self.text_section.append(f'    mov [rbp{locals_map[name]}], rax')
                     else:
-                        self.text_section.append(f"    cmp {left_operand_for_cmp}, dword {right_operand}")
+                        # global variable not supported; ignore
+                        pass
 
-                # The comparison sets flags, caller will use je/jne/jg/jl etc.
-                return
-        
-        # Handle simple variable checks (non-zero)
-        if condition in self.variable_labels:
-            operand = self._format_var_operand(condition, as_memory=True)
-            if self.variable_info.get(condition, {}).get('type') == 'equ':
-                self.text_section.append(f"    mov eax, {operand}")
-            else:
-                self.text_section.append(f"    mov eax, dword {operand}")
-            self.text_section.append(f"    cmp eax, 0")
-        elif condition.isdigit():
-            # Direct number comparison
-            self.text_section.append(f"    mov eax, {condition}")
-            self.text_section.append(f"    cmp eax, 0")
-        else:
-            # Try to treat as variable name
-            cond_label = self._get_var_label(condition)
-            self.text_section.append(f"    mov eax, dword [rel {cond_label}]")
-            self.text_section.append(f"    cmp eax, 0")
+            elif isinstance(s, FunctionCallNode):
+                # very simple: only support puts-like calls with literal arg
+                if isinstance(s.function, IdentifierNode) and s.function.name == 'puts' and s.arguments:
+                    arg = s.arguments[0]
+                    if isinstance(arg, LiteralNode) and isinstance(arg.value, str):
+                        label = self._new_str_label()
+                        self.rodata_section.append(f"{label}: db \"{arg.value}\", 0")
+                        self._emit_call_puts(label)
+
+            elif isinstance(s, ReturnNode):
+                # Lower return value: if it's an integer literal emit mov rax, <int>
+                # otherwise evaluate the expression into rax using _emit_expr
+                if s.value is None:
+                    self.text_section.append('    mov rax, 0')
+                else:
+                    # integer literal
+                    if isinstance(s.value, LiteralNode) and isinstance(s.value.value, int):
+                        self.text_section.append(f'    mov rax, {s.value.value}')
+                    else:
+                        # evaluate arbitrary expression into rax
+                        self._emit_expr(s.value, locals_map, local_offset)
+                # jump to function epilogue by emitting mov rsp, rbp; pop rbp; ret
+                self.text_section.append('    mov rsp, rbp')
+                self.text_section.append('    pop rbp')
+                self.text_section.append('    ret')
+
+
